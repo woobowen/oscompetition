@@ -251,9 +251,9 @@ graph LR
     User[用户进程 sys_read]:::user --> FileRead[file_read]:::fs
     FileRead --> Check{Inode Type?}:::fs
     
-    Check -- DATA --> InodeRead[inode_read_data<br/> 【读磁盘数据块】]:::impl
-    Check -- DIR --> DentryTrans[dentry_transmit<br/>【读目录项】]:::impl
-    Check -- DEVICE --> DeviceRead[device_read_data<br/>【调用设备驱动】]:::impl
+    Check -- DATA --> InodeRead[inode_read_data<br>读磁盘数据块]:::impl
+    Check -- DIR --> DentryTrans[dentry_transmit<br>读目录项]:::impl
+    Check -- DEVICE --> DeviceRead[device_read_data<br>调用设备驱动]:::impl
 ```
 
 - **普通文件 (DATA)**：调用 `inode_read_data` / `inode_write_data`，直接读写磁盘数据块，并自动更新 `offset`。
