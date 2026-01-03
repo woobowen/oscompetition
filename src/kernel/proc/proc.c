@@ -1,5 +1,8 @@
 #include "mod.h"
 
+// trap/timer.c: 已存在，用于读取全局 tick
+extern uint64 timer_get_ticks();
+
 // 这个文件通过make build生成, 是proczero对应的ELF文件
 #include "../../user/initcode.h"
 #define initcode target_user_initcode
@@ -64,6 +67,9 @@ void proc_init()
     global_pid = 1;
     spinlock_init(&pid_lk, "pid_lock");
 
+    // 初始化MLFQ调度器
+    mlfq_init();
+
     // 初始化进程数组
     for (int i = 0; i < N_PROC; i++) {
         memset(&proc_list[i], 0, sizeof(proc_t)); // 初始化为null
@@ -94,6 +100,29 @@ proc_t *proc_alloc()
             p->ustack_npage = 0;
             p->mmap = NULL;
             p->tf = NULL;
+
+            // MLFQ 初始化
+            p->mlfq_level = 0;
+            p->mlfq_ticks_left = 0;
+            p->mlfq_in_readyq = 0;
+            p->mlfq_yield_reason = MLFQ_YIELD_NONE;
+            p->mlfq_wait_ticks = 0;
+
+            // 调度统计初始化
+            p->sched_last_ready_tick = 0;
+            p->sched_run_start_tick = 0;
+            p->sched_first_run_tick = 0;
+            p->sched_cpu_ticks = 0;
+            p->sched_wait_sum = 0;
+            p->sched_wait_max = 0;
+            p->sched_run_count = 0;
+            p->sched_ready_count = 0;
+            p->sched_ctx_switches = 0;
+            p->sched_preempt_expire = 0;
+            p->sched_preempt_higher = 0;
+            p->sched_yield_voluntary = 0;
+            p->sched_sleep_count = 0;
+
             // 预设内核栈与上下文
             p->kstack = (uint64)KSTACK(i);
             p->ctx.ra = (uint64)proc_return; // 切入到该进程时，从这里返回到用户态入口
@@ -144,6 +173,29 @@ void proc_free(proc_t *p)
     p->mmap = NULL;
     p->kstack = 0;
     memset(&p->ctx, 0, sizeof(p->ctx));
+
+    // MLFQ 清理
+    p->mlfq_level = 0;
+    p->mlfq_ticks_left = 0;
+    p->mlfq_in_readyq = 0;
+    p->mlfq_yield_reason = MLFQ_YIELD_NONE;
+    p->mlfq_wait_ticks = 0;
+
+    // 调度统计清理
+    p->sched_last_ready_tick = 0;
+    p->sched_run_start_tick = 0;
+    p->sched_first_run_tick = 0;
+    p->sched_cpu_ticks = 0;
+    p->sched_wait_sum = 0;
+    p->sched_wait_max = 0;
+    p->sched_run_count = 0;
+    p->sched_ready_count = 0;
+    p->sched_ctx_switches = 0;
+    p->sched_preempt_expire = 0;
+    p->sched_preempt_higher = 0;
+    p->sched_yield_voluntary = 0;
+    p->sched_sleep_count = 0;
+
     p->state = UNUSED;
 }
 
@@ -184,7 +236,6 @@ pgtbl_t proc_pgtbl_init(uint64 trapframe)
 */
 void proc_make_first()
 {
-    printf("I'm here.");
     // 通过通用分配接口申请 proczero（返回时持有锁）
     proc_t *p = proc_alloc();
     if (!p) panic("proc_make_first: proc_alloc failed");
@@ -238,6 +289,10 @@ void proc_make_first()
     p->mmap = NULL;
     p->state = RUNNABLE;
 
+    // 调度统计：进入就绪态
+    p->sched_last_ready_tick = timer_get_ticks();
+    p->sched_ready_count++;
+
     // 5. 设置 trapframe 中的入口与用户栈
     tf->user_to_kern_epc = UCODE_VA;
     tf->sp = USTACK_TOP;
@@ -245,7 +300,9 @@ void proc_make_first()
     // 6. 记录为 proczero 并解锁
     proczero = p;
     spinlock_release(&p->lk);
-    printf("leave proc_make_first");
+
+    // 入MLFQ就绪队列(避免持有 p->lk 时拿 mlfq 锁)
+    mlfq_on_new(p);
 }
 
 /*
@@ -278,6 +335,10 @@ int proc_fork()
     child->mmap = NULL; // 子进程初始无mmap
     child->state = RUNNABLE;
 
+    // 调度统计：进入就绪态
+    child->sched_last_ready_tick = timer_get_ticks();
+    child->sched_ready_count++;
+
     // 复制页表
     uvm_copy_pgtbl(parent->pgtbl, child->pgtbl, parent->heap_top, parent->ustack_npage, parent->mmap);
 
@@ -298,7 +359,44 @@ int proc_fork()
 
     int pid = child->pid;
     spinlock_release(&child->lk);
+
+    // 入MLFQ就绪队列(避免持有 child->lk 时拿 mlfq 锁)
+    mlfq_on_new(child);
+
     return pid;
+}
+
+/*
+    用户态时钟中断触发: 更新时间片
+    返回 1 表示需要让出 CPU
+*/
+int proc_on_tick(void)
+{
+    proc_t *p = myproc();
+    if (!p)
+        return 0;
+
+    if (p->state != RUNNING)
+        return 0;
+
+    // aging: 更新就绪队列中的等待时间并按阈值提升
+    mlfq_age_tick();
+
+    if (p->mlfq_ticks_left > 0)
+        p->mlfq_ticks_left--;
+
+    if (p->mlfq_ticks_left <= 0) {
+        p->mlfq_yield_reason = MLFQ_YIELD_EXPIRE;
+        return 1;
+    }
+
+    // 如果更高优先级队列出现就绪任务, 也允许抢占
+    if (mlfq_has_higher(p->mlfq_level)) {
+        p->mlfq_yield_reason = MLFQ_YIELD_HIGHER;
+        return 1;
+    }
+
+    return 0;
 }
 
 /*
@@ -308,9 +406,36 @@ int proc_fork()
 void proc_yield()
 {
     proc_t *p = myproc();
+    int reason;
+
+    uint64 now = timer_get_ticks();
+
+    // 统一锁顺序: 先拿 MLFQ 锁，再拿 p->lk
+    // 这样避免与调度器(mlfq -> p->lk)发生锁反转
+    mlfq_lock();
     spinlock_acquire(&p->lk);
+
     p->state = RUNNABLE;
-    proc_sched(); // 保持持锁切换
+    // 防御：RUNNING 进程不应当在就绪队列中；若标志残留会导致入队被跳过，从而永远跑不到。
+    p->mlfq_in_readyq = 0;
+    reason = p->mlfq_yield_reason;
+    if (reason == MLFQ_YIELD_NONE)
+        reason = MLFQ_YIELD_EXPIRE;
+    p->mlfq_yield_reason = MLFQ_YIELD_NONE;
+
+    // 调度统计：按原因计数 + 重新进入就绪态
+    p->sched_last_ready_tick = now;
+    p->sched_ready_count++;
+    if (reason == MLFQ_YIELD_EXPIRE) p->sched_preempt_expire++;
+    else if (reason == MLFQ_YIELD_HIGHER) p->sched_preempt_higher++;
+    else if (reason == MLFQ_YIELD_VOLUNTARY) p->sched_yield_voluntary++;
+
+    // 入队(当前已持有 mlfq_lock)
+    mlfq_on_yield_locked(p, reason);
+    mlfq_unlock();
+
+    // 保持持锁切换; 被再次调度回来后才会继续向下执行
+    proc_sched();
     spinlock_release(&p->lk);
 }
 
@@ -341,12 +466,20 @@ static void proc_try_wakeup(proc_t *p)
     proc_t *parent = p->parent;
     if (!parent) return;
     // 唤醒等待“自己”的父进程
+    bool woke = false;
     spinlock_acquire(&parent->lk);
     if (parent->state == SLEEPING && parent->sleep_space == parent) {
         parent->state = RUNNABLE;
         parent->sleep_space = NULL;
+        parent->sched_last_ready_tick = timer_get_ticks();
+        parent->sched_ready_count++;
+        woke = true;
     }
     spinlock_release(&parent->lk);
+
+    // 修复：父进程变为 RUNNABLE 后，需要重新进入就绪队列，否则在 MLFQ 下会“永远跑不到”
+    if (woke)
+        mlfq_on_wakeup(parent);
 }
 
 /*
@@ -428,6 +561,9 @@ void proc_sleep(void *sleep_space, spinlock_t *lock)
     // 开始睡眠
     p->sleep_space = sleep_space;
     p->state = SLEEPING;
+    // 防御：进程处于 SLEEPING 时不应在就绪队列中。
+    p->mlfq_in_readyq = 0;
+    p->sched_sleep_count++;
     // printf("proc %d is sleeping!\n", p->pid);
 
     // 切到调度器
@@ -455,6 +591,15 @@ void proc_wakeup(void *sleep_space)
         if (p->state == SLEEPING && p->sleep_space == sleep_space) {
             p->state = RUNNABLE;
             p->sleep_space = NULL;
+            p->sched_last_ready_tick = timer_get_ticks();
+            p->sched_ready_count++;
+            // 防御：清理可能残留的 in_readyq 标志，确保一定能重新入队
+            p->mlfq_in_readyq = 0;
+            spinlock_release(&p->lk);
+
+            // I/O 唤醒: 提升到最高优先级(不持有 p->lk)
+            mlfq_on_wakeup(p);
+            continue;
         }
         spinlock_release(&p->lk);
     }
@@ -484,16 +629,83 @@ void proc_scheduler()
     for (;;) {
         intr_on(); // 开启中断，否则所有进程 sleep 时 CPU 会死锁在关中断状态！
         c->proc = NULL;
-        for (int i = 0; i < N_PROC; i++) {
-            proc_t *p = &proc_list[i];
-            spinlock_acquire(&p->lk);
-            if (p->state == RUNNABLE) {
-                // 切入该进程
-                p->state = RUNNING;
-                c->proc = p;
-                swtch(&c->ctx, &p->ctx);
-            }
+
+        proc_t *p = mlfq_pick_next();
+        if (p == NULL)
+            continue;
+
+        spinlock_acquire(&p->lk);
+        if (p->state != RUNNABLE) {
             spinlock_release(&p->lk);
+            continue;
         }
+
+        // 切入该进程
+        p->state = RUNNING;
+        c->proc = p;
+
+        // 调度统计：RUNNABLE -> RUNNING
+        uint64 now = timer_get_ticks();
+        if (p->sched_first_run_tick == 0)
+            p->sched_first_run_tick = now;
+        if (p->sched_last_ready_tick != 0) {
+            uint64 w = now - p->sched_last_ready_tick;
+            p->sched_wait_sum += w;
+            if (w > p->sched_wait_max)
+                p->sched_wait_max = w;
+        }
+        p->sched_run_start_tick = now;
+        p->sched_run_count++;
+
+        swtch(&c->ctx, &p->ctx);
+
+        // 从进程切回调度器后，仍持有 p->lk
+        p->sched_ctx_switches++;
+        spinlock_release(&p->lk);
     }
+}
+
+uint32 proc_schedstat(uint64 user_dst, uint32 max_entries)
+{
+    if (max_entries == 0)
+        return 0;
+
+    proc_t *caller = myproc();
+    if (!caller)
+        return 0;
+
+    uint32 copied = 0;
+    for (int i = 0; i < N_PROC && copied < max_entries; i++) {
+        proc_t *p = &proc_list[i];
+        spinlock_acquire(&p->lk);
+        if (p->state == UNUSED || p->pid == 0) {
+            spinlock_release(&p->lk);
+            continue;
+        }
+
+        sched_stat_t st;
+        st.pid = (uint32)p->pid;
+        st.state = (uint32)p->state;
+        st.mlfq_level = (uint32)p->mlfq_level;
+        st._pad = 0;
+        st.cpu_ticks = p->sched_cpu_ticks;
+        st.wait_sum = p->sched_wait_sum;
+        st.wait_max = p->sched_wait_max;
+        st.run_count = p->sched_run_count;
+        st.ready_count = p->sched_ready_count;
+        st.ctx_switches = p->sched_ctx_switches;
+        st.preempt_expire = p->sched_preempt_expire;
+        st.preempt_higher = p->sched_preempt_higher;
+        st.yield_voluntary = p->sched_yield_voluntary;
+        st.sleep_count = p->sched_sleep_count;
+        st.first_run_tick = p->sched_first_run_tick;
+        spinlock_release(&p->lk);
+
+        uvm_copyout(caller->pgtbl,
+                    user_dst + (uint64)copied * sizeof(sched_stat_t),
+                    (uint64)&st,
+                    sizeof(sched_stat_t));
+        copied++;
+    }
+    return copied;
 }

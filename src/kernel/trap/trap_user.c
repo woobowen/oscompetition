@@ -39,8 +39,9 @@ void trap_user_handler()
         switch (trap_id) {
             case 1: // S-mode软件中断
                 timer_interrupt_handler();
-                // 处理完后，强制当前进程让出CPU
-                proc_yield();
+                // MLFQ: 仅当时间片用完/需要抢占时才让出CPU
+                if (proc_on_tick())
+                    proc_yield();
                 break;
             case 9: // S-mode外设中断
                 external_interrupt_handler();

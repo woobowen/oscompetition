@@ -20,3 +20,5 @@
 #define SYS_print_cwd 20        // 打印工作目录的绝对路径
 #define SYS_link 21             // 建立硬链接
 #define SYS_unlink 22           // 解除硬链接
+
+#define SYS_schedstat 23        // 拉取调度统计快照

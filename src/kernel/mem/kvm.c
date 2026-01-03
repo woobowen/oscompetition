@@ -80,6 +80,9 @@ void vm_mappages(pgtbl_t pgtbl, uint64 va, uint64 pa, uint64 len, int perm)
         pa += PGSIZE;
     }
 
+    // 页表修改后刷新TLB，避免陈旧映射导致的内存一致性问题
+    sfence_vma();
+
 }
 
 // 解除pgtbl中[va, va+len)区域的映射
@@ -110,6 +113,9 @@ void vm_unmappages(pgtbl_t pgtbl, uint64 va, uint64 len, bool freeit)
         // Step 4: 前进到下一页
         va += PGSIZE;
     }
+
+    // 页表修改后刷新TLB，避免用户继续使用旧TLB访问已释放的物理页
+    sfence_vma();
 }
 
 // 完成UART、CLINT、PLIC、内核代码区、内核数据区、可分配区域的页表映射

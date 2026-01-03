@@ -60,6 +60,25 @@ typedef struct file_stat {
     uint32 offset;      // file->offset
 } file_stat_t;
 
+// 调度统计快照(与内核 sched_stat_t 对齐)
+typedef struct sched_stat {
+    uint32 pid;
+    uint32 state;
+    uint32 mlfq_level;
+    uint32 _pad;
+    uint64 cpu_ticks;
+    uint64 wait_sum;
+    uint64 wait_max;
+    uint64 run_count;
+    uint64 ready_count;
+    uint64 ctx_switches;
+    uint64 preempt_expire;
+    uint64 preempt_higher;
+    uint64 yield_voluntary;
+    uint64 sleep_count;
+    uint64 first_run_tick;
+} sched_stat_t;
+
 /* 第一类: 系统调用函数 */
 
 uint64 sys_brk(uint64 new_heap_top);
@@ -84,6 +103,7 @@ uint32 sys_chdir(char *new_path);
 uint32 sys_print_cwd();
 uint32 sys_link(char *old_path, char *new_path);
 uint32 sys_unlink(char *path);
+uint32 sys_schedstat(sched_stat_t *buf, uint32 max_entries);
 
 /* 第二类: 其他辅助函数 */
 

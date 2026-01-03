@@ -91,6 +91,12 @@ enum proc_state
     ZOMBIE,   // 濒临死亡
 };
 
+// MLFQ 调度相关
+#define MLFQ_YIELD_NONE    0
+#define MLFQ_YIELD_EXPIRE  1  // 时间片用完
+#define MLFQ_YIELD_HIGHER  2  // 更高优先级任务就绪导致抢占
+#define MLFQ_YIELD_VOLUNTARY 3 // 主动让出(当前未使用)
+
 // 单个进程最多打开N_OPEN_FILE_PER_PROC个文件
 #define N_OPEN_FILE_PER_PROC 10
 
@@ -108,6 +114,28 @@ typedef struct proc
     int exit_code;         // 进程退出状态(父进程关心)
     void *sleep_space;     // 进程睡眠位置(等待的资源)
 
+    // MLFQ 调度字段
+    int mlfq_level;        // 当前队列层级(0最高)
+    int mlfq_ticks_left;   // 当前时间片剩余tick
+    int mlfq_in_readyq;    // 是否在就绪队列中(防重复入队)
+    int mlfq_yield_reason; // 本次让出CPU的原因(由tick设置)
+    uint32 mlfq_wait_ticks; // aging: RUNNABLE 等待tick累计
+
+    // 调度统计(用于对比不同调度策略)
+    uint64 sched_last_ready_tick; // 最近一次进入RUNNABLE并入队的tick
+    uint64 sched_run_start_tick;  // 最近一次开始RUNNING的tick
+    uint64 sched_first_run_tick;  // 首次获得CPU的tick(0表示从未运行)
+    uint64 sched_cpu_ticks;       // 累计RUNNING时长(tick)
+    uint64 sched_wait_sum;        // 累计就绪等待时间(tick)
+    uint64 sched_wait_max;        // 最大就绪等待时间(tick)
+    uint64 sched_run_count;       // 被调度上CPU的次数
+    uint64 sched_ready_count;     // 进入RUNNABLE(入队)次数
+    uint64 sched_ctx_switches;    // 进程切出到调度器的次数
+    uint64 sched_preempt_expire;  // 时间片耗尽导致的让出次数
+    uint64 sched_preempt_higher;  // 被更高优先级抢占次数
+    uint64 sched_yield_voluntary; // 主动让出次数
+    uint64 sched_sleep_count;     // sleep切出次数
+
     pgtbl_t pgtbl;         // 用户态页表
     uint64 heap_top;       // 用户堆顶(以字节为单位)
     uint64 ustack_npage;   // 用户栈占用的页面数量
@@ -121,6 +149,25 @@ typedef struct proc
     file_t *open_file[N_OPEN_FILE_PER_PROC]; // 打开文件表
 
 } proc_t;
+
+// 用户态可见的调度统计快照(内核copyout)
+typedef struct sched_stat {
+    uint32 pid;
+    uint32 state;
+    uint32 mlfq_level;
+    uint32 _pad;
+    uint64 cpu_ticks;
+    uint64 wait_sum;
+    uint64 wait_max;
+    uint64 run_count;
+    uint64 ready_count;
+    uint64 ctx_switches;
+    uint64 preempt_expire;
+    uint64 preempt_higher;
+    uint64 yield_voluntary;
+    uint64 sleep_count;
+    uint64 first_run_tick;
+} sched_stat_t;
 
 // 系统中最多同时存在N_PROC个进程
 #define N_PROC 32

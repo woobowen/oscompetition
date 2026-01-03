@@ -17,6 +17,24 @@ void proc_wakeup(void *sleep_space);                // 进程唤醒
 void proc_sched();                                  // 进程切换到调度器
 void proc_scheduler();                              // 调度器选择合适的进程执行
 
+// 调度统计: copyout 一份 proc 列表快照到用户态
+uint32 proc_schedstat(uint64 user_dst, uint32 max_entries);
+
+// MLFQ: 多级反馈队列调度
+void mlfq_init(void);
+void mlfq_on_new(proc_t *p);                         // 新创建/初次就绪: 放入高优先级队列
+void mlfq_on_wakeup(proc_t *p);                      // 睡眠唤醒: 提升到高优先级队列
+void mlfq_on_yield(proc_t *p, int reason);           // 让出CPU: 根据原因降级/保持
+proc_t *mlfq_pick_next(void);                        // 选择下一个RUNNABLE进程(不加p->lk)
+bool mlfq_has_higher(int level);                     // 是否存在更高优先级的就绪进程
+void mlfq_age_tick(void);                            // aging: 更新等待tick并按阈值提升
+
+// MLFQ 内部锁(用于保证全局锁顺序: 先 mlfq, 后 p->lk)
+void mlfq_lock(void);
+void mlfq_unlock(void);
+void mlfq_on_yield_locked(proc_t *p, int reason);    // 需要已持有 mlfq_lock
+int proc_on_tick(void);                              // 用户态时钟中断: 更新时间片并判断是否需要yield
+
 // exec.c: 重置进程以执行ELF文件
 
 int proc_exec(char *path, char **argv);             // 准备新进程

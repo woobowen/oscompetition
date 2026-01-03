@@ -3,6 +3,37 @@
 // 内核空间和用户空间的可分配物理页分开描述
 static alloc_region_t kern_region, user_region;
 
+typedef struct pmem_trace {
+    uint64 page;
+    uint64 ra;
+    uint8 in_kernel;
+} pmem_trace_t;
+
+#define PMEM_TRACE_N 256
+static pmem_trace_t pmem_trace[PMEM_TRACE_N];
+static uint32 pmem_trace_idx;
+
+static void pmem_trace_record(uint64 page, bool in_kernel)
+{
+    uint32 idx = __sync_fetch_and_add(&pmem_trace_idx, 1) % PMEM_TRACE_N;
+    pmem_trace[idx].page = page;
+    pmem_trace[idx].ra = (uint64)__builtin_return_address(0);
+    pmem_trace[idx].in_kernel = (uint8)(in_kernel ? 1 : 0);
+}
+
+static void pmem_trace_print_last_free(uint64 page)
+{
+    for (int i = 0; i < PMEM_TRACE_N; i++) {
+        int idx = (int)((pmem_trace_idx + PMEM_TRACE_N - 1 - (uint32)i) % PMEM_TRACE_N);
+        if (pmem_trace[idx].page == page) {
+            printf("pmem_trace: last free page=%p ra=%p in_kernel=%d\n",
+                   page, pmem_trace[idx].ra, pmem_trace[idx].in_kernel);
+            return;
+        }
+    }
+    printf("pmem_trace: no recent free record for page=%p\n", page);
+}
+
 // 物理内存的初始化
 // 本质上就是填写kern_region和user_region, 包括基本数值和空闲链表
 void pmem_init(void)
@@ -59,6 +90,29 @@ void* pmem_alloc(bool in_kernel)
     spinlock_acquire(&ar->lk);
     page = ar->list_head.next;
     if (page) {
+        // free list 健康性检查：避免 page->next 解引用触发内核 load page fault
+        uint64 pa = (uint64)page;
+        if (pa % PGSIZE != 0 || pa < ar->begin || pa >= ar->end) {
+            spinlock_release(&ar->lk);
+            printf("pmem_alloc: free list head corrupted: page=%p region=[%p,%p) in_kernel=%d ra=%p\n",
+                   page, ar->begin, ar->end, in_kernel, __builtin_return_address(0));
+            pmem_trace_print_last_free(pa);
+            panic("pmem_alloc: free list corrupted");
+        }
+
+        // 进一步检查 next 指针：page 合法但其头部(next)可能被写坏
+        page_node_t *next = page->next;
+        if (next != NULL) {
+            uint64 npa = (uint64)next;
+            if (npa % PGSIZE != 0 || npa < ar->begin || npa >= ar->end) {
+                spinlock_release(&ar->lk);
+                printf("pmem_alloc: free list next corrupted: page=%p next=%p region=[%p,%p) in_kernel=%d\n",
+                       page, next, ar->begin, ar->end, in_kernel);
+                pmem_trace_print_last_free(pa);
+                panic("pmem_alloc: free list corrupted (next)");
+            }
+        }
+
         ar->list_head.next = page->next;
         ar->allocable--;
     }
@@ -90,7 +144,8 @@ void pmem_free(uint64 page, bool in_kernel)
     }
 
     // 检查page的合法性
-    if (page % PGSIZE != 0 || page < ar->begin || page > ar->end)
+    // 注意：ar->end 是开区间端点，合法范围为 [begin, end)
+    if (page % PGSIZE != 0 || page < ar->begin || page >= ar->end)
     {
         panic("pmem_free: invalid page");
     }
@@ -105,6 +160,8 @@ void pmem_free(uint64 page, bool in_kernel)
     ar->list_head.next = p;
     ar->allocable++;
     spinlock_release(&ar->lk);
+
+    pmem_trace_record(page, in_kernel);
 }
 
 // 获取可用内存信息

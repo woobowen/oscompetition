@@ -196,3 +196,12 @@ uint32 sys_unlink(char *path)
 {
 	return syscall(SYS_unlink, path);
 }
+
+/*
+	拉取调度统计快照
+	返回实际写入条目数
+*/
+uint32 sys_schedstat(sched_stat_t *buf, uint32 max_entries)
+{
+	return syscall(SYS_schedstat, buf, max_entries);
+}

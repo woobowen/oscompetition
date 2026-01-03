@@ -31,3 +31,4 @@ uint64 sys_chdir();
 uint64 sys_print_cwd();
 uint64 sys_link();
 uint64 sys_unlink();
+uint64 sys_schedstat();

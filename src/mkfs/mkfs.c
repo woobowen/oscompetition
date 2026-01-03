@@ -114,6 +114,93 @@ unsigned int inode_alloc()
 
 /*-------------------------inode精细化管理-------------------------*/
 
+// 获取/分配 inode 的第 logical_block_num 个数据块号（支持：直接/一级间接/二级间接）
+static unsigned int inode_get_or_alloc_block(inode_disk_t *ip, unsigned int logical_block_num)
+{
+    // 每个 block 能存放的索引数量 (1024)
+    unsigned int index_per_block = BLOCK_SIZE / sizeof(unsigned int);
+
+    // 1) 直接映射 (0 ~ 9)
+    if (logical_block_num < INODE_INDEX_1) {
+        if (ip->index[logical_block_num] == 0)
+            ip->index[logical_block_num] = block_alloc();
+        return ip->index[logical_block_num];
+    }
+
+    // 2) 一级间接映射 (10 ~ 10+2048-1)
+    if (logical_block_num < INODE_BLOCK_INDEX_2) {
+        unsigned int rel = logical_block_num - INODE_BLOCK_INDEX_1;
+        unsigned int l1_idx = rel / index_per_block; // 0..1
+        unsigned int l1_off = rel % index_per_block;
+
+        if (l1_idx >= (INODE_INDEX_2 - INODE_INDEX_1)) {
+            printf("inode_append: bad l1_idx=%u\n", l1_idx);
+            exit(1);
+        }
+
+        unsigned int l1_block = ip->index[INODE_INDEX_1 + l1_idx];
+        if (l1_block == 0) {
+            l1_block = block_alloc();
+            ip->index[INODE_INDEX_1 + l1_idx] = l1_block;
+            memset(data_buf, 0, BLOCK_SIZE);
+            block_rw(l1_block, data_buf, true);
+        }
+
+        block_rw(l1_block, data_buf, false);
+        unsigned int *l1_table = (unsigned int *)data_buf;
+        unsigned int data_block = l1_table[l1_off];
+        if (data_block == 0) {
+            data_block = block_alloc();
+            l1_table[l1_off] = data_block;
+            block_rw(l1_block, data_buf, true);
+        }
+        return data_block;
+    }
+
+    // 3) 二级间接映射 (10+2048 ~ 10+2048+1024*1024-1)
+    if (logical_block_num < INODE_BLOCK_INDEX_3) {
+        unsigned int rel = logical_block_num - INODE_BLOCK_INDEX_2;
+        unsigned int l2_idx = rel / index_per_block;
+        unsigned int l1_off = rel % index_per_block;
+
+        // 二级索引块（只占一个槽位）
+        unsigned int l2_block = ip->index[INODE_INDEX_2];
+        if (l2_block == 0) {
+            l2_block = block_alloc();
+            ip->index[INODE_INDEX_2] = l2_block;
+            memset(data_buf, 0, BLOCK_SIZE);
+            block_rw(l2_block, data_buf, true);
+        }
+
+        // 读取二级索引块，拿到对应的一级索引块
+        block_rw(l2_block, data_buf, false);
+        unsigned int *l2_table = (unsigned int *)data_buf;
+        unsigned int l1_block = l2_table[l2_idx];
+        if (l1_block == 0) {
+            l1_block = block_alloc();
+            l2_table[l2_idx] = l1_block;
+            block_rw(l2_block, data_buf, true);
+
+            memset(data_buf, 0, BLOCK_SIZE);
+            block_rw(l1_block, data_buf, true);
+        }
+
+        // 读取一级索引块，拿到数据块
+        block_rw(l1_block, data_buf, false);
+        unsigned int *l1_table = (unsigned int *)data_buf;
+        unsigned int data_block = l1_table[l1_off];
+        if (data_block == 0) {
+            data_block = block_alloc();
+            l1_table[l1_off] = data_block;
+            block_rw(l1_block, data_buf, true);
+        }
+        return data_block;
+    }
+
+    printf("inode_append: data len out of space!\n");
+    exit(1);
+}
+
 /* inode初始化 */
 void inode_init(inode_disk_t *ip, short type, short major, short minor)
 {
@@ -139,29 +226,30 @@ void inode_append(inode_disk_t *ip, void *data, unsigned int len)
     tmp = ip->size / BLOCK_SIZE;
     tar_len = len;
 
-    /* 如果有必要, 扩充block空间 */
+    /* 如果有必要, 扩充block空间（通过映射函数分配必要的数据块/索引块） */
     if (new_blocks > old_blocks) {
-        if (new_blocks > INODE_BLOCK_INDEX_1) { // 出于简化考虑, 暂不启用间接映射
-            printf("inode_append: data len out of space!\n");
-            return;
+        for (int i = old_blocks; i < new_blocks; i++) {
+            (void)inode_get_or_alloc_block(ip, (unsigned int)i);
         }
-        for(int i = old_blocks; i < new_blocks; i++)
-            ip->index[i] = block_alloc();
     }
 
     /* 分段写入各个block */
     while (len > 0)
     {
-        if (tmp == ip->size / BLOCK_SIZE) { /* last old block */
-            cut_len = MIN(BLOCK_SIZE - (ip->size % BLOCK_SIZE), len);
-            offset = ip->size % BLOCK_SIZE;
-            block_rw(ip->index[tmp], data_buf, false);
-            memcpy(data_buf + offset, data_new, cut_len);
-        } else { /* new block */
-            cut_len = MIN(BLOCK_SIZE, len);
-            memcpy(data_buf, data_new, cut_len);
+        unsigned int logical_block = ip->size / BLOCK_SIZE;
+        unsigned int data_block = inode_get_or_alloc_block(ip, logical_block);
+
+        // 读出旧块（如果是追加到已有块内），否则新块从全0开始
+        offset = ip->size % BLOCK_SIZE;
+        if (offset != 0) {
+            block_rw(data_block, data_buf, false);
+        } else {
+            memset(data_buf, 0, BLOCK_SIZE);
         }
-        block_rw(ip->index[tmp], data_buf, true);
+
+        cut_len = MIN(BLOCK_SIZE - offset, len);
+        memcpy(data_buf + offset, data_new, cut_len);
+        block_rw(data_block, data_buf, true);
 
         len -= cut_len;
         data_new += cut_len;

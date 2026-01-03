@@ -135,7 +135,6 @@ int proc_exec(char *path, char **argv)
 	// step-1: 解析输入的文件路径, 获取ELF文件的inode
 	inode_t *ip = path_to_inode(path);
 	if (!ip) {
-		pmem_free((uint64)new_tf, false);
 		uvm_destroy_pgtbl(new_pgtbl);
 		return -1;
 	}
@@ -145,7 +144,6 @@ int proc_exec(char *path, char **argv)
 	uint32 data_size = inode_read_data(ip, 0, sizeof(eh), &eh, false);
 	if (data_size != sizeof(eh) || eh.magic != ELF_MAGIC) { 
 		inode_put(ip);
-		pmem_free((uint64)new_tf, false);
 		uvm_destroy_pgtbl(new_pgtbl);
 		return -1;
 	}
@@ -154,7 +152,6 @@ int proc_exec(char *path, char **argv)
 	uint64 new_heap_top = prepare_heap(new_pgtbl, ip, &eh);
 	if (new_heap_top == -1) {
 		inode_put(ip);
-		pmem_free((uint64)new_tf, false);
 		uvm_destroy_pgtbl(new_pgtbl);
 		return -1;
 	}
@@ -166,14 +163,12 @@ int proc_exec(char *path, char **argv)
 	int argc;
 	uint64 sp = prepare_stack(new_pgtbl, argv, &argc);
 	if (sp == -1) {
-		pmem_free((uint64)new_tf, false);
 		uvm_destroy_pgtbl(new_pgtbl);
 		return -1;
 	}
 	
 	// step-6: 新的地址空间构建完毕, 释放旧资源
 	uvm_destroy_pgtbl(p->pgtbl);
-	pmem_free((uint64)p->tf, false);
 	if (p->mmap) {
 		mmap_region_t *mmap = p->mmap;
 		while (mmap) {

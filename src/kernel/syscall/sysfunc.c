@@ -168,6 +168,21 @@ uint64 sys_getpid()
 }
 
 /*
+    拉取调度统计快照
+    uint64 buf_user (sched_stat_t*)
+    uint32 max_entries
+    返回实际写入条目数
+*/
+uint64 sys_schedstat()
+{
+    uint64 buf_user;
+    uint32 max_entries;
+    arg_uint64(0, &buf_user);
+    arg_uint32(1, &max_entries);
+    return (uint64)proc_schedstat(buf_user, max_entries);
+}
+
+/*
     执行ELF文件以替换当前进程的内容
     char *path
     char **argv

@@ -149,6 +149,12 @@ void timer_interrupt_handler()
     if(mycpuid() == 0)
         timer_update();
 
+    // 调度统计：每个时钟tick，对当前RUNNING进程累计一次CPU占用
+    // 这样同时覆盖用户态与内核态执行时间；不加锁避免在中断上下文死锁。
+    proc_t *p = myproc();
+    if (p && p->state == RUNNING)
+        p->sched_cpu_ticks++;
+
     // 打印tick信息（调试）
     // uint64 ticks = timer_get_ticks();
     // if (ticks % 10 == 0) {
