@@ -1,4 +1,4 @@
-# LAB-10: 进程调度 之 MLFQ 与 性能分析
+# LAB-10: 进程调度 之 多级反馈调度算法（MLFQ） 与 性能分析
 
 在 Lab-9 实现完整系统功能的基础上，Lab-10 开始对内核性能进行针对性改进。我选择从**进程调度**入手进行优化，将原先的简单 **时间片轮转（RR）** 升级为更智能的 **多级反馈（MLFQ）** 调度算法，并引入了 **调度统计（Schedstat）** 机制，通过实测数据来定量分析优化效果。
 
@@ -354,7 +354,7 @@ if (woke)
   
 测试结果见 [`test_schedstat.png`](pictures/test_schedstat.png)，成功打印出所有子进程的 `pid`, `state`, `lvl` (优先级), `run` (运行次数) 等信息，验证了调度统计功能的正确性。
 
-### test_mlfq_aging: MLFQ 老化测
+### test_mlfq_aging: MLFQ 老化测试
 
 测试试代码见 `src/user/test_mlfq_aging.c`。该测试验证了 MLFQ 的**老化机制**是否有效，确保低优先级进程不会因长时间等待而饥饿。
 
