@@ -1,127 +1,127 @@
 #include "mod.h"
 
 /*
-	将ELF文件中的segment放入内存中制定位置
-	inode逻辑区域: [seg_start, seg_start + len)
-	进程地址空间: [va_start, va_start + len), 对应的物理页是存在的
+    将ELF文件中的segment放入内存中制定位置
+    inode逻辑区域: [seg_start, seg_start + len)
+    进程地址空间: [va_start, va_start + len), 对应的物理页是存在的
 */
 static void load_segment(inode_t *ip, pgtbl_t pgtbl, 
-	uint64 seg_start, uint64 va_start, uint32 len)
+    uint64 seg_start, uint64 va_start, uint32 len)
 {
-	assert(va_start % PGSIZE == 0, "load_segment: va aligned!");
+    assert(va_start % PGSIZE == 0, "load_segment: va aligned!");
 
-	pte_t *pte;
-	uint64 pa;
-	uint32 read_len, cut_len;
+    pte_t *pte;
+    uint64 pa;
+    uint32 read_len, cut_len;
 
-	for (read_len = 0; read_len < len; read_len += PGSIZE)
-	{
-		/* 获取物理内存地址 */
-		pte = vm_getpte(pgtbl, va_start + read_len, false);
-		pa = PTE_TO_PA(*pte);
-		assert(pa != 0, "load_segment: invalid pa!");
+    for (read_len = 0; read_len < len; read_len += PGSIZE)
+    {
+        /* 获取物理内存地址 */
+        pte = vm_getpte(pgtbl, va_start + read_len, false);
+        pa = PTE_TO_PA(*pte);
+        assert(pa != 0, "load_segment: invalid pa!");
 
-		/* 读入segment的一部分 */
-		cut_len = MIN(len - read_len, PGSIZE);
-		if (inode_read_data(ip, (uint32)seg_start + read_len, cut_len, (void*)pa, false) != cut_len)
-			panic("load_segment: read fail!");
-	}
+        /* 读入segment的一部分 */
+        cut_len = MIN(len - read_len, PGSIZE);
+        if (inode_read_data(ip, (uint32)seg_start + read_len, cut_len, (void*)pa, false) != cut_len)
+            panic("load_segment: read fail!");
+    }
 }
 
 /* 将程序的代码区和数据区读入用户堆中, 返回new_heap_top */
 static uint64 prepare_heap(pgtbl_t new_pgtbl, inode_t *ip, elf_header_t *eh)
 {
-	program_header_t ph;
-	uint64 new_heap_top = USER_BASE, old_heap_top = USER_BASE;
-	
-	for (uint32 off = eh->ph_off; off < eh->ph_off + eh->ph_ent_num * sizeof(ph); off += sizeof(ph))
-	{
-		// 读入一个program header
-		if (inode_read_data(ip, off, sizeof(ph), &ph, false) != sizeof(ph))
-			return -1;
-		
-		// 判断是否有必要载入
-		if (ph.type != ELF_PROG_LOAD)
-			continue;
-		
-		// program header参数的合法性检查
-		if (ph.mem_size < ph.file_size)
-			return -1;
-		if (ph.va + ph.mem_size < ph.va)
-			return -1;
-		if (ph.va % PGSIZE != 0)
-			return -1;
-		
-		//! 用户堆生长
-		uint32 perm = PTE_U;
-		if(ph.flags & ELF_PROG_FLAG_READ) perm |= PTE_R;
-		if(ph.flags & ELF_PROG_FLAG_WRITE) perm |= PTE_W;
-		if(ph.flags & ELF_PROG_FLAG_EXEC) perm |= PTE_X;
+    program_header_t ph;
+    uint64 new_heap_top = USER_BASE, old_heap_top = USER_BASE;
+    
+    for (uint32 off = eh->ph_off; off < eh->ph_off + eh->ph_ent_num * sizeof(ph); off += sizeof(ph))
+    {
+        // 读入一个program header
+        if (inode_read_data(ip, off, sizeof(ph), &ph, false) != sizeof(ph))
+            return -1;
+        
+        // 判断是否有必要载入
+        if (ph.type != ELF_PROG_LOAD)
+            continue;
+        
+        // program header参数的合法性检查
+        if (ph.mem_size < ph.file_size)
+            return -1;
+        if (ph.va + ph.mem_size < ph.va)
+            return -1;
+        if (ph.va % PGSIZE != 0)
+            return -1;
+        
+        //! 用户堆生长
+        uint32 perm = PTE_U;
+        if(ph.flags & ELF_PROG_FLAG_READ) perm |= PTE_R;
+        if(ph.flags & ELF_PROG_FLAG_WRITE) perm |= PTE_W;
+        if(ph.flags & ELF_PROG_FLAG_EXEC) perm |= PTE_X;
 
-		new_heap_top = uvm_heap_grow(new_pgtbl, old_heap_top,
-						ph.va + ph.mem_size - old_heap_top, perm);//! 更灵活的权限设置
-		if (new_heap_top != ph.va + ph.mem_size)
-			return -1;
-		old_heap_top = new_heap_top;
+        new_heap_top = uvm_heap_grow(new_pgtbl, old_heap_top,
+                        ph.va + ph.mem_size - old_heap_top, perm);//! 更灵活的权限设置
+        if (new_heap_top != ph.va + ph.mem_size)
+            return -1;
+        old_heap_top = new_heap_top;
 
-		// segment读入
-		load_segment(ip, new_pgtbl, ph.off, ph.va, ph.file_size);
-	}
+        // segment读入
+        load_segment(ip, new_pgtbl, ph.off, ph.va, ph.file_size);
+    }
 
-	return new_heap_top;
+    return new_heap_top;
 }
 
 /* 准备栈空间用于存储输入参数(4KB), 设置arg_count, 返回sp */
 static uint64 prepare_stack(pgtbl_t new_pgtbl, char **argv, int *arg_count)
 {
-	uint64 ustack_page;
-	uint64 sp = TRAPFRAME, sp_base = TRAPFRAME - PGSIZE;
-	uint64 sp_list[ELF_MAXARGS + 1];
-	uint32 argc, arg_len;
+    uint64 ustack_page;
+    uint64 sp = TRAPFRAME, sp_base = TRAPFRAME - PGSIZE;
+    uint64 sp_list[ELF_MAXARGS + 1];
+    uint32 argc, arg_len;
 
-	ustack_page = (uint64)pmem_alloc(false);
-	vm_mappages(new_pgtbl, sp_base, ustack_page, PGSIZE, PTE_R | PTE_W | PTE_U);
-	
-	for (argc = 0; argv[argc] != NULL; argc++)
-	{
-		if (argc >= ELF_MAXARGS)
-			return -1;
-		
-		arg_len = strlen(argv[argc]) + 1;
-		sp -= ALIGN_UP(arg_len, 16);
-		if (sp < sp_base)
-			return -1;
-		
-		uvm_copyout(new_pgtbl, sp, (uint64)argv[argc], arg_len);
+    ustack_page = (uint64)pmem_alloc(false);
+    vm_mappages(new_pgtbl, sp_base, ustack_page, PGSIZE, PTE_R | PTE_W | PTE_U);
+    
+    for (argc = 0; argv[argc] != NULL; argc++)
+    {
+        if (argc >= ELF_MAXARGS)
+            return -1;
+        
+        arg_len = strlen(argv[argc]) + 1;
+        sp -= ALIGN_UP(arg_len, 16);
+        if (sp < sp_base)
+            return -1;
+        
+        uvm_copyout(new_pgtbl, sp, (uint64)argv[argc], arg_len);
 
-		sp_list[argc] = sp;
-	}
-	sp_list[argc] = 0;
+        sp_list[argc] = sp;
+    }
+    sp_list[argc] = 0;
 
-	arg_len = (argc + 1) * sizeof(uint64);
-	sp -= ALIGN_UP(arg_len, 16);
-	if (sp < sp_base)
-		return -1;
+    arg_len = (argc + 1) * sizeof(uint64);
+    sp -= ALIGN_UP(arg_len, 16);
+    if (sp < sp_base)
+        return -1;
 
-	uvm_copyout(new_pgtbl, sp, (uint64)sp_list, arg_len);
+    uvm_copyout(new_pgtbl, sp, (uint64)sp_list, arg_len);
 
-	*arg_count = argc;
+    *arg_count = argc;
 
-	return sp;
+    return sp;
 }
 
 /*
-	执行ELF文件
-	输入路径和参数
-	成功返回argc, 失败返回-1
+    执行ELF文件
+    输入路径和参数
+    成功返回argc, 失败返回-1
 */
 int proc_exec(char *path, char **argv)
 {
-	proc_t *p = myproc();
-	
-	// step-0: 准备全新的pagetable和trapframe
-	// 分配一个新的物理页作为 Trapframe
-   	trapframe_t *new_tf = (trapframe_t*)pmem_alloc(false);
+    proc_t *p = myproc();
+    
+    // step-0: 准备全新的pagetable和trapframe
+    // 分配一个新的物理页作为 Trapframe
+    trapframe_t *new_tf = (trapframe_t*)pmem_alloc(false);
     if (!new_tf)  return -1;
     memset(new_tf, 0, sizeof(trapframe_t));
 
@@ -131,71 +131,76 @@ int proc_exec(char *path, char **argv)
         pmem_free((uint64)new_tf, false);
         return -1;
     }
-	
-	// step-1: 解析输入的文件路径, 获取ELF文件的inode
-	inode_t *ip = path_to_inode(path);
-	if (!ip) {
-		uvm_destroy_pgtbl(new_pgtbl);
-		return -1;
-	}
-	
-	// step-2: 读取ELF_header
-	elf_header_t eh;
-	uint32 data_size = inode_read_data(ip, 0, sizeof(eh), &eh, false);
-	if (data_size != sizeof(eh) || eh.magic != ELF_MAGIC) { 
-		inode_put(ip);
-		uvm_destroy_pgtbl(new_pgtbl);
-		return -1;
-	}
-	
-	// step-3: 按照顺序读取需要载入内存的Segment, 填充到用户堆区域
-	uint64 new_heap_top = prepare_heap(new_pgtbl, ip, &eh);
-	if (new_heap_top == -1) {
-		inode_put(ip);
-		uvm_destroy_pgtbl(new_pgtbl);
-		return -1;
-	}
-	
-	// step-4: 释放ELF的inode
-	inode_put(ip);
-	
-	// step-5: 处理输入的参数列表argv, 填充到用户栈区域
-	int argc;
-	uint64 sp = prepare_stack(new_pgtbl, argv, &argc);
-	if (sp == -1) {
-		uvm_destroy_pgtbl(new_pgtbl);
-		return -1;
-	}
-	
-	// step-6: 新的地址空间构建完毕, 释放旧资源
-	uvm_destroy_pgtbl(p->pgtbl);
-	if (p->mmap) {
-		mmap_region_t *mmap = p->mmap;
-		while (mmap) {
-			mmap_region_t *next = mmap->next;
-			mmap_region_free(mmap);
-			mmap = next;
-		}
-	}
-	
-	// step-7: 设置trapframe的相关字段
-	new_tf->a0 = argc;       
-	new_tf->a1 = sp;        
-	new_tf->user_to_kern_epc = eh.entry;   
-	new_tf->sp = sp;          
-	
-	// step-8: 更新进程的相关字段
-	p->pgtbl = new_pgtbl;
-	p->tf = new_tf;
-	p->heap_top = new_heap_top;
-	p->ustack_npage = 1;     
-	p->mmap = NULL;
-	int i;
+    
+    // step-1: 解析输入的文件路径, 获取ELF文件的inode
+    inode_t *ip = path_to_inode(path);
+    if (!ip) {
+        // pmem_free((uint64)new_tf, false); 【修复】
+        uvm_destroy_pgtbl(new_pgtbl);
+        return -1;
+    }
+    
+    // step-2: 读取ELF_header
+    elf_header_t eh;
+    uint32 data_size = inode_read_data(ip, 0, sizeof(eh), &eh, false);
+    if (data_size != sizeof(eh) || eh.magic != ELF_MAGIC) { 
+        inode_put(ip);
+        // pmem_free((uint64)new_tf, false); 【修复】
+        uvm_destroy_pgtbl(new_pgtbl);
+        return -1;
+    }
+    
+    // step-3: 按照顺序读取需要载入内存的Segment, 填充到用户堆区域
+    uint64 new_heap_top = prepare_heap(new_pgtbl, ip, &eh);
+    if (new_heap_top == -1) {
+        inode_put(ip);
+        // pmem_free((uint64)new_tf, false); 【修复】
+        uvm_destroy_pgtbl(new_pgtbl);
+        return -1;
+    }
+    
+    // step-4: 释放ELF的inode
+    inode_put(ip);
+    
+    // step-5: 处理输入的参数列表argv, 填充到用户栈区域
+    int argc;
+    uint64 sp = prepare_stack(new_pgtbl, argv, &argc);
+    if (sp == -1) {
+        // pmem_free((uint64)new_tf, false); 【修复】
+        uvm_destroy_pgtbl(new_pgtbl);
+        return -1;
+    }
+    
+    // step-6: 新的地址空间构建完毕, 释放旧资源
+    uvm_destroy_pgtbl(p->pgtbl);
+    // pmem_free((uint64)p->tf, false); 【修复】
+    if (p->mmap) {
+        mmap_region_t *mmap = p->mmap;
+        while (mmap) {
+            mmap_region_t *next = mmap->next;
+            mmap_region_free(mmap);
+            mmap = next;
+        }
+    }
+    
+    // step-7: 设置trapframe的相关字段
+    new_tf->a0 = argc;       
+    new_tf->a1 = sp;        
+    new_tf->user_to_kern_epc = eh.entry;   
+    new_tf->sp = sp;          
+    
+    // step-8: 更新进程的相关字段
+    p->pgtbl = new_pgtbl;
+    p->tf = new_tf;
+    p->heap_top = new_heap_top;
+    p->ustack_npage = 1;     
+    p->mmap = NULL;
+    int i;
     for(i = 0; i < sizeof(p->name) - 1 && path[i] != '\0'; i++){
         p->name[i] = path[i];
     }
     p->name[i] = '\0';
-	p->name[sizeof(p->name) - 1] = '\0';
-	
-	return argc;
+    p->name[sizeof(p->name) - 1] = '\0';
+    
+    return argc;
 }

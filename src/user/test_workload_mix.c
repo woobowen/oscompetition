@@ -102,7 +102,16 @@ int main(void)
     }
 
     sys_sleep(30);
-    dump_stats("mid");
+    dump_stats("mid1");
+
+    sys_sleep(30);
+    dump_stats("mid2");
+
+    sys_sleep(1);
+    dump_stats("mid3");
+
+    sys_sleep(1);
+    dump_stats("mid4");
 
     fprintf(STDOUT, "test_workload_mix: waiting children... started=%d\n", started);
     for (int i = 0; i < started; i++) {
