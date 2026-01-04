@@ -118,6 +118,7 @@ OS2025-SEAOS
   - **智能唤醒选核 (Smart Wakeup)**：基于负载权重 (`L0`, `Running`) 选择**最佳 CPU**，减少唤醒延迟。
   - **L0 队首插队 (Head Insertion)**：唤醒的交互式任务直接插入 L0 **队首**，实现极速响应。
   - **马尔可夫预测 (Markov Prediction)**：根据历史行为**预测**进程 Burst 类型，**自适应**调整时间片。
+  - **防饥饿机制 (Lazy Aging)**：采用**惰性老化**策略，以 $O(1)$ 开销防止低优先级任务饥饿。
 
 ---
 
@@ -200,25 +201,26 @@ graph TD
 - **任务窃取 (Work Stealing)**：
     为了防止“**一核有难，八核围观**”的**负载不均**现象，当某个 CPU 的本地队列为空时，它会尝试从其他 CPU 的队列中 **“偷”任务**。
     - **窃取策略**：
-      我采用了**仅从 `L2` (最低优先级) 队列尾部窃取**的保守策略，以下是我设计时的考量：
-      - **只偷 `L2`**: `L0`/`L1` 存放的是**对延迟敏感的交互式任务**，留在原核可以保持更好的 Cache 亲和性；而 `L2` 任务是**长耗时的 CPU 密集型任务**，跨核迁移带来的开销远小于其运行收益。
-      - **从队尾偷**: 目标 CPU 总是从队首取任务，我从队尾偷可以尽量**避免与目标 CPU 产生直接竞争**，有效降低对目标 CPU 正常调度的干扰。
+      我采用了**分级窃取**的策略，优先保证交互性，其次保证吞吐量：
+      1.  **首选策略：偷 `L2` 队尾**。
+          - `L2` 存放的是**长耗时的 CPU 密集型任务**，跨核迁移带来的开销远小于其运行收益。
+          - 从队尾偷可以尽量**避免与目标 CPU 产生直接竞争**（目标 CPU 取队首）。
+      2.  **次选策略：偷 `L1` 队尾（仅当 `L2` 没得偷时）**。
+          - 如果目标 CPU 的 `L2` 也是空的，且**其 `L0` 也是空的**（说明它真的很闲，或者只剩 `L1` 任务），我们才尝试从其 `L1` 队尾偷取。
+          - **为何不偷 `L0`？** `L0` 是极度敏感的交互式任务，必须留在原核以保证 Cache 亲和性和极低延迟。
     - **实现细节**：
-      在 `mlfq_pick_next` 函数中，当本地所有级别的队列均为空时，会触发跨核窃取逻辑。通过 `runq_pop_tail` **从目标核最不紧急的`L2`队列末尾获取进程**，如下所示：
+      在 `mlfq_pick_next` 函数中，当本地所有级别的队列均为空时，会触发跨核窃取逻辑。
       ```c
       // mlfq.c: mlfq_pick_next
+      // 1. 尝试偷 L2
       for (int victim = 0; victim < NCPU; victim++) {
-          if (victim == cpu) continue;
-          spinlock_acquire(&mlfq_rq[victim].lk); // 跨核获取 victim 的锁
-          
-          // 策略：仅从 victim 的 L2 队列尾部偷取任务
-          p = runq_pop_tail(&mlfq_rq[victim].q[MLFQ_LEVELS - 1]); 
-          if (p) {
-              runq_push_tail(&mlfq_rq[cpu].q[MLFQ_LEVELS - 1], p);
-              spinlock_release(&mlfq_rq[victim].lk);
-              break; // 偷到一个任务即刻返回，减少锁持有时间
-          }
-          spinlock_release(&mlfq_rq[victim].lk);
+          // ... 尝试从 victim->q[L2] pop_tail ...
+      }
+      
+      // 2. 如果没偷到，且 victim 比较空 (L0 为空)，尝试偷 L1
+      for (int victim = 0; victim < NCPU; victim++) {
+           // ... 检查 victim->q[0] 是否为空 ...
+           // ... 尝试从 victim->q[1] pop_tail ...
       }
       ```
 
@@ -398,6 +400,17 @@ flowchart LR
     style CheckL2 fill:#e1f5fe,stroke:#01579b,stroke-width:2px
 ```
 
+### 5. 防饥饿机制 (Lazy Aging)
+
+在 Lab-10 中，我引入了基础的 Aging 机制来防止低优先级任务饥饿。但在 Lab-11 的多核高并发场景下，遍历所有进程带来的 $O(N)$ 开销变得不可忽视。因此，我将其升级为 **Lazy Aging (惰性老化)** 策略。
+
+- **原理**：
+  系统会记录每个处于 `RUNNABLE` 状态的进程在就绪队列中的**等待时间**。一旦等待时间超过阈值 `MLFQ_AGING_THRESHOLD`（例如 10 ticks），该进程的优先级就会被**提升一级**（如 L2 -> L1）。
+
+- **Lazy Aging 优化**：
+  为了避免在每个 tick 遍历所有进程，我采用了**分摊开销**的策略：
+  - 在 `mlfq_age_tick` 中，每次**只扫描队列中的一小部分进程**（`MLFQ_AGING_BUDGET`，例如 4 个）。
+  - 这种方式既保证了饥饿进程最终会被处理（最终一致性），又将调度器的额外开销严格控制在**常数级别**，避免了随着进程数增加而导致的性能抖动。
 
 ---
 
