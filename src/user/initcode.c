@@ -2,8 +2,8 @@
 
 int main()
 {
-	char path[] = "./test_workload_io";
-	char arg0[] = "test_io";
+	char path[] = "./test_mlfq_preempt";
+	char arg0[] = "test_8";
 	char arg1[] = "111";
 	char arg2[] = "222";
 	char arg3[] = "333";

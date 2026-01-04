@@ -77,56 +77,77 @@ test_workload_io: done
 
 run ./test_workload_mix test_mix 111 222 333
 
-======== test start ========
+======== test start  ========
 
 test_workload_mix: start (cpu=6 io=6 burst=1)
 [mid1] entries=15
  pid state lvl cpu wait_sum wait_max run ready ctx preExp preHigh yield sleep first
- 1 SLEEPING 0 0 0 0 33 33 33 0 0 0 33 1
- 2 RUNNING 0 0 0 0 34 34 33 0 0 0 33 1
- 3 ZOMBIE 0 0 0 0 1 1 1 0 0 0 0 2
- 4 ZOMBIE 0 0 0 0 1 1 1 0 0 0 0 2
- 5 ZOMBIE 1 2 0 0 3 3 3 1 1 0 0 2
- 6 ZOMBIE 1 2 0 0 3 3 3 1 1 0 0 2
- 7 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 3
- 8 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 3
- 9 SLEEPING 0 0 1 1 30 30 30 0 0 0 30 3
-10 SLEEPING 0 0 1 1 30 30 30 0 0 0 30 3
-
+1 SLEEPING 0 0 0 0 33 33 33 0 0 0 33 1
+2 RUNNING 0 0 1 1 33 33 32 0 0 0 32 1
+3 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 1
+4 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 1
+5 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 2
+6 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 2
+7 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 2
+8 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 2
+9 SLEEPING 0 0 2 2 29 29 29 0 0 0 29 3
+10 SLEEPING 0 0 2 2 29 29 29 0 0 0 29 3
+11 SLEEPING 0 0 2 2 29 29 29 0 0 0 29 3
+12 SLEEPING 0 0 2 2 29 29 29 0 0 0 29 3
+13 SLEEPING 0 0 2 2 29 29 29 0 0 0 29 3
+14 SLEEPING 0 0 2 2 29 29 29 0 0 0 29 3
+15 ZOMBIE 0 0 2 2 25 25 25 0 0 0 24 3
+[mid2] entries=15
+ pid state lvl cpu wait_sum wait_max run ready ctx preExp preHigh yield sleep first
+1 SLEEPING 0 0 0 0 33 33 33 0 0 0 33 1
+2 RUNNING 0 0 1 1 63 63 62 0 0 0 62 1
+3 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 1
+4 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 1
+5 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 2
+6 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 2
+7 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 2
+8 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 2
+9 SLEEPING 0 0 2 2 59 59 59 0 0 0 59 3
+10 RUNNING 0 0 2 2 59 59 58 0 0 0 58 3
+11 RUNNABLE 0 0 2 2 58 59 58 0 0 0 58 3
+12 RUNNABLE 0 0 2 2 58 59 58 0 0 0 58 3
+13 RUNNABLE 0 0 2 2 58 59 58 0 0 0 58 3
+14 RUNNABLE 0 0 2 2 58 59 58 0 0 0 58 3
+15 ZOMBIE 0 0 2 2 25 25 25 0 0 0 24 3
 [mid3] entries=15
  pid state lvl cpu wait_sum wait_max run ready ctx preExp preHigh yield sleep first
- 1 SLEEPING 0 0 0 0 33 33 33 0 0 0 33 1
- 2 RUNNING 0 0 1 1 64 64 63 0 0 0 63 2
- 3 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 2
- 4 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 2
- 5 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 3
- 6 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 3
- 7 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 3
- 8 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 3
- 9 RUNNING 0 0 2 2 60 60 59 0 0 0 59 4
-10 RUNNABLE 0 0 2 2 59 60 59 0 0 0 59 4
-11 RUNNABLE 0 0 2 2 59 60 59 0 0 0 59 4
-12 RUNNABLE 0 0 2 2 59 60 59 0 0 0 59 4
-13 RUNNABLE 0 0 2 2 59 60 59 0 0 0 59 4
-14 RUNNABLE 0 0 2 2 59 60 59 0 0 0 59 4
-15 ZOMBIE 0 0 2 2 25 25 25 0 0 0 24 4
+1 SLEEPING 0 0 0 0 33 33 33 0 0 0 33 1
+2 RUNNING 0 0 1 1 64 64 63 0 0 0 63 1
+3 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 1
+4 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 1
+5 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 2
+6 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 2
+7 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 2
+8 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 2
+9 RUNNING 0 0 2 2 60 60 59 0 0 0 59 3
+10 RUNNABLE 0 0 2 2 59 60 59 0 0 0 59 3
+11 RUNNABLE 0 0 2 2 59 60 59 0 0 0 59 3
+12 RUNNABLE 0 0 2 2 59 60 59 0 0 0 59 3
+13 RUNNABLE 0 0 2 2 59 60 59 0 0 0 59 3
+14 RUNNABLE 0 0 2 2 59 60 59 0 0 0 59 3
+15 ZOMBIE 0 0 2 2 25 25 25 0 0 0 24 3
 [mid4] entries=15
  pid state lvl cpu wait_sum wait_max run ready ctx preExp preHigh yield sleep first
- 1 SLEEPING 0 0 0 0 33 33 33 0 0 0 33 1
- 2 RUNNING 0 0 1 1 65 65 64 0 0 0 64 2
- 3 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 2
- 4 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 2
- 5 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 3
- 6 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 3
- 7 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 3
- 8 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 3
- 9 ZOMBIE 0 0 2 2 61 61 61 0 0 0 60 4
-10 RUNNABLE 0 0 2 2 60 61 60 0 0 0 60 4
-11 RUNNABLE 0 0 2 2 60 61 60 0 0 0 60 4
-12 RUNNABLE 0 0 2 2 60 61 60 0 0 0 60 4
-13 RUNNABLE 0 0 2 2 60 61 60 0 0 0 60 4
-14 RUNNABLE 0 0 2 2 60 61 60 0 0 0 60 4
-15 ZOMBIE 0 0 2 2 25 25 25 0 0 0 24 4
+1 SLEEPING 0 0 0 0 33 33 33 0 0 0 33 1
+2 RUNNING 0 1 1 1 66 66 65 1 0 0 64 1
+3 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 1
+4 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 1
+5 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 2
+6 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 2
+7 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 2
+8 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 2
+9 ZOMBIE 0 0 2 2 61 61 61 0 0 0 60 3
+10 ZOMBIE 0 0 2 2 61 61 61 0 0 0 60 3
+11 ZOMBIE 0 0 2 2 61 61 61 0 0 0 60 3
+12 ZOMBIE 0 0 2 2 61 61 61 0 0 0 60 3
+13 ZOMBIE 0 0 2 2 61 61 61 0 0 0 60 3
+14 ZOMBIE 0 0 2 2 61 61 61 0 0 0 60 3
+15 ZOMBIE 0 0 2 2 25 25 25 0 0 0 24 3
 test_workload_mix: waiting children... started=13
 wait #0 -> 3
 wait #1 -> 4
@@ -143,11 +164,12 @@ wait #11 -> 14
 wait #12 -> 15
 [end] entries=2
  pid state lvl cpu wait_sum wait_max run ready ctx preExp preHigh yield sleep first
- 1 SLEEPING 0 0 0 0 33 33 33 0 0 0 33 1
- 2 RUNNING 1 1 1 1 66 66 65 1 0 0 64 2
+1 SLEEPING 0 0 0 0 33 33 33 0 0 0 33 1
+2 RUNNING 0 1 1 1 66 66 65 1 0 0 64 1
 test_workload_mix: done
 
 ======== test sucess ========
+
 
 
 lab-11:
