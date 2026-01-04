@@ -77,6 +77,13 @@ typedef struct sched_stat {
     uint64 yield_voluntary;
     uint64 sleep_count;
     uint64 first_run_tick;
+
+    // Lab-11: Markov / Adaptive quantum
+    uint64 mkv_pred_total;
+    uint64 mkv_pred_hit;
+    uint64 mkv_l2_boost_count;
+    uint32 mkv_last_pred_state;
+    uint32 mkv_last_act_state;
 } sched_stat_t;
 
 /* 第一类: 系统调用函数 */

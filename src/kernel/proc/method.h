@@ -29,6 +29,9 @@ proc_t *mlfq_pick_next(void);                        // 选择下一个RUNNABLE�
 bool mlfq_has_higher(int level);                     // 是否存在更高优先级的就绪进程
 void mlfq_age_tick(void);                            // aging: 更新等待tick并按阈值提升
 
+// Lab-11: 运行状态提示(用于 wakeup 的负载评估)
+void mlfq_set_cpu_running(int cpu, int running);
+
 // MLFQ 内部锁(用于保证全局锁顺序: 先 mlfq, 后 p->lk)
 void mlfq_lock(void);
 void mlfq_unlock(void);

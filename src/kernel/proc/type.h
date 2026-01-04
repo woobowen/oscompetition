@@ -97,6 +97,9 @@ enum proc_state
 #define MLFQ_YIELD_HIGHER  2  // 更高优先级任务就绪导致抢占
 #define MLFQ_YIELD_VOLUNTARY 3 // 主动让出(当前未使用)
 
+// Lab-11: Markov 状态数 (S/M/L × sleep/expire/higher)
+#define MLFQ_MKV_STATES 9
+
 // 单个进程最多打开N_OPEN_FILE_PER_PROC个文件
 #define N_OPEN_FILE_PER_PROC 10
 
@@ -120,6 +123,28 @@ typedef struct proc
     int mlfq_in_readyq;    // 是否在就绪队列中(防重复入队)
     int mlfq_yield_reason; // 本次让出CPU的原因(由tick设置)
     uint32 mlfq_wait_ticks; // aging: RUNNABLE 等待tick累计
+
+    // Lab-11: Per-CPU Runqueue + Lazy Aging
+    int mlfq_cpu;               // 当前所在就绪队列的 CPU 编号
+    uint64 mlfq_age_start_tick; // 本次进入就绪队列(或上次被 aging 提升)的起始 tick
+
+    // Lab-11: Markov 统计
+    uint8 mkv_has_prev;                       // 是否已有上一状态
+    uint8 mkv_prev_state;                     // 上一状态编号 [0, MLFQ_MKV_STATES)
+    uint16 mkv_pad;
+    uint32 mkv_trans[MLFQ_MKV_STATES][MLFQ_MKV_STATES]; // 转移计数
+
+    // Lab-11: Markov 预测可观测性
+    uint8 mkv_pred_valid;       // 是否存在“下一次 slice”的预测结果
+    uint8 mkv_last_pred_state;  // 最近一次预测的状态
+    uint8 mkv_last_act_state;   // 最近一次实际观测到的状态
+    uint8 mkv_pad2;
+    uint64 mkv_pred_total;      // 产生预测的次数(通常等于分配时间片次数)
+    uint64 mkv_pred_hit;        // 预测命中的次数
+    uint64 mkv_l2_boost_count;  // L2 量子被放大的次数
+
+    // Lab-11: Markov burst 计时基准（使用 sched_cpu_ticks 差值，避免多核全局 tick 偏差）
+    uint64 mkv_run_start_cpu_ticks;
 
     // 调度统计(用于对比不同调度策略)
     uint64 sched_last_ready_tick; // 最近一次进入RUNNABLE并入队的tick
@@ -167,6 +192,13 @@ typedef struct sched_stat {
     uint64 yield_voluntary;
     uint64 sleep_count;
     uint64 first_run_tick;
+
+    // Lab-11: Markov / Adaptive quantum
+    uint64 mkv_pred_total;
+    uint64 mkv_pred_hit;
+    uint64 mkv_l2_boost_count;
+    uint32 mkv_last_pred_state;
+    uint32 mkv_last_act_state;
 } sched_stat_t;
 
 // 系统中最多同时存在N_PROC个进程

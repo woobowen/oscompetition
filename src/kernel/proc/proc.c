@@ -3,6 +3,76 @@
 // trap/timer.c: 已存在，用于读取全局 tick
 extern uint64 timer_get_ticks();
 
+// ---- Lab-11: Markov(S/M/L × sleep/expire/higher) 统计更新（预测在 mlfq.c 中使用） ----
+
+#define MKV_BURST_S 0
+#define MKV_BURST_M 1
+#define MKV_BURST_L 2
+
+#define MKV_R_SLEEP 0
+#define MKV_R_EXPIRE 1
+#define MKV_R_HIGHER 2
+
+static int mkv_burst_class(uint64 run_ticks)
+{
+    // 分档阈值贴合当前 quantum/tick：
+    // S: 1
+    // M: 2~4
+    // L: >=5
+    if (run_ticks <= 1) return MKV_BURST_S;
+    if (run_ticks <= 4) return MKV_BURST_M;
+    return MKV_BURST_L;
+}
+
+// 要求：调用者已持有 p->lk
+// 不能用 timer_get_ticks() 来算 slice 时长：该系统只让 CPU0 更新全局 tick。
+// 这里改用 sched_cpu_ticks 的差值，保证多核下统计可靠。
+static void mkv_on_stop_locked(proc_t *p, int yield_reason, uint64 now)
+{
+    if (p->sched_run_start_tick == 0)
+        return;
+
+    (void)now;
+
+    uint64 run_ticks = 0;
+    if (p->sched_cpu_ticks >= p->mkv_run_start_cpu_ticks)
+        run_ticks = p->sched_cpu_ticks - p->mkv_run_start_cpu_ticks;
+    if (run_ticks == 0)
+        run_ticks = 1;
+
+    int burst = mkv_burst_class(run_ticks);
+
+    int reason = MKV_R_SLEEP;
+    if (yield_reason == MLFQ_YIELD_EXPIRE)
+        reason = MKV_R_EXPIRE;
+    else if (yield_reason == MLFQ_YIELD_HIGHER)
+        reason = MKV_R_HIGHER;
+
+    int state = burst * 3 + reason;
+    if (state < 0 || state >= MLFQ_MKV_STATES)
+        return;
+
+    // 记录最近一次实际观测
+    p->mkv_last_act_state = (uint8)state;
+
+    // 预测命中统计：将“最近一次预测”与本次实际观测对比
+    if (p->mkv_pred_valid) {
+        if (p->mkv_last_pred_state == (uint8)state)
+            p->mkv_pred_hit++;
+        p->mkv_pred_valid = 0; // 消费掉一次预测，避免重复命中计数
+    }
+
+    if (p->mkv_has_prev) {
+        int prev = (int)p->mkv_prev_state;
+        if (prev >= 0 && prev < MLFQ_MKV_STATES)
+            p->mkv_trans[prev][state]++;
+    } else {
+        p->mkv_has_prev = 1;
+    }
+
+    p->mkv_prev_state = (uint8)state;
+}
+
 // 这个文件通过make build生成, 是proczero对应的ELF文件
 #include "../../user/initcode.h"
 #define initcode target_user_initcode
@@ -108,6 +178,25 @@ proc_t *proc_alloc()
             p->mlfq_yield_reason = MLFQ_YIELD_NONE;
             p->mlfq_wait_ticks = 0;
 
+            // Lab-11: Per-CPU Runqueue + Lazy Aging
+            p->mlfq_cpu = 0;
+            p->mlfq_age_start_tick = 0;
+
+            // Lab-11: Markov 统计
+            p->mkv_has_prev = 0;
+            p->mkv_prev_state = 0;
+            p->mkv_pad = 0;
+            memset(p->mkv_trans, 0, sizeof(p->mkv_trans));
+
+            p->mkv_pred_valid = 0;
+            p->mkv_last_pred_state = 0;
+            p->mkv_last_act_state = 0;
+            p->mkv_pad2 = 0;
+            p->mkv_pred_total = 0;
+            p->mkv_pred_hit = 0;
+            p->mkv_l2_boost_count = 0;
+            p->mkv_run_start_cpu_ticks = 0;
+
             // 调度统计初始化
             p->sched_last_ready_tick = 0;
             p->sched_run_start_tick = 0;
@@ -180,6 +269,25 @@ void proc_free(proc_t *p)
     p->mlfq_in_readyq = 0;
     p->mlfq_yield_reason = MLFQ_YIELD_NONE;
     p->mlfq_wait_ticks = 0;
+
+    // Lab-11: Per-CPU Runqueue + Lazy Aging
+    p->mlfq_cpu = 0;
+    p->mlfq_age_start_tick = 0;
+
+    // Lab-11: Markov 统计
+    p->mkv_has_prev = 0;
+    p->mkv_prev_state = 0;
+    p->mkv_pad = 0;
+    memset(p->mkv_trans, 0, sizeof(p->mkv_trans));
+
+    p->mkv_pred_valid = 0;
+    p->mkv_last_pred_state = 0;
+    p->mkv_last_act_state = 0;
+    p->mkv_pad2 = 0;
+    p->mkv_pred_total = 0;
+    p->mkv_pred_hit = 0;
+    p->mkv_l2_boost_count = 0;
+    p->mkv_run_start_cpu_ticks = 0;
 
     // 调度统计清理
     p->sched_last_ready_tick = 0;
@@ -291,6 +399,7 @@ void proc_make_first()
 
     // 调度统计：进入就绪态
     p->sched_last_ready_tick = timer_get_ticks();
+    p->mlfq_age_start_tick = p->sched_last_ready_tick;
     p->sched_ready_count++;
 
     // 5. 设置 trapframe 中的入口与用户栈
@@ -337,6 +446,7 @@ int proc_fork()
 
     // 调度统计：进入就绪态
     child->sched_last_ready_tick = timer_get_ticks();
+    child->mlfq_age_start_tick = child->sched_last_ready_tick;
     child->sched_ready_count++;
 
     // 复制页表
@@ -425,10 +535,14 @@ void proc_yield()
 
     // 调度统计：按原因计数 + 重新进入就绪态
     p->sched_last_ready_tick = now;
+    p->mlfq_age_start_tick = now;
     p->sched_ready_count++;
     if (reason == MLFQ_YIELD_EXPIRE) p->sched_preempt_expire++;
     else if (reason == MLFQ_YIELD_HIGHER) p->sched_preempt_higher++;
     else if (reason == MLFQ_YIELD_VOLUNTARY) p->sched_yield_voluntary++;
+
+    // Lab-11: Markov（slice 结束：expire/higher）
+    mkv_on_stop_locked(p, reason, now);
 
     // 入队(当前已持有 mlfq_lock)
     mlfq_on_yield_locked(p, reason);
@@ -564,6 +678,9 @@ void proc_sleep(void *sleep_space, spinlock_t *lock)
     // 防御：进程处于 SLEEPING 时不应在就绪队列中。
     p->mlfq_in_readyq = 0;
     p->sched_sleep_count++;
+
+    // Lab-11: Markov（slice 结束：sleep）
+    mkv_on_stop_locked(p, MLFQ_YIELD_NONE, timer_get_ticks());
     // printf("proc %d is sleeping!\n", p->pid);
 
     // 切到调度器
@@ -592,6 +709,7 @@ void proc_wakeup(void *sleep_space)
             p->state = RUNNABLE;
             p->sleep_space = NULL;
             p->sched_last_ready_tick = timer_get_ticks();
+            p->mlfq_age_start_tick = p->sched_last_ready_tick;
             p->sched_ready_count++;
             // 防御：清理可能残留的 in_readyq 标志，确保一定能重新入队
             p->mlfq_in_readyq = 0;
@@ -630,6 +748,9 @@ void proc_scheduler()
         intr_on(); // 开启中断，否则所有进程 sleep 时 CPU 会死锁在关中断状态！
         c->proc = NULL;
 
+        // Lab-11: 该 CPU 处于 scheduler 循环中(不在运行进程)
+        mlfq_set_cpu_running(mycpuid(), 0);
+
         proc_t *p = mlfq_pick_next();
         if (p == NULL)
             continue;
@@ -644,6 +765,9 @@ void proc_scheduler()
         p->state = RUNNING;
         c->proc = p;
 
+        // Lab-11: 标记该 CPU 正在运行进程(用于 wakeup 负载评估)
+        mlfq_set_cpu_running(mycpuid(), 1);
+
         // 调度统计：RUNNABLE -> RUNNING
         uint64 now = timer_get_ticks();
         if (p->sched_first_run_tick == 0)
@@ -656,6 +780,12 @@ void proc_scheduler()
         }
         p->sched_run_start_tick = now;
         p->sched_run_count++;
+
+        // Lab-11: Per-CPU 归属（便于后续 enqueue/steal 的 locality）
+        p->mlfq_cpu = mycpuid();
+
+        // Lab-11: Markov burst 计时起点（使用 sched_cpu_ticks）
+        p->mkv_run_start_cpu_ticks = p->sched_cpu_ticks;
 
         swtch(&c->ctx, &p->ctx);
 
@@ -699,6 +829,13 @@ uint32 proc_schedstat(uint64 user_dst, uint32 max_entries)
         st.yield_voluntary = p->sched_yield_voluntary;
         st.sleep_count = p->sched_sleep_count;
         st.first_run_tick = p->sched_first_run_tick;
+
+        // Lab-11: Markov / Adaptive quantum
+        st.mkv_pred_total = p->mkv_pred_total;
+        st.mkv_pred_hit = p->mkv_pred_hit;
+        st.mkv_l2_boost_count = p->mkv_l2_boost_count;
+        st.mkv_last_pred_state = (uint32)p->mkv_last_pred_state;
+        st.mkv_last_act_state = (uint32)p->mkv_last_act_state;
         spinlock_release(&p->lk);
 
         uvm_copyout(caller->pgtbl,
