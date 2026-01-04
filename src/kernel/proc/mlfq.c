@@ -33,8 +33,16 @@ static mlfq_cpu_rq_t mlfq_rq[NCPU];
 // 1 表示该 CPU 正在运行某个进程(不在 scheduler 循环里)。
 static uint8 mlfq_cpu_running[NCPU];
 
+// ---- wakeup 选核可调参数（集中在这里便于调参/写报告） ----
 // wakeup 迁移抖动抑制：最佳 CPU 与本 CPU 负载差距不大则留本核。
 #define MLFQ_WAKEUP_HYSTERESIS 0
+
+// wakeup/newproc 选核时的负载权重：load = w0*L0 + w1*L1 + w2*L2 + wr*running
+// 注：running 是一个轻量提示（该 CPU 当前是否正在跑用户进程）。
+#define MLFQ_WAKEUP_W_L0      2
+#define MLFQ_WAKEUP_W_L1      1
+#define MLFQ_WAKEUP_W_L2      1
+#define MLFQ_WAKEUP_W_RUNNING 2
 
 // 新建进程入队时的“打散”轮转起点，用于负载相同时的 tie-break。
 static uint32 mlfq_new_rr;
@@ -163,11 +171,10 @@ static int mlfq_cpu_load_locked(int cpu)
 	// I/O 友好：对 L0(最高优先级)队列加权更大，使 wakeup 更倾向于把任务放到
 	// L0 更空的 CPU（降低唤醒后排队等待）。
 	int load = 0;
-	load += 2 * mlfq_rq[cpu].q[0].size;
-	for (int l = 1; l < MLFQ_LEVELS; l++)
-		load += mlfq_rq[cpu].q[l].size;
-	// running 权重提高：避免把 wakeup 任务塞给“正在跑用户进程”的 CPU。
-	load += (mlfq_cpu_running[cpu] ? 2 : 0);
+	load += MLFQ_WAKEUP_W_L0 * mlfq_rq[cpu].q[0].size;
+	load += MLFQ_WAKEUP_W_L1 * mlfq_rq[cpu].q[1].size;
+	load += MLFQ_WAKEUP_W_L2 * mlfq_rq[cpu].q[2].size;
+	load += (mlfq_cpu_running[cpu] ? MLFQ_WAKEUP_W_RUNNING : 0);
 	return load;
 }
 

@@ -61,6 +61,7 @@ typedef struct file_stat {
 } file_stat_t;
 
 // 调度统计快照(与内核 sched_stat_t 对齐)
+#define SCHEDSTAT_HAS_MKV 1
 typedef struct sched_stat {
     uint32 pid;
     uint32 state;

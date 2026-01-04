@@ -795,7 +795,273 @@ test_workload_mix: done
 
 修改：把 wakeup 的任务插入 L0 队列头部（而不是尾部），这样刚被唤醒的 I/O 任务更容易立刻得到 CPU
 
+run ./test_workload_mix test_mix 111 222 333
+
+======== test start  ========
+
+test_workload_mix: start (cpu=6 io=6 burst=1)
+[mid1] entries=15
+ pid state lvl cpu wait_sum wait_max run ready ctx preExp preHigh yield sleep first mkvP mkvH mkvB pred act
+1 SLEEPING 0 0 0 0 33 33 33 0 0 0 33 1 32 32 0 S/sleep S/sleep
+2 RUNNING 0 1 0 0 35 35 34 1 0 0 33 1 34 32 0 S/sleep S/sleep
+3 ZOMBIE 0 0 0 0 1 1 1 0 0 0 0 2 0 0 0 S/sleep S/sleep
+4 ZOMBIE 0 0 0 0 1 1 1 0 0 0 0 2 0 0 0 S/sleep S/sleep
+5 ZOMBIE 1 2 0 0 3 3 3 1 1 0 0 2 1 0 0 S/expire S/higher
+6 ZOMBIE 1 2 1 1 3 3 3 1 1 0 0 2 1 0 0 S/expire S/higher
+7 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 3 0 0 0 S/sleep S/sleep
+8 ZOMBIE 0 0 0 0 1 1 1 0 0 0 0 2 0 0 0 S/sleep S/sleep
+9 SLEEPING 0 0 1 1 30 30 30 0 0 0 30 3 29 29 0 S/sleep S/sleep
+10 RUNNABLE 0 0 1 1 29 30 29 0 0 0 29 3 29 28 0 S/sleep S/sleep
+11 SLEEPING 0 0 1 1 30 30 30 0 0 0 30 3 29 29 0 S/sleep S/sleep
+12 SLEEPING 0 0 1 1 30 30 30 0 0 0 30 3 29 29 0 S/sleep S/sleep
+13 RUNNABLE 0 0 1 1 29 30 29 0 0 0 29 3 29 28 0 S/sleep S/sleep
+14 SLEEPING 0 0 1 1 30 30 30 0 0 0 30 3 29 29 0 S/sleep S/sleep
+15 ZOMBIE 0 0 1 1 25 25 25 0 0 0 24 3 24 23 0 S/sleep S/sleep
+[mid2] entries=15
+ pid state lvl cpu wait_sum wait_max run ready ctx preExp preHigh yield sleep first mkvP mkvH mkvB pred act
+1 SLEEPING 0 0 0 0 33 33 33 0 0 0 33 1 32 32 0 S/sleep S/sleep
+2 RUNNING 0 2 0 0 66 66 65 2 0 0 63 1 65 62 0 S/sleep S/sleep
+3 ZOMBIE 0 0 0 0 1 1 1 0 0 0 0 2 0 0 0 S/sleep S/sleep
+4 ZOMBIE 0 0 0 0 1 1 1 0 0 0 0 2 0 0 0 S/sleep S/sleep
+5 ZOMBIE 1 2 0 0 3 3 3 1 1 0 0 2 1 0 0 S/expire S/higher
+6 ZOMBIE 1 2 1 1 3 3 3 1 1 0 0 2 1 0 0 S/expire S/higher
+7 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 3 0 0 0 S/sleep S/sleep
+8 ZOMBIE 0 0 0 0 1 1 1 0 0 0 0 2 0 0 0 S/sleep S/sleep
+9 RUNNABLE 0 0 1 1 60 61 60 0 0 0 60 3 60 59 0 S/sleep S/sleep
+10 RUNNABLE 0 0 2 1 59 60 59 0 0 0 59 3 59 58 0 S/sleep S/sleep
+11 RUNNABLE 0 0 1 1 60 61 60 0 0 0 60 3 60 59 0 S/sleep S/sleep
+12 RUNNABLE 0 0 1 1 60 61 60 0 0 0 60 3 60 59 0 S/sleep S/sleep
+13 RUNNABLE 0 0 2 1 59 60 59 0 0 0 59 3 59 58 0 S/sleep S/sleep
+14 ZOMBIE 0 0 1 1 61 61 61 0 0 0 60 3 60 59 0 S/sleep S/sleep
+15 ZOMBIE 0 0 1 1 25 25 25 0 0 0 24 3 24 23 0 S/sleep S/sleep
+[mid3] entries=15
+ pid state lvl cpu wait_sum wait_max run ready ctx preExp preHigh yield sleep first mkvP mkvH mkvB pred act
+1 SLEEPING 0 0 0 0 33 33 33 0 0 0 33 1 32 32 0 S/sleep S/sleep
+2 RUNNING 0 3 0 0 68 68 67 3 0 0 64 1 67 63 0 S/sleep S/sleep
+3 ZOMBIE 0 0 0 0 1 1 1 0 0 0 0 2 0 0 0 S/sleep S/sleep
+4 ZOMBIE 0 0 0 0 1 1 1 0 0 0 0 2 0 0 0 S/sleep S/sleep
+5 ZOMBIE 1 2 0 0 3 3 3 1 1 0 0 2 1 0 0 S/expire S/higher
+6 ZOMBIE 1 2 1 1 3 3 3 1 1 0 0 2 1 0 0 S/expire S/higher
+7 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 3 0 0 0 S/sleep S/sleep
+8 ZOMBIE 0 0 0 0 1 1 1 0 0 0 0 2 0 0 0 S/sleep S/sleep
+9 ZOMBIE 0 0 1 1 61 61 61 0 0 0 60 3 60 59 0 S/sleep S/sleep
+10 RUNNING 0 0 3 1 61 61 60 0 0 0 60 3 60 59 0 S/sleep S/sleep
+11 ZOMBIE 0 0 1 1 61 61 61 0 0 0 60 3 60 59 0 S/sleep S/sleep
+12 ZOMBIE 0 0 1 1 61 61 61 0 0 0 60 3 60 59 0 S/sleep S/sleep
+13 RUNNABLE 0 0 3 1 60 61 60 0 0 0 60 3 60 59 0 S/sleep S/sleep
+14 ZOMBIE 0 0 1 1 61 61 61 0 0 0 60 3 60 59 0 S/sleep S/sleep
+15 ZOMBIE 0 0 1 1 25 25 25 0 0 0 24 3 24 23 0 S/sleep S/sleep
+[mid4] entries=15
+ pid state lvl cpu wait_sum wait_max run ready ctx preExp preHigh yield sleep first mkvP mkvH mkvB pred act
+1 SLEEPING 0 0 0 0 33 33 33 0 0 0 33 1 32 32 0 S/sleep S/sleep
+2 RUNNING 0 4 0 0 70 70 69 4 0 0 65 1 69 64 0 S/sleep S/sleep
+3 ZOMBIE 0 0 0 0 1 1 1 0 0 0 0 2 0 0 0 S/sleep S/sleep
+4 ZOMBIE 0 0 0 0 1 1 1 0 0 0 0 2 0 0 0 S/sleep S/sleep
+5 ZOMBIE 1 2 0 0 3 3 3 1 1 0 0 2 1 0 0 S/expire S/higher
+6 ZOMBIE 1 2 1 1 3 3 3 1 1 0 0 2 1 0 0 S/expire S/higher
+7 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 3 0 0 0 S/sleep S/sleep
+8 ZOMBIE 0 0 0 0 1 1 1 0 0 0 0 2 0 0 0 S/sleep S/sleep
+9 ZOMBIE 0 0 1 1 61 61 61 0 0 0 60 3 60 59 0 S/sleep S/sleep
+10 ZOMBIE 0 0 3 1 61 61 61 0 0 0 60 3 60 59 0 S/sleep S/sleep
+11 ZOMBIE 0 0 1 1 61 61 61 0 0 0 60 3 60 59 0 S/sleep S/sleep
+12 ZOMBIE 0 0 1 1 61 61 61 0 0 0 60 3 60 59 0 S/sleep S/sleep
+13 ZOMBIE 0 0 4 1 61 61 61 0 0 0 60 3 60 59 0 S/sleep S/sleep
+14 ZOMBIE 0 0 1 1 61 61 61 0 0 0 60 3 60 59 0 S/sleep S/sleep
+15 ZOMBIE 0 0 1 1 25 25 25 0 0 0 24 3 24 23 0 S/sleep S/sleep
+test_workload_mix: waiting children... started=13
+wait #0 -> 3
+wait #1 -> 4
+wait #2 -> 5
+wait #3 -> 6
+wait #4 -> 7
+wait #5 -> 8
+wait #6 -> 9
+wait #7 -> 10
+wait #8 -> 11
+wait #9 -> 12
+wait #10 -> 13
+wait #11 -> 14
+wait #12 -> 15
+[end] entries=2
+ pid state lvl cpu wait_sum wait_max run ready ctx preExp preHigh yield sleep first mkvP mkvH mkvB pred act
+1 SLEEPING 0 0 0 0 33 33 33 0 0 0 33 1 32 32 0 S/sleep S/sleep
+2 RUNNING 1 6 0 0 71 71 70 5 0 0 65 1 70 64 0 S/sleep S/expire
+test_workload_mix: done
+
+======== test sucess ========
 
 
+修改了：把 wakeup 选核相关参数集中到 mlfq.c 顶部一处：
+MLFQ_WAKEUP_HYSTERESIS
+MLFQ_WAKEUP_W_L0 / _W_L1 / _W_L2 / _W_RUNNING
+把 mlfq_cpu_load_locked() 里的 2*L0 + L1 + L2 + 2*running 改为用上述宏计算
 
-为什么结果都是S，是我代码逻辑的问题？还是我的测试体现不出来？
+
+1. test_cpu:
+
+run ./test_workload_cpu test_cpu 111 222 333
+
+======== test start  ========
+
+test_workload_cpu: start (N=8)
+[mid] entries=10
+ pid state lvl cpu wait_sum wait_max run ready ctx preExp preHigh yield sleep first mkvP mkvH mkvB pred act
+1 SLEEPING 0 1 0 0 33 33 33 0 0 0 33 1 32 32 0 S/sleep S/sleep
+2 RUNNING 0 0 0 0 14 14 13 0 0 0 13 2 13 12 0 S/sleep S/sleep
+3 RUNNABLE 2 3 4 4 2 3 2 2 0 0 0 2 2 0 1 M/expire M/expire
+4 RUNNABLE 2 4 7 6 3 4 3 2 1 0 0 3 2 0 1 M/expire S/higher
+5 ZOMBIE 2 3 6 2 4 4 4 2 1 0 0 2 2 0 0 S/higher S/expire
+6 RUNNING 1 2 8 6 2 2 1 1 0 0 0 4 1 0 0 S/expire S/expire
+7 ZOMBIE 2 3 6 2 4 4 4 2 1 0 0 3 2 0 0 S/higher S/expire
+8 RUNNABLE 1 1 3 3 1 2 1 1 0 0 0 5 1 0 0 S/expire S/expire
+9 ZOMBIE 2 3 6 2 4 4 4 2 1 0 0 4 2 0 0 S/higher S/expire
+10 RUNNABLE 1 1 4 4 1 2 1 1 0 0 0 6 1 0 0 S/expire S/expire
+test_workload_cpu: waiting children... started=8
+wait #0 -> 5
+wait #1 -> 7
+wait #2 -> 9
+wait #3 -> 4
+wait #4 -> 6
+wait #5 -> 3
+wait #6 -> 8
+wait #7 -> 10
+[end] entries=2
+ pid state lvl cpu wait_sum wait_max run ready ctx preExp preHigh yield sleep first mkvP mkvH mkvB pred act
+1 SLEEPING 0 1 0 0 33 33 33 0 0 0 33 1 32 32 0 S/sleep S/sleep
+2 RUNNING 0 1 0 0 20 20 19 1 0 0 18 2 19 16 0 S/sleep S/sleep
+test_workload_cpu: done
+
+======== test sucess ========
+
+2. test_io:
+
+run ./test_workload_io test_io 111 222 333
+
+======== test start  ========
+
+test_workload_io: start (N=8 rounds=30)
+[mid] entries=10
+ pid state lvl cpu wait_sum wait_max run ready ctx preExp preHigh yield sleep first mkvP mkvH mkvB pred act
+1 SLEEPING 0 1 0 0 33 33 33 0 0 0 33 1 32 32 0 S/sleep S/sleep
+2 RUNNING 0 0 0 0 34 34 33 0 0 0 33 2 33 32 0 S/sleep S/sleep
+3 RUNNABLE 0 0 0 0 30 31 30 0 0 0 30 2 30 29 0 S/sleep S/sleep
+4 RUNNABLE 0 0 0 0 30 31 30 0 0 0 30 2 30 29 0 S/sleep S/sleep
+5 RUNNABLE 0 0 0 0 30 31 30 0 0 0 30 2 30 29 0 S/sleep S/sleep
+6 RUNNABLE 0 0 0 0 30 31 30 0 0 0 30 2 30 29 0 S/sleep S/sleep
+7 RUNNABLE 0 0 0 0 30 31 30 0 0 0 30 2 30 29 0 S/sleep S/sleep
+8 ZOMBIE 0 0 0 0 31 31 31 0 0 0 30 2 30 29 0 S/sleep S/sleep
+9 RUNNABLE 0 0 0 0 30 31 30 0 0 0 30 2 30 29 0 S/sleep S/sleep
+10 RUNNABLE 0 0 0 0 30 31 30 0 0 0 30 2 30 29 0 S/sleep S/sleep
+test_workload_io: waiting children... started=8
+wait #0 -> 3
+wait #1 -> 4
+wait #2 -> 5
+wait #3 -> 6
+wait #4 -> 7
+wait #5 -> 8
+wait #6 -> 9
+wait #7 -> 10
+[end] entries=2
+ pid state lvl cpu wait_sum wait_max run ready ctx preExp preHigh yield sleep first mkvP mkvH mkvB pred act
+1 SLEEPING 0 1 0 0 33 33 33 0 0 0 33 1 32 32 0 S/sleep S/sleep
+2 RUNNING 0 2 0 0 37 37 36 1 0 0 35 2 36 33 0 S/sleep S/sleep
+test_workload_io: done
+
+======== test sucess ========
+
+3. test_mix:
+
+run ./test_workload_mix test_mix 111 222 333
+
+======== test start  ========
+
+test_workload_mix: start (cpu=6 io=6 burst=1)
+[mid1] entries=15
+ pid state lvl cpu wait_sum wait_max run ready ctx preExp preHigh yield sleep first mkvP mkvH mkvB pred act
+1 SLEEPING 0 0 1 1 5 5 5 0 0 0 5 1 4 4 0 S/sleep S/sleep
+2 RUNNING 0 0 0 0 34 34 33 0 0 0 33 2 33 32 0 S/sleep S/sleep
+3 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 2 1 0 0 S/expire S/expire
+4 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 3 0 0 0 S/sleep S/sleep
+5 ZOMBIE 1 1 0 0 2 2 2 1 0 0 0 2 1 0 0 S/expire S/expire
+6 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 3 1 0 0 S/expire S/expire
+7 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 3 0 0 0 S/sleep S/sleep
+8 ZOMBIE 0 0 2 2 1 1 1 0 0 0 0 4 0 0 0 S/sleep S/sleep
+9 SLEEPING 0 0 1 1 30 30 30 0 0 0 30 3 29 29 0 S/sleep S/sleep
+10 SLEEPING 0 0 2 2 29 29 29 0 0 0 29 4 28 28 0 S/sleep S/sleep
+11 SLEEPING 0 0 1 1 30 30 30 0 0 0 30 3 29 29 0 S/sleep S/sleep
+12 SLEEPING 0 0 2 2 29 29 29 0 0 0 29 4 28 28 0 S/sleep S/sleep
+13 SLEEPING 0 0 1 1 30 30 30 0 0 0 30 3 29 29 0 S/sleep S/sleep
+14 SLEEPING 0 0 2 2 29 29 29 0 0 0 29 4 28 28 0 S/sleep S/sleep
+15 ZOMBIE 0 0 1 1 25 25 25 0 0 0 24 3 24 23 0 S/sleep S/sleep
+[mid2] entries=15
+ pid state lvl cpu wait_sum wait_max run ready ctx preExp preHigh yield sleep first mkvP mkvH mkvB pred act
+1 SLEEPING 0 0 1 1 5 5 5 0 0 0 5 1 4 4 0 S/sleep S/sleep
+2 RUNNING 0 1 0 0 65 65 64 1 0 0 63 2 64 61 0 S/sleep S/sleep
+3 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 2 1 0 0 S/expire S/expire
+4 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 3 0 0 0 S/sleep S/sleep
+5 ZOMBIE 1 1 0 0 2 2 2 1 0 0 0 2 1 0 0 S/expire S/expire
+6 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 3 1 0 0 S/expire S/expire
+7 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 3 0 0 0 S/sleep S/sleep
+8 ZOMBIE 0 0 2 2 1 1 1 0 0 0 0 4 0 0 0 S/sleep S/sleep
+9 ZOMBIE 0 0 1 1 61 61 61 0 0 0 60 3 60 59 0 S/sleep S/sleep
+10 SLEEPING 0 0 2 2 60 60 60 0 0 0 60 4 59 59 0 S/sleep S/sleep
+11 ZOMBIE 0 0 1 1 61 61 61 0 0 0 60 3 60 59 0 S/sleep S/sleep
+12 SLEEPING 0 0 2 2 60 60 60 0 0 0 60 4 59 59 0 S/sleep S/sleep
+13 ZOMBIE 0 0 1 1 61 61 61 0 0 0 60 3 60 59 0 S/sleep S/sleep
+14 SLEEPING 0 0 2 2 60 60 60 0 0 0 60 4 59 59 0 S/sleep S/sleep
+15 ZOMBIE 0 0 1 1 25 25 25 0 0 0 24 3 24 23 0 S/sleep S/sleep
+[mid3] entries=15
+ pid state lvl cpu wait_sum wait_max run ready ctx preExp preHigh yield sleep first mkvP mkvH mkvB pred act
+1 SLEEPING 0 0 1 1 5 5 5 0 0 0 5 1 4 4 0 S/sleep S/sleep
+2 RUNNING 0 2 0 0 67 67 66 2 0 0 64 2 66 62 0 S/sleep S/sleep
+3 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 2 1 0 0 S/expire S/expire
+4 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 3 0 0 0 S/sleep S/sleep
+5 ZOMBIE 1 1 0 0 2 2 2 1 0 0 0 2 1 0 0 S/expire S/expire
+6 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 3 1 0 0 S/expire S/expire
+7 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 3 0 0 0 S/sleep S/sleep
+8 ZOMBIE 0 0 2 2 1 1 1 0 0 0 0 4 0 0 0 S/sleep S/sleep
+9 ZOMBIE 0 0 1 1 61 61 61 0 0 0 60 3 60 59 0 S/sleep S/sleep
+10 ZOMBIE 0 0 2 2 61 61 61 0 0 0 60 4 60 59 0 S/sleep S/sleep
+11 ZOMBIE 0 0 1 1 61 61 61 0 0 0 60 3 60 59 0 S/sleep S/sleep
+12 ZOMBIE 0 0 2 2 61 61 61 0 0 0 60 4 60 59 0 S/sleep S/sleep
+13 ZOMBIE 0 0 1 1 61 61 61 0 0 0 60 3 60 59 0 S/sleep S/sleep
+14 ZOMBIE 0 0 2 2 61 61 61 0 0 0 60 4 60 59 0 S/sleep S/sleep
+15 ZOMBIE 0 0 1 1 25 25 25 0 0 0 24 3 24 23 0 S/sleep S/sleep
+[mid4] entries=15
+ pid state lvl cpu wait_sum wait_max run ready ctx preExp preHigh yield sleep first mkvP mkvH mkvB pred act
+1 SLEEPING 0 0 1 1 5 5 5 0 0 0 5 1 4 4 0 S/sleep S/sleep
+2 RUNNING 0 3 0 0 69 69 68 3 0 0 65 2 68 63 0 S/sleep S/sleep
+3 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 2 1 0 0 S/expire S/expire
+4 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 3 0 0 0 S/sleep S/sleep
+5 ZOMBIE 1 1 0 0 2 2 2 1 0 0 0 2 1 0 0 S/expire S/expire
+6 ZOMBIE 1 1 1 1 2 2 2 1 0 0 0 3 1 0 0 S/expire S/expire
+7 ZOMBIE 0 0 1 1 1 1 1 0 0 0 0 3 0 0 0 S/sleep S/sleep
+8 ZOMBIE 0 0 2 2 1 1 1 0 0 0 0 4 0 0 0 S/sleep S/sleep
+9 ZOMBIE 0 0 1 1 61 61 61 0 0 0 60 3 60 59 0 S/sleep S/sleep
+10 ZOMBIE 0 0 2 2 61 61 61 0 0 0 60 4 60 59 0 S/sleep S/sleep
+11 ZOMBIE 0 0 1 1 61 61 61 0 0 0 60 3 60 59 0 S/sleep S/sleep
+12 ZOMBIE 0 0 2 2 61 61 61 0 0 0 60 4 60 59 0 S/sleep S/sleep
+13 ZOMBIE 0 0 1 1 61 61 61 0 0 0 60 3 60 59 0 S/sleep S/sleep
+14 ZOMBIE 0 0 2 2 61 61 61 0 0 0 60 4 60 59 0 S/sleep S/sleep
+15 ZOMBIE 0 0 1 1 25 25 25 0 0 0 24 3 24 23 0 S/sleep S/sleep
+test_workload_mix: waiting children... started=13
+wait #0 -> 3
+wait #1 -> 4
+wait #2 -> 5
+wait #3 -> 6
+wait #4 -> 7
+wait #5 -> 8
+wait #6 -> 9
+wait #7 -> 10
+wait #8 -> 11
+wait #9 -> 12
+wait #10 -> 13
+wait #11 -> 14
+wait #12 -> 15
+[end] entries=2
+ pid state lvl cpu wait_sum wait_max run ready ctx preExp preHigh yield sleep first mkvP mkvH mkvB pred act
+1 SLEEPING 0 0 1 1 5 5 5 0 0 0 5 1 4 4 0 S/sleep S/sleep
+2 RUNNING 1 4 0 0 70 70 69 4 0 0 65 2 69 63 0 S/sleep S/expire
+test_workload_mix: done
+
+======== test sucess ========

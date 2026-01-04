@@ -105,9 +105,6 @@ $(ELFUser): $(USER_INIT_OBJ)
 	$(OBJCOPY) -S -O binary $(TARGET)/user/initcode.out $(TARGET)/user/initcode
 	xxd -i $(TARGET)/user/initcode > $(ELFUser)
 
-# kernel/proc/proc.c 需要包含生成出来的 initcode.h（并行构建时必须保证先生成）
-$(TARGET)/kernel/proc/proc.o: $(ELFUser)
-
 # 生成 kernel-qemu.elf
 $(ELFKernel): $(KernelOBJ)
 	$(LD) $(LDFLAGS) -T $(KERNEL_LD) $^ -o $@
