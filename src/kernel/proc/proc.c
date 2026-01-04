@@ -3,7 +3,7 @@
 // trap/timer.c: 已存在，用于读取全局 tick
 extern uint64 timer_get_ticks();
 
-// ---- Lab-11: Markov(S/M/L × sleep/expire/higher) 统计更新（预测在 mlfq.c 中使用） ----
+// Lab-11: Markov(S/M/L × sleep/expire/higher) 统计更新
 
 #define MKV_BURST_S 0
 #define MKV_BURST_M 1
@@ -15,7 +15,7 @@ extern uint64 timer_get_ticks();
 
 static int mkv_burst_class(uint64 run_ticks)
 {
-    // 分档阈值贴合当前 quantum/tick：
+    // 分档阈值：
     // S: 1
     // M: 2~4
     // L: >=5
@@ -25,8 +25,7 @@ static int mkv_burst_class(uint64 run_ticks)
 }
 
 // 要求：调用者已持有 p->lk
-// 不能用 timer_get_ticks() 来算 slice 时长：该系统只让 CPU0 更新全局 tick。
-// 这里改用 sched_cpu_ticks 的差值，保证多核下统计可靠。
+// 用 sched_cpu_ticks 的差值，保证多核下统计可靠
 static void mkv_on_stop_locked(proc_t *p, int yield_reason, uint64 now)
 {
     if (p->sched_run_start_tick == 0)
