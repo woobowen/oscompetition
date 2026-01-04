@@ -30,21 +30,20 @@ typedef struct mlfq_cpu_rq {
 static mlfq_cpu_rq_t mlfq_rq[NCPU];
 
 // Lab-11: wakeup 选核时的轻量运行状态提示。
-// 1 表示该 CPU 正在运行某个进程(不在 scheduler 循环里)。
+// 1 表示该 CPU 正在运行某个进程(不在 scheduler 循环里)
 static uint8 mlfq_cpu_running[NCPU];
 
-// ---- wakeup 选核可调参数（集中在这里便于调参/写报告） ----
-// wakeup 迁移抖动抑制：最佳 CPU 与本 CPU 负载差距不大则留本核。
+// ---- wakeup 选核可调参数 ----
+// wakeup 迁移抖动抑制：最佳 CPU 与本 CPU 负载差距不大则留本核
 #define MLFQ_WAKEUP_HYSTERESIS 0
 
 // wakeup/newproc 选核时的负载权重：load = w0*L0 + w1*L1 + w2*L2 + wr*running
-// 注：running 是一个轻量提示（该 CPU 当前是否正在跑用户进程）。
 #define MLFQ_WAKEUP_W_L0      2
 #define MLFQ_WAKEUP_W_L1      1
 #define MLFQ_WAKEUP_W_L2      1
 #define MLFQ_WAKEUP_W_RUNNING 2
 
-// 新建进程入队时的“打散”轮转起点，用于负载相同时的 tie-break。
+// 新建进程入队时的“打散”轮转起点，用于负载相同时的 tie-break
 static uint32 mlfq_new_rr;
 
 void mlfq_lock(void)
@@ -109,7 +108,7 @@ static proc_t *runq_pop_tail(mlfq_runq_t *q)
 	return p;
 }
 
-// 在持有任一 CPU 的 mlfq_rq[cpu].lk 的前提下检查 p 是否真的存在于该 CPU 的任一就绪队列中。
+// 在持有任一 CPU 的 mlfq_rq[cpu].lk 的前提下检查 p 是否真的存在于该 CPU 的任一就绪队列中
 static int mlfq_contains_locked_cpu(int cpu, proc_t *p)
 {
 	for (int level = 0; level < MLFQ_LEVELS; level++) {
@@ -123,7 +122,7 @@ static int mlfq_contains_locked_cpu(int cpu, proc_t *p)
 	return 0;
 }
 
-// ---- Markov 预测（仅用于自适应 quantum；统计更新在 proc.c 中完成） ----
+// ---- Markov 预测，用于自适应 quantum ----
 
 // state = burst(S/M/L)*3 + reason(sleep/expire/higher)
 #define MLFQ_MKV_BURST_S 0
@@ -144,9 +143,7 @@ static int mlfq_markov_predict_state_plocked(proc_t *p)
 	if (prev < 0 || prev >= MLFQ_MKV_STATES)
 		return -1;
 
-	// 冷启动：如果该 prev 状态从未观察到任何出边转移，
-	// 直接预测“保持不变”。否则 Laplace smoothing + argmax 会因为全 0
-	// 而退化成固定返回 0(S/sleep)，导致输出看起来“永远是 S/sleep”。
+	// 冷启动：如果该 prev 状态从未观察到任何出边转移，直接预测“保持不变”
 	uint32 sum = 0;
 	for (int s = 0; s < MLFQ_MKV_STATES; s++)
 		sum += p->mkv_trans[prev][s];
@@ -168,8 +165,7 @@ static int mlfq_markov_predict_state_plocked(proc_t *p)
 static int mlfq_cpu_load_locked(int cpu)
 {
 	// caller holds mlfq_rq[cpu].lk
-	// I/O 友好：对 L0(最高优先级)队列加权更大，使 wakeup 更倾向于把任务放到
-	// L0 更空的 CPU（降低唤醒后排队等待）。
+	// I/O 友好：对 L0(最高优先级)队列加权更大，使 wakeup 更倾向于把任务放到 L0 更空的 CPU。
 	int load = 0;
 	load += MLFQ_WAKEUP_W_L0 * mlfq_rq[cpu].q[0].size;
 	load += MLFQ_WAKEUP_W_L1 * mlfq_rq[cpu].q[1].size;
@@ -180,7 +176,6 @@ static int mlfq_cpu_load_locked(int cpu)
 
 // 新建进程入队：优先放到最空的 CPU。
 // 与 wakeup 不同，这里不做本核偏好；否则 fork 风暴会把所有子进程压在父进程所在核，
-// 在 per-CPU runqueue + 仅偷 L2 的条件下，会显著拉高其他进程的 ready wait。
 static int mlfq_choose_cpu_for_newproc(void)
 {
 	int start = (int)(__sync_fetch_and_add(&mlfq_new_rr, 1) % NCPU);
@@ -236,7 +231,7 @@ static int mlfq_quantum_plocked(proc_t *p, int level)
 	level = mlfq_clamp_level(level);
 	int base = mlfq_quantum[level];
 
-	// 记录预测（用于 schedstat 验证自适应策略是否触发/是否命中）
+	// 记录预测
 	int pred = mlfq_markov_predict_state_plocked(p);
 	if (pred >= 0) {
 		p->mkv_last_pred_state = (uint8)pred;
@@ -273,7 +268,7 @@ static int mlfq_quantum_plocked(proc_t *p, int level)
 	return base;
 }
 
-// 核心入队逻辑
+// 入队逻辑
 // 要求：调用者必须同时持有 mlfq_rq[cpu].lk 和 p->lk
 // 这样才能安全地检查 p->state 和 p->mlfq_in_readyq
 static void mlfq_enqueue_locked_plocked(int cpu, proc_t *p, int level, bool reset_slice, bool push_front)
@@ -339,8 +334,6 @@ void mlfq_on_wakeup(proc_t *p)
 {
 	// I/O 型任务被唤醒: 提升到最高优先级。
 	// 选核指标：L0_len + L1_len + L2_len + running(0/1)，并用小阈值抑制抖动。
-	// 注意：很多 wakeup(例如基于 ticks 的 sleep)由 CPU0 触发，若用 mycpuid() 会把
-	// “本核偏好”钉死在 CPU0，导致 I/O 任务聚集。这里用进程上次运行所在 CPU 作为本核。
 	int local_cpu = p->mlfq_cpu;
 	if (local_cpu < 0 || local_cpu >= NCPU)
 		local_cpu = mycpuid();
