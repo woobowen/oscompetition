@@ -15,7 +15,6 @@ static const char *state_str(uint32 state)
     }
 }
 
-
 static const char *mkv_state_str(uint32 s)
 {
     switch (s) {

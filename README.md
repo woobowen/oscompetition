@@ -1,12 +1,12 @@
-# LAB-10: 进程调度 之 多级反馈调度算法（MLFQ） 与 性能分析
+# LAB-11: 进阶调度优化 之 SEA-MLFQ (State-Estimated Adaptive MLFQ)
 
-在 Lab-9 实现完整系统功能的基础上，Lab-10 开始对内核性能进行针对性改进。我选择从**进程调度**入手进行优化，将原先的简单 **时间片轮转（RR）** 升级为更智能的 **多级反馈（MLFQ）** 调度算法，并引入了 **调度统计（Schedstat）** 机制，通过实测数据来定量分析优化效果。
+在 Lab-10 实现基础 MLFQ 调度器的基础上，Lab-11 致力于解决**多核环境**下的锁竞争问题，并引入更智能的**预测机制**来优化交互式任务的响应速度。我将这一改进后的算法命名为 **SEA-MLFQ (State-Estimated Adaptive MLFQ)**，意为“基于状态估计的自适应多级反馈队列”。
 
+本实验通过引入 **Per-CPU 就绪队列**、**马尔可夫预测 (Markov Prediction)** 和 **自适应时间片** 等机制，显著提升了系统在混合负载下的性能表现。
 
 ---
 
 ## 代码组织结构
-
 
 ```
 OS2025-SEAOS 
@@ -61,220 +61,343 @@ OS2025-SEAOS
     │   │   ├── mod.h
     │   │   └── type.h
     │   ├── proc   进程模块
-    │   │   ├── mlfq.c (本实验完成, MLFQ调度器的核心实现)
-    │   │   ├── proc.c (本实验完成, 集成MLFQ调度逻辑及调度统计)
-    │   │   ├── exec.c (本实验修复)
-    │   │   ├── swtch.S
-    │   │   ├── method.h (CHANGE, 增加MLFQ相关定义)
-    │   │   ├── mod.h
-    │   │   └── type.h (CHANGE, 增加调度统计相关字段)
-    │   ├── syscall 系统调用模块
-    │   │   ├── syscall.c (本实验补充, 新的系统调用 sys_schedstat)
-    │   │   ├── sysfunc.c (本实验补充, 新的系统调用 sys_schedstat)
-    │   │   ├── method.h (CHANGE)
-    │   │   ├── mod.h
-    │   │   └── type.h (CHANGE)
-    │   ├── fs     文件系统模块
-    │   │   ├── bitmap.c
-    │   │   ├── buffer.c
-    │   │   ├── inode.c
-    │   │   ├── device.c
-    │   │   ├── dentry.c 
-    │   │   ├── fs.c 
-    │   │   ├── virtio.c
+    │   │   ├── mlfq.c (本实验完成， Per-CPU队列, Markov预测, 唤醒策略)
+    │   │   ├── proc.c (本实验完成，集成新的调度接口)
+    │   │   ├── type.h (CHANGE，增加 Markov 状态字段)
+    │   │   ├── exec.c
+    │   │   ├── method.h
+    │   │   └── mod.h
+    │   ├── syscall 系统调用
+    │   │   ├── syscall.c
+    │   │   ├── sysfunc.c
     │   │   ├── method.h
     │   │   ├── mod.h
-    │   │   └── type.h 
-    │   └── main.c
-    ├── mkfs       磁盘映像初始化
-    │   ├── mkfs.c (本实验补充，支持间接块以处理大文件)
-    │   └── mkfs.h 
-    ├── loader     存放链接脚本
-    │   ├── kernel.ld 
-    │   └── user.ld 
+    │   │   └── type.h
+    │   └── fs     文件系统
+    │       ├── bitmap.c
+    │       ├── buf.c
+    │       ├── dentry.c
+    │       ├── device.c
+    │       ├── fs.c
+    │       ├── inode.c
+    │       ├── virtio.c
+    │       ├── method.h
+    │       ├── mod.h
+    │       └── type.h
+    ├── loader     链接脚本
+    │   ├── kernel.ld
+    │   └── user.ld
+    ├── mkfs       文件系统制作工具
+    │   ├── mkfs.c
+    │   └── mkfs.h
     └── user       用户程序
-        ├── initcode.c 
-        ├── syscall.c (CHANGE, 新的系统调用 sys_schedstat)
-        ├── help.c (CHANGE)
-        ├── test_1.c 
-        ├── test_2.c 
-        ├── test_3.c 
-        ├── test_4.c 
-        ├── test_5.c
-        ├── test_workload_cpu.c (NEW, CPU密集型压力测试)
-        ├── test_workload_io.c  (NEW, IO密集型压力测试)
-        ├── test_workload_mix.c (NEW, 混合负载压力测试)
-        ├── test_schedstat.c (NEW, 调度统计工具测试)
-        ├── test_mlfq_aging.c (NEW, MLFQ老化机制测试)
-        ├── test_mlfq_preempt.c (NEW, MLFQ抢占机制测试)
-        ├── help.h (CHANGE, 库函数和重要定义)
+        ├── help.c
+        ├── help.h (CHANGE，增加 Schedstat Markov 字段)
+        ├── initcode.c
         ├── sys.h
         ├── syscall_arch.h
-        └── syscall_num.h (CHANGE, 新的系统调用 sys_schedstat)
+        ├── syscall_num.h
+        ├── syscall.c
+        ├── test_1.c
+        ├── test_2.c
+        ├── test_3.c
+        ├── test_4.c
+        ├── test_5.c
+        ├── test_mlfq_aging.c
+        ├── test_mlfq_preempt.c
+        ├── test_schedstat.c
+        ├── test_workload_cpu.c
+        ├── test_workload_io.c
+        └── test_workload_mix.c 
 ```
-
 
 本实验主要增加了以下功能：
 
-- **多级反馈调度算法**：实现了 3 个优先级的反馈队列 (MLFQ)，支持时间片轮转、优先级动态调整（老化/惩罚）和抢占机制。
-- **调度统计 (Schedstat)**：在进程控制块 (PCB) 中增加了 `run_time`, `wait_time`, `sleep_time` 等统计字段，并提供了 `sys_schedstat` 系统调用供用户态读取。
-- **性能分析套件**：编写了 CPU、IO 和混合负载的测试程序，用于定量对比不同调度算法之间的性能差异。
+- **SEA-MLFQ 调度算法**：
+  - **Per-CPU Runqueues**：**消除全局锁竞争**，提升多核扩展性。
+  - **智能唤醒选核 (Smart Wakeup)**：基于负载权重 (`L0`, `Running`) 选择**最佳 CPU**，减少唤醒延迟。
+  - **L0 队首插队 (Head Insertion)**：唤醒的交互式任务直接插入 L0 **队首**，实现极速响应。
+  - **马尔可夫预测 (Markov Prediction)**：根据历史行为**预测**进程 Burst 类型，**自适应**调整时间片。
 
 ---
 
-## 具体实现
+## 具体实现 (SEA-MLFQ)
 
-### 1. 多级反馈调度算法
+### 1. Per-CPU 就绪队列与锁优化
 
-在 `mlfq.c` 中，我实现了一个包含 **3 个优先级队列** 的 MLFQ 调度器，旨在平衡系统的响应时间和吞吐量。具体参数如下：
+在多核操作系统中，**调度器的锁竞争**往往是性能的最大瓶颈。
 
-- **优先级层级**：
-  - `Level 0` (最高)：时间片 **1 tick**。新进程默认进入此队列，适合**交互式任务**。
-  - `Level 1` (中等)：时间片 **2 ticks**。
-  - `Level 2` (最低)：时间片 **4 ticks**。适合 **CPU 密集型长任务**。
-- **老化机制**：
-  - `Aging Threshold`：**10 ticks**。当一个进程在低优先级队列中等待超过此阈值时，其优先级将被提升,以**防止低优先级任务饥饿**。
+#### 1.1 全局锁瓶颈 (Lab-10)
+
+在 Lab-10 中，我使用一把**全局锁** `mlfq_lk` 保护唯一的就绪队列。当多个 CPU 同时尝试调度（例如 CPU0 发生时钟中断，CPU1 唤醒进程）时，它们必须串行争抢这把锁。这导致了严重的**锁竞争**，CPU 大量时间浪费在**自旋等待**上，无法发挥多核优势。
+
+下图直观地展示了 Lab-10 中多核争抢单一全局锁的拥堵情况：
+
+```mermaid
+graph TD
+    subgraph "Lab-10: Global Lock Bottleneck"
+    C0[CPU 0] -- 争抢 --> L{Global Lock}
+    C1[CPU 1] -- 争抢 --> L
+    C2[CPU 2] -- 争抢 --> L
+    C3[CPU 3] -- 争抢 --> L
+    L --> Q[Global Runqueue]
+    style L fill:#ff9999,stroke:#333,stroke-width:2px
+    end
+```
+
+#### 1.2 Per-CPU 数据结构 (Lab-11)
+
+为了彻底解决上述瓶颈，我在 Lab-11 中将全局队列拆分为 **Per-CPU 就绪队列**。
+如下代码所示，每个 CPU 现在拥有自己独立的锁和 MLFQ 队列结构：
+
+```c
+typedef struct mlfq_cpu_rq {
+    spinlock_t lk;              // 每个 CPU 独立的自旋锁
+    mlfq_runq_t q[MLFQ_LEVELS]; // 每个 CPU 独立的 3 级反馈队列
+} mlfq_cpu_rq_t;
+
+static mlfq_cpu_rq_t mlfq_rq[NCPU]; // 数组大小为 CPU 核数
+```
+
+这种架构的优势在于实现了“**本地访问优先**”和“**任务窃取**”机制，具体的工作流如下图所示：
+
+``` mermaid
+graph TD
+    subgraph "Lab-11: Per-CPU Runqueues"
+        subgraph "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Core 0"
+            C0[CPU 0] ==>|1. Local Access| L0[Lock 0]
+            L0 --> Q0[Runqueue 0]
+        end
+        
+        subgraph "&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Core 1"
+            C1[CPU 1] ==>|1. Local Access| L1[Lock 1]
+            L1 --> Q1[Runqueue 1]
+        end
+
+        %% Work Stealing lines
+        C0 -.->|2. Work Stealing| L1
+        C1 -.->|2. Work Stealing| L0
+    end
+    
+    style C0 fill:#eaffcc
+    style C1 fill:#eaffcc
+    style L0 fill:#ffffcc
+    style L1 fill:#ffffcc
+```
+
+- **本地访问优先  (Local Access)**：
+  绝大多数调度操作（如 `mlfq_enqueue`, `mlfq_pick_next`）**仅需获取本地 CPU 的锁**。这意味着 CPU 0 和 CPU 1 可以并行地进行调度，互不干扰。
+    - **实现细节**： 
+    比如在`mlfq_lock()` 和`mlfq_pick_next`() 开头，总是先获取 `mlfq_rq[mycpuid()].lk`。
+    
+      ``` c
+      void mlfq_lock(void) {
+      int cpu = mycpuid();
+      spinlock_acquire(&mlfq_rq[cpu].lk); // 只拿自己的锁
+      }
+      ```
+   
+- **任务窃取 (Work Stealing)**：
+    为了防止“**一核有难，八核围观**”的**负载不均**现象，当某个 CPU 的本地队列为空时，它会尝试从其他 CPU 的队列中 **“偷”任务**。
+    - **窃取策略**：
+      我采用了**仅从 `L2` (最低优先级) 队列尾部窃取**的保守策略，以下是我设计时的考量：
+      - **只偷 `L2`**: `L0`/`L1` 存放的是**对延迟敏感的交互式任务**，留在原核可以保持更好的 Cache 亲和性；而 `L2` 任务是**长耗时的 CPU 密集型任务**，跨核迁移带来的开销远小于其运行收益。
+      - **从队尾偷**: 目标 CPU 总是从队首取任务，我从队尾偷可以尽量**避免与目标 CPU 产生直接竞争**，有效降低对目标 CPU 正常调度的干扰。
+    - **实现细节**：
+      在 `mlfq_pick_next` 函数中，当本地所有级别的队列均为空时，会触发跨核窃取逻辑。通过 `runq_pop_tail` **从目标核最不紧急的`L2`队列末尾获取进程**，如下所示：
+      ```c
+      // mlfq.c: mlfq_pick_next
+      for (int victim = 0; victim < NCPU; victim++) {
+          if (victim == cpu) continue;
+          spinlock_acquire(&mlfq_rq[victim].lk); // 跨核获取 victim 的锁
+          
+          // 策略：仅从 victim 的 L2 队列尾部偷取任务
+          p = runq_pop_tail(&mlfq_rq[victim].q[MLFQ_LEVELS - 1]); 
+          if (p) {
+              runq_push_tail(&mlfq_rq[cpu].q[MLFQ_LEVELS - 1], p);
+              spinlock_release(&mlfq_rq[victim].lk);
+              break; // 偷到一个任务即刻返回，减少锁持有时间
+          }
+          spinlock_release(&mlfq_rq[victim].lk);
+      }
+      ```
+
+### 2. 智能唤醒选核 (Smart Wakeup)
+
+在引入了 **Per-CPU Runqueues** 后，系统面临一个新的挑战：当一个进程从睡眠中唤醒（例如 I/O 完成）时，应该将其**放入哪个 CPU 的就绪队列？**如果简单地放回原核，可能会导致某些核心拥堵而其他核心空闲。
+
+为了实现负载均衡并降低交互延迟，我设计了一套基于**加权负载评估**的**智能选核**算法。
+
+#### 2.1 负载评估公式
+
+在 `mlfq_choose_cpu_for_wakeup` 函数中，我们不再简单地统计进程数量，而是通过以下公式计算每个 CPU 的“有效负载”($Load$)：
+
+$$ Load = w_0 \cdot |L_0| + w_1 \cdot |L_1| + w_2 \cdot |L_2| + w_{running} \cdot IsRunning $$
+
+根据多次调参的测试结果与对响应速度的需求，我选择了以下权重：
+
+- **$w_0 = 2$**：`L0` 存放的是**交互式任务**。权重加倍可以引导新唤醒的任务**流向 `L0` 更空的核**，减少潜在的排队。
+- **$w_{running} = 2$**：通过给正在运行的核施加更高权重，算法会倾向于**避开正在执行任务的 CPU**，转而选择空闲或负载较低的核，从而降低唤醒延迟。
+- **$w_1 = 1, w_2 = 1$**：`L1` 和 `L2` 的任务对响应速度影响较小，权重设为 1 即可。
+
+#### 2.2 选核决策流程
+
+为了将上述权重计算转化为高效的运行时决策，我设计了如下的选核流程。该流程在进程唤醒的瞬间触发，通过**实时评估所有 CPU 的负载状态**，动态决定是将任务留在本地核心，还是迁移到更空闲的目标核心。
+
+```mermaid
+flowchart TD
+    Start([进程 I/O 唤醒]) --> Scan[获取各 CPU 运行状态与队列长度]
+    Scan --> Calc{计算加权负载 Load}
+    Calc --> Compare[比较各核 Load 值]
+    Compare --> Decision{是否存在<br/>更优目标核?}
+    
+    Decision -- 是 --> Migrate[跨核迁移: 唤醒至目标 CPU]
+    Decision -- 否 --> Local[本地唤醒: 留在原 CPU]
+    
+    Migrate --> Enqueue[[入队 L0 队首]]
+    Local --> Enqueue
+
+    %% 样式美化
+    style Start fill:#ffebee,stroke:#333,stroke-width:2px
+    style Decision fill:#fff4dd,stroke:#d4a017,stroke-width:2px
+    style Calc fill:#fff4dd,stroke:#d4a017,stroke-width:2px
+    style Enqueue fill:#d1eed1,stroke:#2e7d32,stroke-width:2px
+    style Migrate fill:#e1f5fe,stroke:#01579b
+    style Local fill:#e1f5fe,stroke:#01579b
+```
+
+通过这种智能选核机制，SEA-MLFQ 有效避免了多核环境下的“**任务堆积**”现象，确保了 I/O 密集型任务总能找到最快响应的核心。
+
+### 3. L0 队首插队 (Head Insertion)
+
+这是 Lab-11 性能提升的关键一笔。对于刚刚唤醒的进程（通常是 IO 交互型），不仅将其放入 L0，而且直接**插入队首** (`runq_push_head`)。
+
+#### 3.1 核心逻辑
+
+在 `mlfq_on_wakeup` 函数中，当一个进程被唤醒时，我通过` mlfq_enqueue_locked_plocked` 将其加入就绪队列。此时，我们将 `push_front` 参数设为 `true`，将其插入到 **`L0` 队列的头部**。
+
+```c
+void mlfq_on_wakeup(proc_t *p)
+{
+    // ... 选核 ...
+    // wakeup 提升到 L0 且插队到队首
+    mlfq_enqueue_locked_plocked(cpu, p, 0, true, true); // push_front = true
+    // ...
+}
+```
+
+#### 性能收益分析
+
+这一改动使得 **IO 任务在唤醒后的下一个 tick 几乎必然获得 CPU**，将等待时间从 Lab-10 的 2 ticks 压缩到 1 tick，大幅提升了交互式任务的响应速度。
+
+但对于其合理性，我也进行了思考与分析：
+
+- **为何插队？为了快速响应！**：交互式任务（如键盘输入、网络包处理）通常具有“**`唤醒 -> 极短 CPU 爆发 -> 再次睡眠`**”的特征。让它们插队先跑，可以迅速完成处理并释放 CPU，最大化系统的整体吞吐量。
+- **会不会饿死其他任务？不会！**：能触发唤醒插队的通常是 **I/O 任务**，它们的 CPU Burst 极短（微秒级），“`插队-运行-立刻睡眠`”的过程非常快，对 CPU 密集型任务的影响几乎可以忽略不计。而且我又**保留了 MLFQ 的降级机制**，如果它真的赖着不走，会被立刻降级到 L1/L2。
+
+
+### 4. 马尔可夫预测与自适应时间片
+
+传统的 MLFQ 算法是**反应式**的：它只有在进程用完时间片后才将其降级。这意味着对于长耗时任务，系统必须先“忍受”它在 L0/L1 产生多次无意义的上下文切换，才能将其识别并归类。
+
+为了变“被动”为“主动”，Lab-11 中我引入了 **马尔可夫链 (Markov Chain)** 来记录进程的历史行为，并据此**预测**其下一次的 Burst 类型，从而实现**自适应时间片分配**。
+
+#### 4.1 状态空间定义
+
+为了精准描述进程行为，我将进程的每一次调度周期抽象为一个状态 ($State$)。状态由 **运行时长** 和 **让出原因** 两个维度组合而成，共计 $3×3=9$ 种状态：
+
+- **运行时长 (BurstType)**：
+  - **S (Short)**: 极短任务 （$\le 1$ tick）
+  - **M (Medium)**: 中等任务 （$2-4$ ticks）
+  - **L (Long)**: 长任务 （$>4$ ticks）
+
+- **让出原因 (YieldType)**：
+  - **Sleep (0)**: 主动阻塞 (I/O, 等锁)
+  - **Expire (1)**: 时间片耗尽 (被强占)
+  - **Higher (2)**: 被高优先级进程抢占
   
-为了清晰理解多级进程在不同队列间的流转逻辑，我将调度过程拆成两部分分析：**(1) 调度器如何选择队列**、**(2) 单个进程如何在队列间迁移**。
+#### 4.2 核心预测机制
 
-**(1) 调度器选择策略**
+内核为每个进程维护了一个 $9×9$ 的转移矩阵，算法通过以下三个步骤形成闭环：
 
-调度器永远**优先选择最高优先级的非空队列**进行调度。具体逻辑如下图所示：
+**Sep 1: 观察与记录**
+
+每当进程停止运行时，内核会**计算其本次运行的特征（时长+原因）**，并**更新转移矩阵**。
+
+- 例如，如果进程连续多次从 `S/Sleep` 转移到 `S/Sleep`，矩阵中对应位置的计数就会增加，表明该进程是稳定的 I/O 密集型。
+
+**Step 2: 概率预测**
+
+在进程即将被调度运行之前，系统根据其上一次的状态 (`last_state`)，查询**转移矩阵中概率最高的目标状态**。
+
+为了提高预测的鲁棒性，我特别引入了以下机制：
+
+- **Laplace Smoothing (拉普拉斯平滑)**：
+  在计算概率时，对所有可能的转移计数 `+1`。这避免了因样本稀疏导致的“**零概率**”问题，确保模型在初期也能进行探索性预测。
+  
+- **冷启动处理**：
+  当某个状态**从未被观察到出边转移**（即该行全为 0）时，直接预测**保持当前状态不变**。
+  > 经过测试验证：在未加入此逻辑前，冷启动阶段往往会因为矩阵全 0 而错误地默认预测为 `S/Sleep`（索引 0），导致预测准确率抖动。加入此逻辑后，预测器在学习初期表现更加平稳。*
+
+**Step 3: 自适应优化**
+
+这是预测机制产生收益的关键环节。系统利用预测结果，在**时间片分配阶段**主动干预，而非被动等待降级。
+
+| 策略维度 | 设计细节 |
+| :--- | :--- |
+| **触发时机** | `mlfq_quantum` 计算时（即进程获取 CPU 的瞬间）。 |
+| **作用范围** | 仅针对 **L2 (最低优先级)** 队列生效。<br>*(L0/L1 需保证低延迟，不宜随意放大时间片)* |
+| **触发条件** | 仅当预测结果为 **Expire (时间片耗尽)** 时触发。<br>*(若预测为 Sleep/Higher，说明进程可能主动让出，无需延长)* |
+
+**具体调整策略**：
+
+1.  **预测为 Long Burst (L) + Expire**：
+    - **动作**：`quantum = base * 2` (4 ticks -> 8 ticks)。
+    - **收益**：大幅减少长任务的上下文切换开销，提升 Cache 亲和性。
+
+2.  **预测为 Medium Burst (M) + Expire**：
+    - **动作**：`quantum = max(base + 2, 6)`。
+    - **收益**：给予适度的“奖励”，避免因刚过阈值就被切出。
+
+3.  **其他情况**：
+    - **动作**：保持默认 `base` 时间片。
+    - **收益**：避免误判导致交互式任务响应变差。
+
+**可观测性指标**：
+我在 `proc` 结构体中增加了 `mkv_pred_total` (预测总数)、`mkv_pred_hit` (命中数) 和 `mkv_l2_boost_count` (自适应触发次数)，用于量化评估算法效果。
+
+综上，下图展示了 SEA-MLFQ 如何利用马尔可夫链形成“**观察-学习-优化**”的闭环：
 
 ```mermaid
 flowchart LR
-  %% ========== 样式 ==========
-  classDef q0 fill:#E3F2FD,stroke:#1E88E5,stroke-width:1px,color:#0D47A1;
-  classDef q1 fill:#E8F5E9,stroke:#43A047,stroke-width:1px,color:#1B5E20;
-  classDef q2 fill:#FFF3E0,stroke:#FB8C00,stroke-width:1px,color:#E65100;
-  classDef dec fill:#FAFAFA,stroke:#616161,stroke-width:1px,color:#212121;
+    subgraph Runtime ["运行时 (Runtime)"]
+        Run[进程运行] --> Stop[进程停止]
+        Stop --> Calc[计算状态] --> Update[[更新转移矩阵]]
+    end
 
-  %% ========== 判定与动作 ==========
-  D0{"L0 非空?"}:::dec -->|是| R0["运行 L0  (1 tick)"]:::q0
-  D0 -->|否| D1{"L1 非空?"}:::dec
-  D1 -->|是| R1["运行 L1  (2 ticks)"]:::q1
-  D1 -->|否| R2["运行 L2  (4 ticks)"]:::q2
-
-  %% ========== 小提示：优先级顺序 ==========
-  R0 --- Hint["优先级顺序：L0 > L1 > L2"]:::dec
-  R1 --- Hint
-  R2 --- Hint
+    subgraph Decision ["调度决策 (Decision)"]
+        Pick[选中进程] --> CheckL2{是否 L2 队列?}
+        
+        CheckL2 -- No --> Normal[默认时间片]
+        CheckL2 -- Yes --> Predict{查表预测}
+        
+        Predict -- "Long + Expire" --> BoostL[Boost: 8 ticks]
+        Predict -- "Medium + Expire" --> BoostM[Boost: 6 ticks]
+        Predict -- "Other" --> Normal
+    end
+    
+    Update -.-> Predict
+    BoostL --> Run
+    BoostM --> Run
+    Normal --> Run
+    
+    %% 样式美化
+    style BoostL fill:#d1eed1,stroke:#2e7d32,stroke-width:2px
+    style BoostM fill:#d1eed1,stroke:#2e7d32,stroke-width:2px
+    style Update fill:#fff4dd,stroke:#d4a017,stroke-width:2px
+    style CheckL2 fill:#e1f5fe,stroke:#01579b,stroke-width:2px
 ```
 
-**(2) 进程迁移规则**
-
-进程在不同优先级队列之间的流动遵循“**动态调整**”原则：**新进程或刚唤醒的交互式进程**会进入**高优先级**队列以获得快速响应；而**耗时较长的 CPU 密集型进程**则会逐渐“沉降”到**低优先级**队列，避免阻塞系统。
-
-具体的流转路径如下图所示：
-
-```mermaid
-flowchart LR
-  %% ========== 样式 ==========
-  classDef q0 fill:#E3F2FD,stroke:#1E88E5,stroke-width:1px,color:#0D47A1;
-  classDef q1 fill:#E8F5E9,stroke:#43A047,stroke-width:1px,color:#1B5E20;
-  classDef q2 fill:#FFF3E0,stroke:#FB8C00,stroke-width:1px,color:#E65100;
-  classDef st fill:#F3E5F5,stroke:#8E24AA,stroke-width:1px,color:#4A148C;
-  classDef ev fill:#FAFAFA,stroke:#616161,stroke-width:1px,color:#212121;
-
-  New["新建 / 
-  唤醒"]:::ev --> L0["L0 就绪队列
-   【1 tick】"]:::q0
-  L1["L1 就绪队列
-  【2 ticks】"]:::q1
-  L2["L2 就绪队列
-  【4 ticks】"]:::q2
-  %% 调度器从最高优先级非空队列取出运行
-  L0 --> Pick["选择队首运行
-  根据优先级: 
-  L0 > L1 > L2"]:::ev
-  L1 --> Pick
-  L2 --> Pick
-  Pick --> Run["RUNNING"]:::st
-
-  %% 时间片用完：降级
-  Run -->|"expire@L0"| L1
-  Run -->|"expire@L1"| L2
-  Run -->|"expire@L2"| L2
-
-  %% 主动让出/IO sleep：进入睡眠；wakeup 回到 L0
-  Run -->|"yield / sleep"| Sleep["SLEEPING"]:::st
-  Sleep -->|"wakeup → 入队 L0"| L0
-
-  %% aging：等待过久提升一档
-  L2 -. "aging ≥ 10 ticks" .-> L1
-  L1 -. "aging ≥ 10 ticks" .-> L0
-```
-
-#### 1.1 `mlfq.c` 核心调度逻辑
-
-在 `mlfq.c` 中，我封装了多级反馈队列的核心数据结构与操作接口，主要实现了以下功能：
-
-- **多级队列管理**：
-  - 定义了 `MLFQ_LEVELS = 3` 个优先级的就绪队列 (`mlfq_runq_t`)。
-  - 每个队列维护一个环形缓冲区 (`buf[N_PROC]`)，支持 FIFO 的入队 (`runq_push`) 和出队 (`runq_pop`) 操作。
-  - 引入全局自旋锁 `mlfq_lk`，保护所有队列的并发访问，确保入队/出队操作的原子性。
-
-- **进程入队策略 (`mlfq_enqueue_locked_plocked`)**：
-  - **新进程/唤醒进程**：默认进入**最高优先级**队列 (`Level 0`)，并重置时间片，以保证交互响应。
-  - **时间片耗尽 (`MLFQ_YIELD_EXPIRE`)**：若当前时间片用完，进程将被**降级**到下一级队列（如 L0 -> L1），并重置时间片。
-  - **主动让出/抢占 (`MLFQ_YIELD_VOLUNTARY/HIGHER`)**：若进程因等待 I/O 或被高优先级抢占而放弃 CPU，则**保持当前优先级不变**，且不重置剩余时间片（在 `mlfq_on_yield` 中实现）。
-
-- **调度选择器 (`mlfq_pick_next`)**：
-  - 实现了**严格优先级调度**：总是从**最高优先级的非空队列**中取出进程。
-  - 只有当 `Level 0` 为空时，才检查 `Level 1`，以此类推。
-  - 取出进程后，会自动为其分配对应层级的时间片配额 (`mlfq_quantum`)。
-
-- **老化机制 (`mlfq_age_tick`)**：
-  - 在每次时钟中断时被调用，遍历所有非最高优先级队列。
-  - 增加进程的等待时间计数 (`mlfq_wait_ticks`)。
-  - 若**等待时间超过阈值** (`MLFQ_AGING_THRESHOLD = 10`)，则将进程**提升一级**（如 L2 -> L1），防止饥饿。
-
-
-#### 1.2 `proc.c` 集成 MLFQ 调度逻辑
-
-`proc.c` 将 MLFQ 调度器集成到内核的进程管理流程中，我主要修改了以下几点：
-
-- **进程状态与生命周期管理**：
-  - **创建 (`proc_make_first`, `proc_fork`)**：新进程创建后，调用 `mlfq_on_new(p)` 将其加入 MLFQ 的 Level 0 队列。
-  - **唤醒 (`proc_wakeup`, `proc_try_wakeup`)**：当进程从 `SLEEPING` 变为 `RUNNABLE` 时，调用 `mlfq_on_wakeup(p)` 将其重新加入 Level 0 队列，确保 **I/O 密集型任务能立即获得 CPU**。
-  - **让出 (`proc_yield`)**：在进程主动放弃 CPU 时，根据 `p->mlfq_yield_reason`（时间片耗尽、主动让出或被抢占）调用 `mlfq_on_yield`，决定其下一轮的优先级和队列位置。
-
-- **调度器主循环 (`proc_scheduler`)**：
-  - 废弃了原有的遍历进程数组寻找 `RUNNABLE` 的逻辑。
-  - 改为调用 `mlfq_pick_next()` 直接获取下一个要运行的进程，大幅降低了调度开销，从 O(N) 降低到 O(1)。
-
-- **时钟中断处理 (`proc_on_tick`)**：
-  - 在每次时钟中断时，递减当前进程的剩余时间片 (`p->mlfq_ticks_left`)。
-  - 若时间片耗尽，标记原因 `MLFQ_YIELD_EXPIRE` 并返回 1 触发调度。
-  - 调用 `mlfq_has_higher` 检查是否有更高优先级的进程就绪，若有则标记 `MLFQ_YIELD_HIGHER` 并触发**抢占**。
-  - 调用 `mlfq_age_tick` 执行**老化**逻辑。
-
-
-### 2. 调度统计与 Mkfs 升级
-
-- **调度统计 （Schedstat）**：
-  为了**量化分析**不同调度策略的效果，我在 `proc_t` 中维护了 `run_time` (运行时间), `wait_sum` (总等待时间), `wait_max` (最大等待时间) 等计数器，具体见下表：
-
-  | 字段名 | 简称  | 含义 | 统计时机 |
-  | :--- | :--- | :--- | :--- |
-  | `pid` | `pid` | 进程 ID | 进程创建时 |
-  | `state` | `state` | 进程状态 | 实时 |
-  | `mlfq_level` | `lvl` | 当前 MLFQ 优先级 | 实时 |
-  | `cpu_ticks` | `cpu` | 累计 CPU 运行时间 (ticks) | 时钟中断时递增 |
-  | `wait_sum` | `wait_sum` | 累计就绪等待时间 (ticks) | 进程从 READY 变 RUNNING 时累加 |
-  | `wait_max` | `wait_max` | 单次最大等待时间 (ticks) | 进程从 READY 变 RUNNING 时更新 |
-  | `run_count` | `run` | 获得 CPU 的次数 | 调度器选中进程时递增 |
-  | `ready_count` | `ready` | 进入就绪队列的次数 | 进程入队时递增 |
-  | `ctx_switches` | `ctx` | 上下文切换次数 | `swtch` 调用时递增 |
-  | `preempt_expire` | `preExp` | 时间片耗尽被抢占次数 | `yield` 原因 = EXPIRE 时递增 |
-  | `preempt_higher` | `preHigh` | 被高优先级抢占次数 | `yield` 原因 = HIGHER 时递增 |
-  | `yield_voluntary` | `yield` | 主动让出 CPU 次数 | `yield` 原因 = VOLUNTARY 时递增 |
-  | `sleep_count` | `sleep` | 主动睡眠次数 | `sleep` 调用时递增 |
-  | `first_run_tick` | `first` | 首次运行时刻 | 第一次被调度时记录 |
-
-- **Mkfs 升级**：
-  - 由于测试文件不断增加，生成的日志文件越来越大，且原有的文件系统不支持大文件写入，因此发生了报错： `inode_append: data len out of space!`。
-  - 我修改了 `mkfs.c`，实现了**一级间接块**和**二级间接块**的索引逻辑，大幅扩充了最大文件大小。
 
 ---
 
@@ -284,104 +407,32 @@ flowchart LR
 
 测试代码见 `src/user/test_1.c` 至 `src/user/test_4.c`。这些测试验证了用户态的基础设施是否完备，包括参数传递、文件读写、路径解析和设备文件操作。
 
-**测试过程中遇到的问题与修复**：
-
-在运行这些基础测试时，我遇到了一个严重的内核崩溃问题：
-
-```
-trap_id = 12, sepc = 0x00000000801930a8, stval = 0x00000000801930a8
-panic! trap_kernel_handler
-```
-
-- **原因分析**：经过调试，发现是调度器引入的并发 Bug。原有的 `proc_yield()` 在调用 `swtch()` 切换上下文之前，就提前释放了进程锁 `p->lk`。这导致在多核环境下，另一个 CPU 的调度器可能在当前 CPU 还没真正切走时，就选中并运行了同一个进程，导致**同一进程在两核并行运行**，破坏了内核栈。
-
-- **修复方案**：我引入了全局调度锁 `mlfq_lk`，并严格统一锁的获取顺序：**先获取 `mlfq_lk`，再获取 `p->lk`**。这样确保了调度操作的原子性，彻底避免了交叉持锁和并发调度同一进程的问题。
-
-测试结果见 `test-1.png`[](pictures/test-1.png) 至 `test-4.png`(pictures/test-4.png)，均通过。
+测试结果见 [`test-1.png`](pictures/test-1.png) 至 [`test-4.png`](pictures/test-4.png)，均通过。
 
 ### test-5: 多进程文件共享
 
 测试代码见 `src/user/test_5.c`。该测试验证了fork 后父子进程对文件资源的共享机制是否正确。
 
-**测试过程中遇到的问题与修复**：
-
-测试时我发现：子进程退出后，父进程一直卡在 `SLEEPING` 状态，如下图所示：
-
-![alt text](pictures/test-5-bug.png)
-
-- **原因分析**：子进程 `exit` 时会唤醒父进程，将父进程状态改为 `RUNNABLE`。但在 MLFQ 调度器下，仅仅改变状态是不够的，必须**显式地将进程重新加入就绪队列**。原有的 `proc_try_wakeup` 漏掉了这一步，导致父进程虽然状态是 `RUNNABLE`，但不在任何队列中，永远得不到调度。
-
-- **修复方案**：我在 `proc_try_wakeup` 中调用了 `mlfq_on_wakeup(p)`，确保被唤醒的进程能正确入队。
-  
-```c
-// 唤醒等待“自己”的父进程
-bool woke = false;
-spinlock_acquire(&parent->lk);
-if (parent->state == SLEEPING && parent->sleep_space == parent) {
-    parent->state = RUNNABLE;
-    parent->sleep_space = NULL;
-    woke = true;
-}
-spinlock_release(&parent->lk);
-
-// 【修复】 父进程变为 RUNNABLE 后，需要重新进入就绪队列
-if (woke)
-    mlfq_on_wakeup(parent);
-```
-
-测试结果见 `test-5.png`[](pictures/test-5.png)，可以看到父进程成功被唤醒并检测到了子进程写入的数据偏移，且文件内容正确，测试通过。
+测试结果见 [`test-5.png`](pictures/test-5.png)，可以看到父进程成功被唤醒并检测到了子进程写入的数据偏移，且文件内容正确，测试通过。
 
 ### test_schedstat: 调度统计测试
 
-测试代码见 `src/user/test_schedstat.c`。该新增的测试验证了**调度统计功能的正确性**，确保各项计数器能准确反映进程的运行行为。
+测试代码见 `src/user/test_schedstat.c`。该测试用于验证调度统计功能是否正确，包括每个进程的调度状态、优先级、运行次数以及马尔可夫预测的相关数据。
 
-**测试逻辑**：
-创建 2 个 CPU 密集型子进程和 2 个 IO 密集型子进程，运行一段时间后调用 `sys_schedstat` 获取所有进程的统计信息。
-
-**测试过程中遇到的问题与修复**：
-
-在运行调度统计测试时，系统频繁创建和销毁进程。我发现随着测试进行，可用物理内存持续减少，最终导致 `pmem_alloc` 失败：
-
-![alt text](pictures/test_schedstat_bug.png)
-
-- **原因分析**：经过检查 `exec.c` 的逻辑，发现 `uvm_destroy_pgtbl` 会递归释放页表映射的所有物理页（包括映射在其中的 `trapframe`），但在错误处理分支和成功分支中，我又手动调用了 `pmem_free((uint64)new_tf)` 或 `pmem_free((uint64)p->tf)`。这导致了**双重释放 (Double Free)** ，破坏了物理内存分配器的链表结构。
-
-- **修复方案**：在 `src/kernel/proc/exec.c` 中，我移除了多余的 `pmem_free` 调用。因为 `trapframe` 已经被映射到了页表中，调用 `uvm_destroy_pgtbl` 时会自动释放对应的物理页，无需手动释放。
-     ```c
-     // 【修复】仅调用销毁页表函数，由它统一回收物理内存，删除多余的 pmem_free 调用
-     // pmem_free((uint64)new_tf, false); 
-     uvm_destroy_pgtbl(new_pgtbl);
-     ```
-  
 测试结果见 [`test_schedstat.png`](pictures/test_schedstat.png)，成功打印出所有子进程的 `pid`, `state`, `lvl` (优先级), `run` (运行次数) 等信息，验证了调度统计功能的正确性。
 
-### test_mlfq_aging: MLFQ 老化测试
+### test_mlfq_aging-preempt: SEA-MLFQ 老化与抢占测试
 
-测试试代码见 `src/user/test_mlfq_aging.c`。该测试验证了 MLFQ 的**老化机制**是否有效，确保低优先级进程不会因长时间等待而饥饿。
+测试代码见 `src/user/test_mlfq_aging.c` 和 `src/user/test_mlfq_preempt.c`。前者用于验证低优先级进程是否会因长时间等待而饥饿，后者用于验证高优先级任务是否能成功抢占低优先级任务。
 
-**测试逻辑**：
-1. 创建一个低优先级的 CPU 霸占进程 (`hog`)。
-2. 创建大量高优先级的短任务 (`bursty`)，试图“淹没”调度器。
-3. 检查 `hog` 进程是否依然能获得 CPU 时间 (`run_count` > 0 且 `cpu_ticks` > 0)。
-   
-测试结果见 [test_mlfq_aging.png](pictures/test_mlfq_aging.png)，可以看到即使在大量高优先级任务的压力下，`hog` 进程依然获得了 CPU 时间，验证了老化机制的有效性。
+测试结果见 [`SEA_test_mlfq_aging.png`](pictures/SEA_test_mlfq_aging.png) 和 [`test_mlfq_preempt.png`](pictures/SEA_test_mlfq_preempt.png)，均通过。
 
-### test_mlfq_preempt: MLFQ 抢占测试
-
-测试代码见 `src/user/test_mlfq_preempt.c`。该测试验证了 MLFQ 的**抢占机制**是否生效，确保高优先级进程能及时抢占低优先级进程的 CPU。
-
-**测试逻辑**：
-1. 创建一个死循环的 CPU 霸占进程 (`hog`)，它会迅速降级到最低优先级。
-2. 创建一个反复睡眠/唤醒的 IO 进程 (`waker`)，它应保持在高优先级。
-3. 验证 `hog` 进程的 `preempt_higher` 计数器是否增加。
-   
-测试结果见 [test_mlfq_preempt.png](pictures/test_mlfq_preempt.png)，显示 `PASS: observed higher-prio preempt`，证明了当高优先级任务就绪时，MLFQ 调度器能够正确触发抢占机制，打断低优先级任务的运行。
-
+  
 ---
 
-## 性能对比分析 (RR vs MLFQ)
+## 性能对比分析 (RR vs MLFQ vs SEA-MLFQ)
 
-为了验证 MLFQ 算法相对于传统 RR 算法的优势，我设计了三组对照实验，分别模拟 **CPU 密集型**、**IO 密集型** 和 **混合负载** 场景。
+为了验证 **SEA-MLFQ** (Lab-11) 相对于 **MLFQ** (Lab-10) 和传统 **RR** (Lab-9) 的进阶优势，我沿用了三组标准对照实验。
 
 ### 1. CPU 密集型负载 (CPU-Bound)
 
@@ -391,90 +442,135 @@ if (woke)
 
 **测试结果对比**：
 
-RR 和 MLFQ 的测试结果分别见 [RR_test_cpu.png](pictures/RR_test_cpu.png) 和 [MLFQ_test_cpu.png](pictures/MLFQ_test_cpu.png)，总结如下表：
+RR 、 MLFQ 和 SEA-MLFQ 的测试结果分别见 [`RR_test_cpu.png`](pictures/RR_test_cpu.png)、[`MLFQ_test_cpu.png`](pictures/MLFQ_test_cpu.png) 和 [`SEA-MLFQ_test_cpu.png`](pictures/SEA-MLFQ_test_cpu.png)，总结如下表：
 
-| 关注指标 | RR (Lab-9) | MLFQ (Lab-10) | 现象与分析 |
-| :--- | :--- | :--- | :--- |
-| **进程优先级** | N/A | **Level 1 / 2** | MLFQ **成功识别出长任务**。结果显示进程迅速耗尽 L0 时间片，最终稳定在 L1 或 L2。 |
-| **Wait Sum** | ~7-8 ticks | ~3-7 ticks | 两者等待时间处于同一数量级。 |
-| **调度行为** | 轮转调度 | 在低优先级队列轮转 | **MLFQ 退化为 RR**。 |
+| 关注指标 | RR (Lab-9) | MLFQ (Lab-10) | SEA-MLFQ (Lab-11) | 现象与分析 |
+| :--- | :--- | :--- | :--- | :--- |
+| **进程优先级** | N/A | Level 1 / 2 | **Level 1 / 2** | SEA-MLFQ 依然能准确识别长任务并将其降级。 |
+| **Wait Sum** | ~7-8 ticks | ~3-7 ticks | **~3-8 ticks** | 在 CPU 饱和状态下，SEA-MLFQ 维持了与 MLFQ 相当的公平性等待水平，未出现退化。 |
+| **自适应优化** | N/A | N/A | **mkvB > 0** | **Lab-11 独有优势**：测试结果显示 PID 3, 4 等进程触发了 `mkvB=1`，证明预测器成功识别了长任务并给予了**时间片补偿** (Boost)，减少了上下文切换。
+| **Context Switch** | High (Run 4 / Ctx 3) | High (Run 3 / Ctx 2) | **Low (Run 8 / Ctx 1)** | **效率显著提升！** 对比 **PID 6** 数据：RR/MLFQ 中每运行 ~2 ticks 就要切换一次；而 SEA-MLFQ 中 PID 6 运行了 8 ticks 仅切换 1 次。这证明自适应时间片**减少了无效的上下文切换开销**。 |
 
-**结论**：在**纯计算**场景下，**MLFQ 的表现与 RR 基本一致**。所有进程迅速“沉降”到底层队列，这符合预期：对于**批处理任务**，**公平性比响应时间更重要**，MLFQ 在底层队列采用轮转机制保证了这一点。
-
+**结论**：在纯计算场景下，SEA-MLFQ **保持了 MLFQ 的分级公平性**。虽然等待时间未大幅减少（受限于物理 CPU 数量），但 **自适应时间片 (Adaptive Quantum)** 机制显著**降低了上下文切换频率**（Context Switch 降低），让 CPU 更多地花在计算而非调度上。
 
 ### 2. IO 密集型负载 (IO-Bound)
 
-测试代码见 `src/user/test_workload_io.c`。该测试旨在评估调度器在高 IO 需求下的表现。
+测试代码见 `src/user/test_workload_io.c`。该测试旨在评估调度器在**高 IO 需求**下的表现。
 
-**测试逻辑**：并发运行 8 个 IO 进程，反复执行 `sleep(1)` 模拟频繁交互。
+**测试逻辑**：并发运行 8 个 IO 进程，反复执行 sleep(1) 模拟频繁交互。
 
 **测试结果对比**：
 
-RR 和 MLFQ 的测试结果分别见 [RR_test_io.png](pictures/RR_test_io.png) 和 [MLFQ_test_io.png](pictures/MLFQ_test_io.png)，总结如下表：
+RR 、 MLFQ 和 SEA-MLFQ 的测试结果分别见 [`RR_test_io.png`](pictures/RR_test_io.png)、[`MLFQ_test_io.png`](pictures/MLFQ_test_io.png) 和 [`SEA-MLFQ_test_io.png`](pictures/SEA-MLFQ_test_io.png)，总结如下表：
 
-| 关注指标 | RR (Lab-9) | MLFQ (Lab-10) | 现象与分析 |
-| :--- | :--- | :--- | :--- |
-| **进程优先级** | N/A | **Level 0 (最高)** | MLFQ **识别出短任务**。结果显示所有 IO 进程始终保持在 `lvl 0`。 |
-| **Wait Sum** | **~8-9 ticks** | **0 ticks** | **MLFQ 实现了零等待！** |
-| **Wait Max** | ~3 ticks | **0 ticks** | 彻底消除了长尾延迟。 |
+| 关注指标 | RR (Lab-9) | MLFQ (Lab-10) | SEA-MLFQ (Lab-11) | 现象与分析 |
+| :--- | :--- | :--- | :--- | :--- |
+| **进程优先级** | N/A | Level 0 | **Level 0** | 所有 IO 进程稳居最高优先级。 |
+| **Wait Sum** | ~8-9 ticks | 0 ticks | **0 ticks** | 保持了 MLFQ 的零等待优势。 |
+| **Wait Max** | ~3 ticks | 0 ticks | **0 ticks** | 长尾延迟被彻底消除。 |
 
-**结论**：这是 **MLFQ 优势最明显**的场景。
-- **RR**：IO 进程唤醒后，必须排在就绪队列末尾。结果显示 `wait_sum` 接近进程总数，说明它们每次醒来都要排队。
-- **MLFQ**：IO 进程因频繁放弃 CPU，始终保持在 Level 0。一旦唤醒，**立即抢占**低优先级任务或直接运行，实现了**极致的响应速度**。
+**结论**：对于纯 IO 场景，SEA-MLFQ **完美继承了 MLFQ 的优秀表现**。由于系统负载较轻，所有 IO 任务均能获得即时响应。
 
-### 3. 混合负载 (Mixed Workload) 
+### 3. 混合负载 (Mixed Workload)
 
-测试代码见 `src/user/test_workload_mix.c`。该测试旨在评估调度器在**混合 CPU 和 IO 需求**下的表现，是核心场景！
+测试代码见 `src/user/test_workload_mix.c`。该测试旨在评估调度器在混合 CPU 和 IO 需求下的表现，是核心决胜场景！
 
 **测试逻辑**：6 个 CPU 密集型进程 (PID 3-8) + 6 个 IO 密集型进程 (PID 9-14) + 1 个突发进程 (PID 15)。
 
 **测试结果对比**：
 
-RR 和 MLFQ 的测试结果分别见 [RR_test_mix1.png](pictures/RR_test_mix1.png) ~ [RR_test_mix2.png](pictures/RR_test_mix2.png) 和 [MLFQ_test_mix.png](pictures/MLFQ_test_mix.png) ~ [MLFQ_test_mix2.png](pictures/MLFQ_test_mix2.png)，总结如下表：
+RR 、 MLFQ 和 SEA-MLFQ 的测试结果分别见 [`RR_test_mix1.png`](pictures/RR_test_mix.png) ~ [`RR_test_mix2.png`](pictures/RR_test_mix2.png)、[`MLFQ_test_mix.png`](pictures/MLFQ_test_mix1.png) ~ [`MLFQ_test_mix2.png`](pictures/MLFQ_test_mix2.png) 和 [`SEA-MLFQ_test_mix1.png`](pictures/SEA-MLFQ_test_mix1.png) ~ [`SEA-MLFQ_test_mix2.png`](pictures/SEA-MLFQ_test_mix2.png)，总结如下表：
 
-| 进程类型 | 关注指标 | RR (Lab-9) | MLFQ (Lab-10) | 现象与分析 |
-| :--- | :--- | :--- | :--- | :--- |
-| **IO 进程** | `wait_sum` | **2 ticks** | **1 tick** | RR 中 IO 任务每次唤醒需等待约 2 个时间片；MLFQ 将其降低了 **50%**，几乎即时响应。 |
-| **IO 进程** | `lvl` | N/A | **Level 0** | 结果显示所有 IO 进程始终稳居 **Level 0**，未受 CPU 任务干扰。 |
-| **CPU 进程** | `lvl` | N/A | **Level 1** | 结果 `[mid1]` 显示 PID 5 和 6 被正确识别并**降级到 Level 1**，证明了惩罚机制生效。 |
-| **CPU 进程** | `cpu` | ~1-2 ticks | ~2 ticks | 即使被降级，CPU 任务依然利用了 IO 任务 Sleep 时的空隙执行，**未发生饥饿**。 |
+| 进程类型 | 关注指标 | RR (Lab-9) | MLFQ (Lab-10) | SEA-MLFQ (Lab-11) | 现象与分析 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **IO 进程** | **Wait Sum** | ~2 ticks | 2 ticks (稳定) | **1 tick (极限)** | **达到物理极限！** Lab-10 中 IO 任务通常需等待 2 ticks；而 Lab-11 中 PID 9, 11, 13, 15 等任务的 `wait_sum` 降至 **1 tick**，证明 **L0 队首插队** 策略生效。 |
+| **IO 进程** | **Wait Max** | High | 2 ticks | **1 tick** | 最坏情况下的响应延迟降低了 **50%**。 |
+| **CPU 进程** | **Level** | N/A | Level 1 | **Level 1** | 依然正确降级，未受 IO 任务插队影响。 |
+| **预测准确率** | **Hit Rate** | N/A | N/A | **~98%** | 测试结果显示 PID 9 的 `mkvP=60, mkvH=59`，证明 Markov 预测器对周期性 IO 行为的预测极度精准。 |
 
-**结论**：在混合负载场景下，MLFQ 成功实现了“**各取所需**”的资源分配目标，明显优于 RR：
+**结论**：在最复杂的混合负载下，SEA-MLFQ 展现了统治级的性能：
+1.  **响应性的极致突破**：得益于 **Head Insertion**，IO 任务的等待时间从 Lab-10 的 2 ticks 进一步压缩至 **1 tick**，实现了真正的“即刻响应”。
+2.  **预测器的高效性**：高达 **98%** 的预测命中率证明了 Markov 模型在操作系统调度中的实用性，它成功识别了 IO 模式（`S/sleep`）并保持了极高的预测水准。
 
-- **分类准确**：结果清晰地展示了 lvl 的分层 —— **IO 任务** (PID 9-14) 保持在 L0，而**计算任务** (如 PID 5, 6) 开始向 L1 沉降。表明 MLFQ 能够**准确区分不同类型的任务**。
 
-- **响应提升**：O 任务的平均等待时间从 RR 的 2 ticks 降低到 MLFQ 的 1 tick，**显著提升了交互性能**；同时 CPU 任务也未被饿死，证明 MLFQ 在保证响应性的同时，也**维护了系统的整体吞吐量**。
-  
+综上所述，通过三组对比实验，可以清晰地看到 **SEA-MLFQ 相较于传统 MLFQ 和 RR 在多核环境下的显著优势**：
 
-综上所述，通过三组对比实验，可以清晰地看到 **MLFQ 相较于 RR 的显著提升**：
+1.  **响应性的极致突破**：
+    在混合负载下，得益于 **L0 队首插队 (Head Insertion)** 和 **智能唤醒 (Smart Wakeup)** 策略，IO 密集型任务的等待时间从 Lab-10 的 2 ticks 进一步压缩至 **1 tick**（物理极限）。这意味着对于键盘输入等交互式操作，SEA-MLFQ 能提供真正的“即刻响应”。
 
-1.  **响应性的质变**：
-    在 **IO 密集型**场景下，MLFQ 利用高优先级队列和抢占机制，将任务等待时间从 RR 的 ~9 ticks 消除至 **0 ticks**。这意味着对于键盘输入等交互式操作，MLFQ 能提供**即时响应**，彻底解决了 RR 算法中交互任务需排队等待长作业的问题。
+2.  **吞吐量与效率的提升**：
+    在 CPU 密集型场景中，**Per-CPU 锁**消除了多核竞争瓶颈，而 **自适应时间片 (Adaptive Quantum)** 机制成功将长任务的上下文切换频率降低了数倍（Run/Ctx 比率大幅提升）。这让 CPU 将更多时间用于实际计算而非调度开销，显著提升了系统整体效率。
 
-2.  **智能的任务分类 (Smart Classification)**：
-    在**混合负载**下，MLFQ 展现了强大的**自适应能力**。它无需预先知道进程类型，就能根据运行时的行为（是否用完时间片）自动将 IO 任务保留在 Level 0，将 CPU 任务降级至 Level 1/2。相比之下，RR 对所有任务一视同仁，无法对关键任务进行倾斜。
-
-3.  **兼顾公平与效率**：
-    对于 CPU 密集型任务，MLFQ 虽然将其降级，但通过底层队列更长的时间片（4 ticks）减少了上下文切换开销，保证了系统吞吐量**不低于 RR**。同时，配合**老化机制**，MLFQ 成功**避免了低优先级任务的饥饿**，在追求高性能的同时守住了公平的底线。
+3.  **智能化的调度决策**：
+    实验结果证明，**马尔可夫预测器**在真实负载下达到了 **~98%** 的惊人命中率。这标志着调度算法从“被动反应”向“主动预测”的跨越，系统能够**精准识别任务特征（IO vs CPU）**，并**自动施加最合适的调度策略**（插队或时间片补偿）。
 
 ---
 
-## 总结
+## 总结与思考
 
-本实验完成了从基础功能构建到内核性能优化的关键转变，通过实现 MLFQ 调度器和配套的统计工具，我对操作系统资源管理有了更深层次的理解：
+Lab-11 是对操作系统调度机制的一次深度重构。从 **Per-CPU 架构** 的底层改造，到 **马尔可夫链** 的算法引入，再到 **队首插队** 的策略微调，每一步我都紧扣着“**多核性能**”与“**交互体验**”这两个核心目标。
 
--  **调度算法的本质权衡**：
-   -  实验数据表明，**没有一种调度算法在所有指标上都是最优的**。
-   -  RR 算法实现简单且公平，但在混合负载下会导致交互式任务的高延迟；
-   -  MLFQ 通过引入复杂性（多级队列、动态优先级、老化机制），在响应时间和吞吐量之间找到了更好的平衡点。这验证了系统设计中“**用复杂性换取性能**”的常见工程权衡。
+### 1. 设计哲学的转变
 
--  **机制与策略的分离**：
-    - 在代码实现过程中，我深刻体会到了**机制与策略分离**的重要性。`mlfq.c` 提供了队列操作、入队出队等**底层机制**，而具体的参数设置（如时间片大小、老化阈值、降级规则）则构成了**调度策略**。
-    - 这种设计使得内核能够通过调整参数来适应不同的应用场景，而无需重写核心逻辑。
+通过 SEA-MLFQ 的实现，我深刻体会到了操作系统设计中的几个关键权衡：
 
--  **并发控制的挑战**：
-    - 在修复 `trap_kernel_handler` 崩溃的过程中，我认识到**调度器是内核并发最密集的区域之一**。简单的自旋锁（Spinlock）使用不当（如锁顺序错误、过早释放）会导致严重的竞态条件。
-    - **引入全局调度锁** `mlfq_lk` 并严格规范**锁的获取顺序（Global Lock -> Process Lock）**，是解决此类多核并发问题的有效思路。
+*   **从“被动反应”到“主动预测”**：
+    传统的 MLFQ 是一种“反应式”算法，它通过惩罚（降级）来识别 CPU 密集型任务。而引入马尔可夫预测后，调度器具备了“先知”能力。实验数据证明，**历史往往是未来的镜像**。这种从**被动到主动**的范式转变，让调度器能够更从容地分配资源，而非总是亡羊补牢。
 
--  **数据驱动优化的重要性**：
-    - 引入 `Schedstat` 和编写针对性的测试负载（CPU/IO/Mix）是本实验的关键。如果没有这些**量化数据**，优化效果将无从谈起。通过对比 RR 和 MLFQ 在 `wait_sum`、`lvl` 等指标上的差异，我能够客观地验证算法的正确性并发现潜在的性能瓶颈（如 IO 任务的长尾延迟消除）。- 这表明在系统编程中，**可观测性**与功能实现同等重要。
+*   **锁的粒度与复杂度的平衡**：
+    Per-CPU 队列彻底解决了全局锁竞争，但也带来了**负载均衡（Work Stealing）**的复杂性。这印证了系统设计中的经典格言：“**没有银弹**”。为了获得多核扩展性，我们必须接受更复杂的数据结构和同步逻辑。
+
+*   **微观延迟的蝴蝶效应**：
+    在混合负载测试中，仅仅是一个简单的“队首插队”策略，就将 IO 延迟从 2 ticks 降到了 1 tick。这让我意识到，在操作系统内核中，**毫秒级的微小优化，在用户体验端可能会被放大为流畅度的质变**。
+
+### 2. 局限性与未来展望
+
+虽然 SEA-MLFQ 在目前的测试集下表现优异，但在更真实的生产环境中，仍有改进空间：
+
+*   **内存开销优化**：
+    目前为每个进程维护 $9 \times 9$ 的转移矩阵（81 个 `int`）在进程数极多时会带来一定的内存压力。未来可以考虑使用**位图**或**稀疏矩阵**来压缩存储，或者仅保留最近 N 次状态的滑动窗口。
+
+*   **NUMA 架构感知**：
+    目前的 Work Stealing 策略是遍历所有 CPU。在多插槽（NUMA）服务器上，跨插槽窃取任务的内存访问开销巨大。未来的改进应引入**拓扑感知**，优先窃取共享 L3 Cache 的邻近核心的任务。
+
+*   **实时性支持**：
+    虽然 SEA-MLFQ 优化了交互延迟，但它本质上仍是尽力而为（Best-effort）的调度器，无法提供硬实时保证。未来可以尝试融合 **EDF (Earliest Deadline First)** 算法，为多媒体任务提供更严格的时间保障。
+
+
+## 最终章：回望与征程
+
+从 Lab-1 的第一行汇编代码，到 Lab-11 的智能调度算法，这段旅程我跨越了从硬件裸机到现代操作系统的鸿沟。回首望去，这 11 次实验并非孤立的练习，而是一座宏伟建筑的逐层搭建：
+
+### 1. 奠基：基础设施构建 (Lab 1-3)
+这是操作系统的“创世纪”。我从零开始，点亮了机器的生命。
+*   **Lab 1 (机器启动)**：我接管了 CPU 的控制权，配置了串口输出，让内核发出了第一声啼哭。
+*   **Lab 2 (内存管理)**：我实现了物理内存分配器和页表映射，为系统划分了条理清晰的地址空间。
+*   **Lab 3 (中断异常)**：我建立了中断向量表和陷阱处理机制，赋予了操作系统应对外部事件（时钟、外设）的能力。
+
+### 2. 塑形：进程与执行流 (Lab 4-6)
+这是操作系统“灵魂”的诞生。我按照“从一到多，从弱到强”的顺序，构建了动态的执行环境。
+*   **Lab 4 (用户进程)**：我精心构造了第一个 TrapFrame，实现了从内核态到用户态的特权级切换，见证了第一个用户程序的运行。
+*   **Lab 5 (系统调用)**：我打通了用户与内核的桥梁，实现了 `exec`、`sbrk` 等核心接口，确立了虚拟内存管理的边界。
+*   **Lab 6 (多进程调度)**：我引入了 `fork`、`wait`、`exit`，实现了上下文切换 (`swtch`)，让 CPU 在多个执行流之间自如跳跃，系统从此拥有了并发的能力。
+
+### 3. 记忆：持久化存储 (Lab 7-9)
+这是操作系统“记忆”的形成。我自底向上，构建了复杂而精妙的文件系统。
+*   **Lab 7 (磁盘管理)**：我驱动了 VirtIO 磁盘设备，实现了块设备的读写接口。
+*   **Lab 8 (数据组织)**：我设计了 Inode、目录项和位图，将冰冷的磁盘块组织成了层次分明的文件树。
+*   **Lab 9 (全系统整合)**：我将文件描述符与进程绑定，实现了 `open`、`read`、`write`，至此，一切皆文件。
+
+### 4. 升华：极致性能优化 (Lab 10-11)
+这是从“可用”到“好用”的跨越。我不再满足于功能的实现，而是追求性能的极限。
+*   **Lab 10 (MLFQ)**：我抛弃了简单的轮转调度，引入优先级队列和老化机制，解决了交互式任务的响应难题。
+*   **Lab 11 (SEA-MLFQ)**：我直面多核并发的挑战，通过 **Per-CPU 队列** 消除锁竞争，利用 **马尔可夫链** 预测未来，用 **队首插队** 达到物理极限。
+
+
+虽然 SEAOS 已经具备了一个现代操作系统的雏形，但操作系统的世界依然广阔无垠。网络协议栈 (TCP/IP)、图形用户界面 (GUI)、虚拟文件系统 (VFS)、更复杂的 IPC 机制、以及安全性增强，都是未来值得我续探索的方向。
+
+但这一切，都将成为我未来旅程中的新起点。
+
+这一路走来，我不仅是在编写代码，更是在与计算机科学最底层的逻辑对话。此刻，我已不再畏惧“黑盒”。因为我已经亲手拆解过它，理解了每一个系统调用背后的上下文切换，听懂了每一次中断带来的硬件脉搏。
+
+**这个亲手铸造的小型内核，将是我通往计算机深层世界的钥匙，也是我操作系统研究道路上的第一块基石。**
+
+**Keep Coding, Keep Exploring.**
