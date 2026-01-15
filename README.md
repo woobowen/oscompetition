@@ -433,14 +433,39 @@ flowchart LR
 测试代码见 `src/user/test_schedstat.c`。该测试用于验证调度统计功能是否正确，包括每个进程的调度状态、优先级、运行次数以及马尔可夫预测的相关数据。
 
 测试结果见 [`test_schedstat.png`](pictures/test_schedstat.png)，成功打印出所有子进程的 `pid`, `state`, `lvl` (优先级), `run` (运行次数) 等信息，验证了调度统计功能的正确性。
-
+ 
 ### test_mlfq_aging-preempt: SEA-MLFQ 老化与抢占测试
-
 测试代码见 `src/user/test_mlfq_aging.c` 和 `src/user/test_mlfq_preempt.c`。前者用于验证低优先级进程是否会因长时间等待而饥饿，后者用于验证高优先级任务是否能成功抢占低优先级任务。
 
-测试结果见 [`SEA_test_mlfq_aging.png`](pictures/SEA_test_mlfq_aging.png) 和 [`test_mlfq_preempt.png`](pictures/SEA_test_mlfq_preempt.png)，均通过。
+测试结果见 [`test_mlfq_aging.png`](pictures/SEA_test_mlfq_aging.png) 和 [`test_mlfq_preempt.png`](pictures/SEA_test_mlfq_preempt.png)，均通过。
 
-  
+### test_steal_l1: 负载均衡与 L1 兜底窃取测试
+
+该测试专门用于验证 **Per-CPU 队列** 模式下的 **Work Stealing (任务窃取)** 机制。它模拟了“本地空闲且全局最高优先级任务为空”的极端场景，观察系统是否能触发 **L1 级任务窃取**。
+
+**测试逻辑**：
+启动 12 个计算型子进程（初置于 L1），人为制造一个各核心 L2 队列均为空的“计算不饱满”阶段，观察 CPU 是否会空转。
+
+测试结果见 [`test_steal_l1.png`](pictures/test_steal_l1.png)，实验结论如下：
+
+1.  **验证 L1 兜底窃取策略**：在 `t=0~7` 的 `L1-only` 阶段，尽管 `L2=0`，但 `cpu_ticks_delta` 始终保持大于 0。这证明了当本地与全局 L2 分别空闲时，调度器成功从跨核 L1 队列末尾窃取任务，保障了多核利用率。
+2.  **验证 MLFQ 动态识别**：从 `t=8` 开始 `l2` 逐渐增长，说明任务累积耗时达到阈值后被准确降级，体现了调度策略的一致性。
+3.  **统计严谨性**：全程 `hit=12/12` 说明我的 12 个子进程在每次采样中都被完整覆盖。`n` 证明统计表稳定返回，排除了因采样缺失导致数据偏移的质疑。
+
+### test_mkv_pattern: 马尔可夫预测与自适应 Boost 测试
+
+该测试旨在验证 **马尔可夫预测器** 对不同特征任务的识别准确率，以及 **自适应时间片 (Boost)** 机制的触发逻辑。
+
+**测试逻辑**：
+1.  **PAT (Pattern 进程)**：执行周期性的 `计算 -> 睡眠` 行为，模拟稳定的 I/O 交互模式。
+2.  **BST (Boost 进程)**：执行纯计算任务，使其下沉到 L2 队列并反复触发 `Expire`（时间片耗尽），观察其是否能获得预测器给予的时间片补偿。
+
+测试结果见 [`test_mkv_pattern.png`](pictures/test_mkv_pattern.png)，实验结论如下：
+
+1. **极高的预测命中率 (PAT)**：PAT 进程的命中率（hit）从 87% 快速收敛并稳定在 **99%**，且 `pred/act` 长期保持为 `S/sleep`。这证明了 Markov 模型能精准捕捉并学习到 I/O 任务的周期性模式。
+2. **自适应 Boost 触发 (BST)**：对于处于 L2 的纯计算进程 BST，其 mkvB（Boost 计数）从 2 持续增长至 21。这证明当预测器识别到任务即将发生 `L/expire` 时，内核成功为其分配了更长的时间片。
+3. **模型自我进化**：BST 进程的预测命中率从最初的 0% 逐步提升到 85% 以上，说明**即使是非交互式任务，预测器也能通过观察历史行为实现状态收敛**。
+
 ---
 
 ## 性能对比分析 (RR vs MLFQ vs SEA-MLFQ)
