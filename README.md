@@ -504,8 +504,7 @@ RR 、 MLFQ 和 SEA-MLFQ 的测试结果分别见 [`RR_test_io.png`](pictures/RR
 | 关注指标 | RR (Lab-9) | MLFQ (Lab-10) | SEA-MLFQ (Lab-11) | 现象与分析 |
 | :--- | :--- | :--- | :--- | :--- |
 | **进程优先级** | N/A | Level 0 | **Level 0** | 所有 IO 进程稳居最高优先级。 |
-| **Wait Sum** | ~8-9 ticks | 0 ticks | **0 ticks** | 保持了 MLFQ 的零等待优势。 |
-| **Wait Max** | ~3 ticks | 0 ticks | **0 ticks** | 长尾延迟被彻底消除。 |
+| **Wait Sum** | 2 ticks | 0 ticks | **0 ticks** | 保持了 MLFQ 的零等待优势。 |
 
 **结论**：对于纯 IO 场景，SEA-MLFQ **完美继承了 MLFQ 的优秀表现**。由于系统负载较轻，所有 IO 任务均能获得即时响应。
 
