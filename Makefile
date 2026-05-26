@@ -22,6 +22,12 @@ ELFKernel  = $(TARGET)/kernel/kernel-qemu.elf
 ELFUser    = $(UserPath)/initcode.h
 DISKIMG    = $(TARGET)/mkfs/disk.img
 
+# 主机工具编译器
+HOSTCC ?= gcc
+HOSTCFLAGS ?= -O2 -Wall -Werror
+BIN2C_SRC = tools/bin2c.c
+BIN2C = $(TARGET)/tools/bin2c
+
 # 收集内核源文件 (.c .S，包括子目录)
 KernelSourceFile = $(wildcard $(KernelPath)/*.c) $(wildcard $(KernelPath)/*.S)
 KernelSourceFile += $(wildcard $(KernelPath)/*/*.c) $(wildcard $(KernelPath)/*/*.S)
@@ -76,6 +82,7 @@ ifeq ($(wildcard $(TARGET)),)
 	@mkdir -p $(TARGET)/kernel/fs
 	@mkdir -p $(TARGET)/user
 	@mkdir -p $(TARGET)/mkfs
+	@mkdir -p $(TARGET)/tools
 endif
 
 # 内核编译规则
@@ -100,10 +107,14 @@ $(TARGET)/user/%.elf: $(TARGET)/user/%.o $(USER_LIB_OBJ)
 	$(LD) $(LDFLAGS) -T $(USER_LD) $< $(USER_LIB_OBJ) -o $@
 
 # 生成 initcode.h（供内核嵌入）
-$(ELFUser): $(USER_INIT_OBJ)
+$(ELFUser): $(USER_INIT_OBJ) $(BIN2C)
 	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o $(TARGET)/user/initcode.out $<
 	$(OBJCOPY) -S -O binary $(TARGET)/user/initcode.out $(TARGET)/user/initcode
-	xxd -i $(TARGET)/user/initcode > $(ELFUser)
+	$(BIN2C) $(TARGET)/user/initcode $(ELFUser)
+
+# 构建主机端的二进制转头文件工具
+$(BIN2C): $(BIN2C_SRC) | $(TARGET)
+	$(HOSTCC) $(HOSTCFLAGS) -o $@ $<
 
 # 生成 kernel-qemu.elf
 $(ELFKernel): $(KernelOBJ)
