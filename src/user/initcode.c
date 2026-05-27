@@ -2,7 +2,7 @@
 
 int main()
 {
-	char path[] = "./test_lazy_aging_vis";
+	char path[] = "./test_1";
 	char arg0[] = "test_age";
 	char arg1[] = "111";
 	char arg2[] = "222";

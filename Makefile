@@ -52,7 +52,7 @@ USER_TEST_ELF = $(USER_TEST_C:$(UserPath)/%.c=$(TARGET)/user/%.elf)
 # QEMU 模拟器配置
 QEMU     = qemu-system-riscv64
 QEMUOPTS = -machine virt -bios none -kernel $(ELFKernel)
-QEMUOPTS += -m 128M -smp $(CPUNUM) -nographic
+QEMUOPTS += -m 128M -smp $(CPUNUM) -nographic -serial mon:stdio -d guest_errors,cpu_reset -D qemu.log
 QEMUOPTS += -drive file=$(DISKIMG),if=none,format=raw,id=x0
 QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 
