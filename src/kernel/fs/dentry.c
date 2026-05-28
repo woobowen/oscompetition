@@ -187,13 +187,61 @@ uint32 dentry_delete(inode_t *ip, char *name)
 	返回成功填充的数据量(字节)
 	注意: 调用者需持有ip->slk
 */
-uint32 dentry_transmit(inode_t *ip, uint64 dst, uint32 len, bool is_user_dst)
+uint32 dentry_transmit(inode_t *ip, uint32 offset, uint64 dst, uint32 len, bool is_user_dst)
 {
 	assert(sleeplock_holding(&ip->slk), "dentry_transmit: slk!");
     assert(ip->disk_info.type == INODE_TYPE_DIR, "dentry_transmit: not dir!");
 
 	if (len < sizeof(dentry_t))
 		return 0; // 缓冲区太小
+
+	uint32 skip_entries = offset / sizeof(dentry_t);
+
+	if (ext4_is_active()) {
+		typedef struct ext4_dirent_hdr {
+			uint32 inode;
+			uint16 rec_len;
+			uint8 name_len;
+			uint8 file_type;
+		} ext4_dirent_hdr_t;
+
+		uint32 copied = 0;
+		uint32 pos = 0;
+		while (pos + sizeof(ext4_dirent_hdr_t) <= ip->disk_info.size) {
+			ext4_dirent_hdr_t hdr;
+			if (ext4_read_inode_data(ip->inode_num, pos, sizeof(hdr), &hdr) != sizeof(hdr))
+				break;
+			if (hdr.rec_len < sizeof(ext4_dirent_hdr_t))
+				break;
+
+			if (hdr.inode != 0 && hdr.name_len > 0 && hdr.name_len < MAXLEN_FILENAME) {
+				if (skip_entries > 0) {
+					skip_entries--;
+				} else {
+					dentry_t out;
+					memset(&out, 0, sizeof(out));
+					if (ext4_read_inode_data(ip->inode_num, pos + sizeof(ext4_dirent_hdr_t), hdr.name_len, out.name) != hdr.name_len)
+						break;
+					out.name[hdr.name_len] = 0;
+					out.inode_num = hdr.inode;
+
+					if (copied + sizeof(dentry_t) > len)
+						break;
+
+					if (is_user_dst)
+						uvm_copyout(myproc()->pgtbl, dst + copied, (uint64)&out, sizeof(dentry_t));
+					else
+						memmove((void *)(dst + copied), (void *)&out, sizeof(dentry_t));
+
+					copied += sizeof(dentry_t);
+				}
+			}
+
+			pos += hdr.rec_len;
+		}
+
+		return copied;
+	}
 
 	uint32 block_num = ip->disk_info.index[0];
 	if (block_num == 0)
@@ -206,6 +254,11 @@ uint32 dentry_transmit(inode_t *ip, uint64 dst, uint32 len, bool is_user_dst)
 	for (int i = 0; i < DENTRY_PER_BLOCK; i++) {
 		// 检查当前槽位是否有效
 		if (de[i].name[0] != 0) {
+			if (skip_entries > 0) {
+				skip_entries--;
+				continue;
+			}
+
 			// 检查是否还有足够空间拷贝一个 dentry
 			if (copied + sizeof(dentry_t) > len) 
 				break; // 缓冲区空间不足
@@ -373,6 +426,14 @@ static inode_t* __path_to_inode(char *path, char *name, bool find_parent_inode)
 */
 inode_t* path_to_inode(char *path)
 {
+	if (ext4_is_active()) {
+		uint32 inode_num;
+		uint16 inode_type;
+		if (ext4_lookup_path(path, &inode_num, &inode_type) < 0)
+			return NULL;
+		return inode_get(inode_num);
+	}
+
 	char name[MAXLEN_FILENAME];
 	return __path_to_inode(path, name, false);
 }

@@ -185,21 +185,21 @@ void kvm_init()
                 PGSIZE, // 假设 trampoline 占用 4KB
                 PTE_R | PTE_W | PTE_X);  // 可读写执行
 
-    // === Step 6: 映射每个进程的内核栈 (为每个 CPU 分配真实的物理页并映射) ===
-    // 遍历所有可能的进程槽位 (N_PROC)，为它们预先分配内核栈
+    // === Step 6: 映射每个进程的内核栈 ===
+    // 每个进程映射 2 个连续页，降低深调用链触发栈溢出的风险。
     for (int i = 0; i < N_PROC; i++) {
-        void *kstack_pa = pmem_alloc(true);  // 分配物理页
-        if (!kstack_pa) {
-            panic("kvm_init: cannot allocate physical page for kstack of proc");
-        }
-        memset(kstack_pa, 0, PGSIZE);  
+        for (int p = 0; p < 2; p++) {
+            void *kstack_pa = pmem_alloc(true);
+            if (!kstack_pa)
+                panic("kvm_init: cannot allocate physical page for kstack of proc");
+            memset(kstack_pa, 0, PGSIZE);
 
-        // 映射到刚刚分配的物理页
-        vm_mappages(kernel_pgtbl, 
-                    KSTACK(i),
-                    (uint64)kstack_pa,
-                    PGSIZE, // 先只映射一页
-                    PTE_R | PTE_W);
+            vm_mappages(kernel_pgtbl,
+                        KSTACK(i) + (uint64)p * PGSIZE,
+                        (uint64)kstack_pa,
+                        PGSIZE,
+                        PTE_R | PTE_W);
+        }
     }
 }
 

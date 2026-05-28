@@ -7,7 +7,7 @@
 */
 uint64 sys_brk(uint64 new_heap_top)
 {
-	return syscall(SYS_brk, new_heap_top); 
+	return syscall(SYS_brk, new_heap_top);
 }
 
 /*
@@ -43,7 +43,7 @@ uint32 sys_fork()
 */
 uint32 sys_wait(uint32 *exit_state)
 {
-	return syscall(SYS_wait, exit_state);	
+	return syscall(SYS_wait, exit_state);
 }
 
 /*
@@ -74,7 +74,7 @@ uint32 sys_getpid()
 
 /*
     执行ELF文件以替换当前进程的内容
-    成功返回argc, 失败返回-1	
+    成功返回argc, 失败返回-1
 */
 uint32 sys_exec(char *path, char **argv)
 {
@@ -204,4 +204,9 @@ uint32 sys_unlink(char *path)
 uint32 sys_schedstat(sched_stat_t *buf, uint32 max_entries)
 {
 	return syscall(SYS_schedstat, buf, max_entries);
+}
+
+uint32 sys_spawn(char *path, char **argv)
+{
+	return syscall(SYS_spawn, path, argv);
 }

@@ -112,6 +112,7 @@ uint32 sys_print_cwd();
 uint32 sys_link(char *old_path, char *new_path);
 uint32 sys_unlink(char *path);
 uint32 sys_schedstat(sched_stat_t *buf, uint32 max_entries);
+uint32 sys_spawn(char *path, char **argv);
 
 /* 第二类: 其他辅助函数 */
 

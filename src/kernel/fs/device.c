@@ -2,6 +2,53 @@
 
 device_t device_table[N_DEVICE];
 
+static bool device_path_eq(const char *path, const char *target)
+{
+	int target_len;
+
+	if (path == NULL || target == NULL)
+		return false;
+
+	target_len = strlen(target);
+	if (strlen(path) != target_len)
+		return false;
+
+	return strncmp(path, target, (uint32)target_len) == 0;
+}
+
+bool device_path_lookup(const char *path, uint16 *major)
+{
+	if (path == NULL || major == NULL)
+		return false;
+
+	if (device_path_eq(path, "/dev/stdin")) {
+		*major = INODE_MAJOR_STDIN;
+		return true;
+	}
+	if (device_path_eq(path, "/dev/stdout")) {
+		*major = INODE_MAJOR_STDOUT;
+		return true;
+	}
+	if (device_path_eq(path, "/dev/stderr")) {
+		*major = INODE_MAJOR_STDERR;
+		return true;
+	}
+	if (device_path_eq(path, "/dev/zero")) {
+		*major = INODE_MAJOR_ZERO;
+		return true;
+	}
+	if (device_path_eq(path, "/dev/null")) {
+		*major = INODE_MAJOR_NULL;
+		return true;
+	}
+	if (device_path_eq(path, "/dev/gpt0")) {
+		*major = INODE_MAJOR_GPT0;
+		return true;
+	}
+
+	return false;
+}
+
 /* 标准输入设备 */
 static uint32 device_stdin_read(uint32 len, uint64 dst, bool is_user_dst)
 {
@@ -122,6 +169,11 @@ void device_init()
     device_register(INODE_MAJOR_NULL,   "null",   device_null_read,  device_null_write);
     device_register(INODE_MAJOR_GPT0,   "gpt0",   NULL,              device_gpt0_write);
 
+	// EXT4 评测盘为只读，不在磁盘上创建 /dev 节点。
+	// /dev/* 路径由 file_open 的虚拟设备映射直接处理。
+	if (ext4_is_active())
+		return;
+
 	// 3.  确保 /dev 存在（不存在则创建目录）
 	if (path_to_inode("/dev") == NULL) {
         inode_t *devdir = path_create_inode("/dev", INODE_TYPE_DIR,
@@ -129,6 +181,9 @@ void device_init()
         if (devdir)
             inode_put(devdir);
     }
+
+	if (path_to_inode("/dev") == NULL)
+		return;
 
 	// 4. 确保 /dev/* 设备文件存在（不存在则创建 device inode）
 	struct { const char *path; uint16 major; } devs[] = {

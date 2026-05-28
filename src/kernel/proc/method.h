@@ -41,3 +41,8 @@ int proc_on_tick(void);                              // 用户态时钟中断: �
 // exec.c: 重置进程以执行ELF文件
 
 int proc_exec(char *path, char **argv);             // 准备新进程
+/* 查找pid对应的进程并返回（返回时持有该进程锁），找不到返回NULL */
+proc_t *proc_get_by_pid(int pid);
+/* 在当前上下文对指定pid的进程执行exec（替换其地址空间）。
+	返回0表示成功，返回-1表示失败（失败时会将子进程置为ZOMBIE并唤醒父进程）。 */
+int proc_exec_target(int pid, char *path, char **argv);

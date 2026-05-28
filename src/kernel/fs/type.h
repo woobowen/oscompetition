@@ -116,6 +116,8 @@ typedef struct buffer_node {
 
 #define FS_MAGIC 0x12341234                 // 魔数
 #define FS_SB_BLOCK 0                       // 超级块的序号
+#define EXT4_SUPER_OFFSET 1024
+#define EXT4_SUPER_MAGIC 0xEF53
 
 /* 超级块 */
 typedef struct super_block {
@@ -134,7 +136,247 @@ typedef struct super_block {
     unsigned int data_blocks;                // data区域的块数量
 } super_block_t;
 
-/* type的可能取值 */
+typedef struct ext4_super_preview {
+    uint32 inodes_count;
+    uint32 blocks_count_lo;
+    uint32 r_blocks_count_lo;
+    uint32 free_blocks_count_lo;
+    uint32 free_inodes_count;
+    uint32 first_data_block;
+    uint32 log_block_size;
+    uint32 log_cluster_size;
+    uint32 blocks_per_group;
+    uint32 clusters_per_group;
+    uint32 inodes_per_group;
+    uint32 mtime;
+    uint32 wtime;
+    uint16 mnt_count;
+    uint16 max_mnt_count;
+    uint16 magic;
+    uint16 state;
+    uint16 errors;
+    uint16 minor_rev_level;
+    uint32 lastcheck;
+    uint32 checkinterval;
+    uint32 creator_os;
+    uint32 rev_level;
+    uint16 def_resuid;
+    uint16 def_resgid;
+    uint32 first_ino;
+    uint16 inode_size;
+    uint16 block_group_nr;
+    uint32 feature_compat;
+    uint32 feature_incompat;
+    uint32 feature_ro_compat;
+    uint8  uuid[16];
+    char   volume_name[16];
+    char   last_mounted[64];
+    uint32 algorithm_usage_bitmap;
+    uint8  prealloc_blocks;
+    uint8  prealloc_dir_blocks;
+    uint16 reserved_gdt_blocks;
+    uint8  journal_uuid[16];
+    uint32 journal_inum;
+    uint32 journal_dev;
+    uint32 last_orphan;
+    uint32 hash_seed[4];
+    uint8  def_hash_version;
+    uint8  jnl_backup_type;
+    uint16 desc_size;
+    uint32 default_mount_opts;
+    uint32 first_meta_bg;
+    uint32 mkfs_time;
+    uint32 jnl_blocks[17];
+    uint32 blocks_count_hi;
+    uint32 r_blocks_count_hi;
+    uint32 free_blocks_count_hi;
+    uint16 min_extra_isize;
+    uint16 want_extra_isize;
+    uint32 flags;
+    uint16 raid_stride;
+    uint16 mmp_interval;
+    uint64 mmp_block;
+    uint32 raid_stripe_width;
+    uint8  log_groups_per_flex;
+    uint8  checksum_type;
+    uint16 reserved_pad;
+    uint64 kbytes_written;
+    uint32 snapshot_inum;
+    uint32 snapshot_id;
+    uint64 snapshot_r_blocks_count;
+    uint32 snapshot_list;
+    uint32 error_count;
+    uint32 first_error_time;
+    uint32 first_error_ino;
+    uint64 first_error_block;
+    uint8  first_error_func[32];
+    uint32 first_error_line;
+    uint32 last_error_time;
+    uint32 last_error_ino;
+    uint32 last_error_line;
+    uint64 last_error_block;
+    uint8  last_error_func[32];
+    uint8  mount_opts[64];
+    uint32 usr_quota_inum;
+    uint32 grp_quota_inum;
+    uint32 overhead_clusters;
+    uint32 backup_bgs[2];
+    uint8  encrypt_algos[4];
+    uint8  encrypt_pw_salt[16];
+    uint32 lpf_ino;
+    uint32 prj_quota_inum;
+    uint32 checksum_seed;
+    uint8  wtime_hi;
+    uint8  mtime_hi;
+    uint8  mkfs_time_hi;
+    uint8  lastcheck_hi;
+    uint8  first_error_time_hi;
+    uint8  last_error_time_hi;
+    uint8  first_error_errcode;
+    uint8  last_error_errcode;
+    uint16 encoding;
+    uint16 encoding_flags;
+    uint32 orphan_file_inum;
+} ext4_super_preview_t;
+
+typedef struct ext4_group_desc {
+    uint32 block_bitmap_lo;
+    uint32 inode_bitmap_lo;
+    uint32 inode_table_lo;
+    uint16 free_blocks_count_lo;
+    uint16 free_inodes_count_lo;
+    uint16 used_dirs_count_lo;
+    uint16 flags;
+    uint32 exclude_bitmap_lo;
+    uint16 block_bitmap_csum_lo;
+    uint16 inode_bitmap_csum_lo;
+    uint16 itable_unused_lo;
+    uint16 checksum;
+    uint32 block_bitmap_hi;
+    uint32 inode_bitmap_hi;
+    uint32 inode_table_hi;
+    uint16 free_blocks_count_hi;
+    uint16 free_inodes_count_hi;
+    uint16 used_dirs_count_hi;
+    uint16 itable_unused_hi;
+    uint32 exclude_bitmap_hi;
+    uint16 block_bitmap_csum_hi;
+    uint16 inode_bitmap_csum_hi;
+    uint32 reserved;
+} ext4_group_desc_t;
+
+typedef struct ext4_inode_disk {
+    uint16 mode;
+    uint16 uid_lo;
+    uint32 size_lo;
+    uint32 atime;
+    uint32 ctime;
+    uint32 mtime;
+    uint32 dtime;
+    uint16 gid_lo;
+    uint16 links_count;
+    uint32 blocks_lo;
+    uint32 flags;
+    uint32 osd1;
+    uint8  block[60];
+    uint32 generation;
+    uint32 file_acl_lo;
+    uint32 size_high;
+    uint32 obso_faddr;
+    uint8  osd2[12];
+} ext4_inode_disk_t;
+
+typedef struct ext4_extent_header {
+    uint16 magic;
+    uint16 entries;
+    uint16 max;
+    uint16 depth;
+    uint32 generation;
+} ext4_extent_header_t;
+
+typedef struct ext4_extent_idx {
+    uint32 block;
+    uint32 leaf_lo;
+    uint16 leaf_hi;
+    uint16 unused;
+} ext4_extent_idx_t;
+
+typedef struct ext4_extent {
+    uint32 block;
+    uint16 len;
+    uint16 start_hi;
+    uint32 start_lo;
+} ext4_extent_t;
+
+typedef struct ext4_dirent {
+    uint32 inode;
+    uint16 rec_len;
+    uint8  name_len;
+    uint8  file_type;
+    char   name[];
+} ext4_dirent_t;
+
+#define EXT4_INODE_MODE_FIFO      0x1000
+#define EXT4_INODE_MODE_CHR       0x2000
+#define EXT4_INODE_MODE_DIR       0x4000
+#define EXT4_INODE_MODE_BLK       0x6000
+#define EXT4_INODE_MODE_REG       0x8000
+#define EXT4_INODE_MODE_LNK       0xA000
+#define EXT4_INODE_MODE_SOCK      0xC000
+#define EXT4_INODE_MODE_MASK      0xF000
+
+#define EXT4_EXTENTS_FL           0x00080000
+#define EXT4_EXT_MAGIC            0xF30A
+#define EXT4_ROOT_INO             2
+#define EXT4_NAME_LEN             255
+#define EXT4_FT_UNKNOWN           0
+#define EXT4_FT_REG_FILE          1
+#define EXT4_FT_DIR               2
+
+#define EXT4_RO_COMPAT_SPARSE_SUPER 0x0001
+#define EXT4_RO_COMPAT_LARGE_FILE   0x0002
+#define EXT4_RO_COMPAT_BTREE_DIR    0x0004
+#define EXT4_RO_COMPAT_HUGE_FILE    0x0008
+#define EXT4_RO_COMPAT_GDT_CSUM     0x0010
+#define EXT4_RO_COMPAT_DIR_NLINK    0x0020
+#define EXT4_RO_COMPAT_EXTRA_ISIZE  0x0040
+#define EXT4_RO_COMPAT_QUOTA        0x0100
+#define EXT4_RO_COMPAT_BIGALLOC     0x0200
+#define EXT4_RO_COMPAT_METADATA_CSUM 0x0400
+#define EXT4_RO_COMPAT_READONLY     0x1000
+#define EXT4_RO_COMPAT_PROJECT      0x2000
+
+#define EXT4_INCOMPAT_COMPRESSION  0x0001
+#define EXT4_INCOMPAT_FILETYPE     0x0002
+#define EXT4_INCOMPAT_RECOVER      0x0004
+#define EXT4_INCOMPAT_JOURNAL_DEV  0x0008
+#define EXT4_INCOMPAT_META_BG      0x0010
+#define EXT4_INCOMPAT_EXTENTS      0x0040
+#define EXT4_INCOMPAT_64BIT        0x0080
+#define EXT4_INCOMPAT_MMP          0x0100
+#define EXT4_INCOMPAT_FLEX_BG      0x0200
+#define EXT4_INCOMPAT_EA_INODE     0x0400
+#define EXT4_INCOMPAT_DIRDATA      0x1000
+#define EXT4_INCOMPAT_CSUM_SEED    0x2000
+#define EXT4_INCOMPAT_LARGEDIR     0x4000
+#define EXT4_INCOMPAT_INLINE_DATA  0x8000
+#define EXT4_INCOMPAT_ENCRYPT      0x10000
+
+typedef struct ext4_info {
+    bool active;
+    uint32 block_size;
+    uint32 blocks_per_group;
+    uint32 inodes_per_group;
+    uint32 inode_size;
+    uint32 first_data_block;
+    uint32 desc_size;
+    uint32 groups_count;
+    uint64 blocks_count;
+    uint32 unsupported_incompat;
+    uint32 unsupported_ro_compat;
+    ext4_super_preview_t sb;
+} ext4_info_t;
+
 #define INODE_TYPE_DATA       0              // inode管理无结构的流式数据
 #define INODE_TYPE_DIR        1              // inode管理结构化的目录数据
 #define INODE_TYPE_DIVICE     2              // inode对应虚拟设备(不管理数据)
@@ -209,6 +451,8 @@ typedef struct dentry {
 
 typedef struct file {
     inode_t *ip;        // 对应的inode
+    bool is_device;     // 是否为虚拟设备文件(不依赖磁盘inode)
+    uint16 dev_major;   // 虚拟设备主设备号
     bool readable;      // 是否可读
     bool writbale;      // 是否可写
     uint32 offset;      // 读/写指针的偏移量

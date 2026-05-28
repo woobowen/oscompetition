@@ -72,3 +72,19 @@ void uart_intr(void)
 		cons_edit(c);
 	}
 }
+
+// 早期无锁输出：直接写 MMIO，不依赖任何锁或初始化
+void uart_putc_early(int c)
+{
+	// 直接写入发送寄存器，无等待与锁
+	WriteReg(THR, c);
+}
+
+void uart_puts_early(const char *s)
+{
+	if (!s)
+		return;
+	while (*s) {
+		uart_putc_early(*s++);
+	}
+}

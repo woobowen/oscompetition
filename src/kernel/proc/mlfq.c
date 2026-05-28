@@ -188,6 +188,11 @@ static int mlfq_choose_cpu_for_newproc(void)
 		int load = mlfq_cpu_load_locked(c);
 		spinlock_release(&mlfq_rq[c].lk);
 
+		// 避免选到没有运行调度器的 CPU（例如只启动了 1 个 hart 时），
+		// 把未运行的 CPU 视为高负载，优先选择已有运行调度器的 CPU。
+		if (!mlfq_cpu_running[c] && c != mycpuid())
+			load += 0x100000; // large penalty
+
 		if (load < best_load) {
 			best_load = load;
 			best_cpu = c;
@@ -322,12 +327,17 @@ void mlfq_set_cpu_running(int cpu, int running)
 
 void mlfq_on_new(proc_t *p)
 {
-	int cpu = mlfq_choose_cpu_for_newproc();
+	int cpu;
+	if (p->pid == 1)
+		cpu = mycpuid();
+	else
+		cpu = mlfq_choose_cpu_for_newproc();
 	spinlock_acquire(&mlfq_rq[cpu].lk);
 	spinlock_acquire(&p->lk);
 	mlfq_enqueue_locked_plocked(cpu, p, 0, true, false);
 	spinlock_release(&p->lk);
 	spinlock_release(&mlfq_rq[cpu].lk);
+	printf("mlfq_on_new: enqueued pid=%d cpu=%d\n", p->pid, cpu);
 }
 
 void mlfq_on_wakeup(proc_t *p)

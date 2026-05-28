@@ -20,6 +20,9 @@ void uart_init(void);
 void uart_putc_sync(int c);
 int uart_getc_sync(void);
 void uart_intr(void);
+/* 早期无锁串口输出（在 uart_init 之前可调用） */
+void uart_putc_early(int c);
+void uart_puts_early(const char *s);
 
 /*cpu.c: 获得CPU信息 */
 

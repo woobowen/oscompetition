@@ -45,19 +45,26 @@ char *exception_info[16] = {
 // 它是完整的内核态trap处理流程
 extern void kernel_vector();
 
+// kernel_vector() 使用的每 CPU 中断栈与原始 sp 保存区
+__attribute__((aligned(PGSIZE))) uint8 kernel_trap_stack[NCPU][PGSIZE];
+uint64 kernel_trap_saved_sp[NCPU];
+
 // 初始化trap中各个核心共享的东西
 void trap_kernel_init()
 {
+    printf("trap_kernel_init: begin\n");
     // PLIC初始化
     plic_init();
 
     // 系统时钟创建
     timer_create();
+    printf("trap_kernel_init: done\n");
 }
 
 // 初始化trap中各个核心独有的东西
 void trap_kernel_inithart()
 {
+    printf("trap_kernel_inithart: begin\n");
     // PLIC核心初始化
     plic_inithart();
 
@@ -66,6 +73,7 @@ void trap_kernel_inithart()
 
     // 打开中断
     intr_on();
+    printf("trap_kernel_inithart: done\n");
 }
 
 // 在kernel_vector()里面调用
@@ -130,6 +138,7 @@ void external_interrupt_handler()
             break;
         // lab-7 新增处理磁盘中断
         case VIRTIO_IRQ:// 虚拟磁盘中断的中断号 定义在fs/type.h中
+            printf("[IRQ] virtio irq=%d\n", irq);
             virtio_disk_intr();
             break;
         default:

@@ -1,17 +1,33 @@
 # 外部函数声明 in trap_kernel.c
 .globl trap_kernel_handler
 
+.extern kernel_trap_stack
+.extern kernel_trap_saved_sp
+
 # S-mode 中断处理 (包括软件中断和外设中断)
 .globl kernel_vector
 .align 4
 kernel_vector:
+
+        # 保存当前内核栈指针到每 CPU 记录区，再切换到专用中断栈
+        mv t0, tp
+        slli t1, t0, 3
+        la t2, kernel_trap_saved_sp
+        add t2, t2, t1
+        sd sp, 0(t2)
+
+        slli t0, t0, 12
+        la sp, kernel_trap_stack
+        add sp, sp, t0
+        li t2, 4096
+        add sp, sp, t2
 
         # 准备空间给32个通用寄存器
         addi sp, sp, -256
 
         # 寄存器状态保存
         sd ra, 0(sp)
-        sd sp, 8(sp)
+        sd zero, 8(sp)
         sd gp, 16(sp)
         sd tp, 24(sp)
         sd t0, 32(sp)
@@ -47,7 +63,6 @@ kernel_vector:
 
         # 寄存器状态恢复
         ld ra, 0(sp)
-        ld sp, 8(sp)
         ld gp, 16(sp)
         # tp寄存器的值可能不可靠
         # ld tp, 24(sp)
@@ -79,8 +94,13 @@ kernel_vector:
         ld t5, 232(sp)
         ld t6, 240(sp)
 
-        # 栈指针恢复
+        # 栈指针恢复到被打断的内核栈
         addi sp, sp, 256
+        mv t0, tp
+        slli t1, t0, 3
+        la t2, kernel_trap_saved_sp
+        add t2, t2, t1
+        ld sp, 0(t2)
 
         # 当前处于S-mode,返回调用者
         sret

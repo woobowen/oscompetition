@@ -16,6 +16,15 @@ bin-release/
 # zipped files
 data/*.img.gz
 autotest-for-oskernel/kernel.zip
+sdcard-rv.img
+sdcard-la.img
+sdcard-rv.img.gz
+sdcard-la.img.gz
+
+# evaluation/build outputs
+kernel-rv
+kernel-la
+qemu.log
 
 # Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
 # should NOT be excluded as they contain compiler settings and other important

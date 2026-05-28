@@ -25,6 +25,8 @@ static uint64 (*syscalls[])(void) = {
     [SYS_link] sys_link,
     [SYS_unlink] sys_unlink,
     [SYS_schedstat] sys_schedstat,
+    [SYS_spawn] sys_spawn,
+    [SYS_shutdown] sys_shutdown,
 };
 
 // 基于系统调用表的请求跳转
@@ -49,7 +51,7 @@ void syscall()
 */
 
 // 读取 n 号参数,它放在 an 寄存器中
-static uint64 arg_raw(int n)
+uint64 arg_raw(int n)
 {
     proc_t *proc = myproc();
     

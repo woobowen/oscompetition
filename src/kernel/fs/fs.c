@@ -1,6 +1,7 @@
 #include "mod.h"
 
 super_block_t sb; /* 超级块 */
+static bool fs_readonly_ext4;
 
 file_t file_table[N_FILE]; // 文件资源池
 spinlock_t lk_file_table; // 保护它的锁
@@ -14,6 +15,8 @@ void file_init()
 	spinlock_acquire(&lk_file_table);
 	for (int i = 0; i < (int)N_FILE; i++) {
 		file_table[i].ip = NULL;
+	file_table[i].is_device = false;
+	file_table[i].dev_major = 0;
         file_table[i].readable = false;
         file_table[i].writbale = false;
         file_table[i].offset = 0;
@@ -31,6 +34,8 @@ file_t* file_alloc()
 		if (file_table[i].ref == 0) {
             file_table[i].ref = 1;
             file_table[i].ip = NULL;
+		file_table[i].is_device = false;
+		file_table[i].dev_major = 0;
             file_table[i].readable = false;
             file_table[i].writbale = false;
             file_table[i].offset = 0;
@@ -57,6 +62,24 @@ file_t* file_open(char *path, uint32 open_mode)
 	// 必须至少读/写之一
     if (!want_r && !want_w)   return NULL;
 
+	uint16 dev_major = 0;
+	if (device_path_lookup(path, &dev_major)) {
+		if (!device_open_check(dev_major, open_mode))
+			return NULL;
+
+		file_t *devf = file_alloc();
+		if (devf == NULL)
+			return NULL;
+
+		devf->ip = NULL;
+		devf->is_device = true;
+		devf->dev_major = dev_major;
+		devf->readable = want_r;
+		devf->writbale = want_w;
+		devf->offset = 0;
+		return devf;
+	}
+
 	// 1. 先按路径找 inode
 	inode_t *ip = path_to_inode(path);
 
@@ -65,7 +88,9 @@ file_t* file_open(char *path, uint32 open_mode)
         ip = path_create_inode(path, INODE_TYPE_DATA, 
 			INODE_MAJOR_DEFAULT, INODE_MINOR_DEFAULT);
     }
-	if (ip == NULL)   return NULL; // 文件不存在且未创建成功
+	if (ip == NULL) {
+		return NULL; // 文件不存在且未创建成功
+	}
 
 	// 3. 若是设备文件：检查权限合法性
 	inode_lock(ip);
@@ -78,6 +103,9 @@ file_t* file_open(char *path, uint32 open_mode)
 			inode_put(ip);
 			return NULL; // 设备文件打开权限检查失败
 		}
+	} else if (fs_readonly_ext4 && (want_w || (open_mode & FILE_OPEN_CREATE))) {
+		inode_put(ip);
+		return NULL;
 	}
 
 	// 4. 从 file_table 分配 file 并绑定 inode
@@ -120,6 +148,8 @@ void file_close(file_t *file)
 	// 此时 ref == 0：回收槽位
 	ip = file->ip;
     file->ip = NULL;
+	file->is_device = false;
+	file->dev_major = 0;
     file->readable = false;
     file->writbale = false;
     file->offset = 0;
@@ -133,12 +163,18 @@ void file_close(file_t *file)
 /* 读取文件内容, 返回读到的字节数量 */
 uint32 file_read(file_t* file, uint32 len, uint64 dst, bool is_user_dst)
 {
-	if (file == NULL || file->ip == NULL){
+	if (file == NULL){
 		return (uint32)-1;
 	}
     if (!file->readable){
 		return (uint32)-1;
 	}
+
+	if (file->is_device)
+		return device_read_data(file->dev_major, len, dst, is_user_dst);
+
+	if (file->ip == NULL)
+		return (uint32)-1;
         
 
 	inode_t *ip = file->ip;
@@ -164,7 +200,7 @@ uint32 file_read(file_t* file, uint32 len, uint64 dst, bool is_user_dst)
 	case INODE_TYPE_DIR:
 		// 目录文件：按“目录项结构体”输出
 		inode_lock(ip);
-		read_len = dentry_transmit(ip, dst, len, is_user_dst);
+		read_len = dentry_transmit(ip, file->offset, dst, len, is_user_dst);
 		file->offset += read_len; // 更新偏移量
 		inode_unlock(ip);
 		return read_len;
@@ -183,12 +219,18 @@ uint32 file_read(file_t* file, uint32 len, uint64 dst, bool is_user_dst)
 /* 写入文件内容, 返回写入的字节数量 */
 uint32 file_write(file_t* file, uint32 len, uint64 src, bool is_user_src)
 {
-	if (file == NULL || file->ip == NULL){
+	if (file == NULL){
 		return (uint32)-1;
 	}	
     if (!file->writbale){
 		return (uint32)-1;
 	}
+
+	if (file->is_device)
+		return device_write_data(file->dev_major, len, src, is_user_src);
+
+	if (file->ip == NULL)
+		return (uint32)-1;
         
 
 	inode_t *ip = file->ip;
@@ -283,12 +325,25 @@ file_t* file_dup(file_t* file)
 /* 获取文件参数, 成功返回0, 失败返回-1 */
 uint32 file_get_stat(file_t* file, uint64 user_dst)
 {
-	 if (file == NULL || file->ip == NULL)
+	 if (file == NULL)
         return (uint32)-1;
 
 	// 填充file_stat结构体
 	file_stat_t st;
 	memset(&st, 0, sizeof(st));
+
+	if (file->is_device) {
+		st.type = INODE_TYPE_DIVICE;
+		st.nlink = 1;
+		st.size = 0;
+		st.inode_num = INVALID_INODE_NUM;
+		st.offset = file->offset;
+		uvm_copyout(myproc()->pgtbl, user_dst, (uint64)&st, sizeof(st));
+		return 0;
+	}
+
+	if (file->ip == NULL)
+		return (uint32)-1;
 
 	inode_t *ip = file->ip;
 
@@ -324,9 +379,39 @@ static void sb_print()
 		(int)((unsigned long long)(sb.total_blocks) * sb.block_size / 1024 / 1024), sb.total_inodes);
 }
 
-/* 文件系统初始化 */
+static bool fs_try_ext4_preview()
+{
+	buffer_t *b = buffer_get(FS_SB_BLOCK);
+	ext4_super_preview_t ext4_sb;
+	memmove(&ext4_sb, b->data + EXT4_SUPER_OFFSET, sizeof(ext4_sb));
+	buffer_put(b);
+
+	if (ext4_sb.magic != EXT4_SUPER_MAGIC)
+		return false;
+	if (!ext4_mount_from_super(&ext4_sb)) {
+		printf("\next4 superblock detected but unsupported features: incompat=0x%x ro_compat=0x%x\n\n",
+			ext4_sb.feature_incompat, ext4_sb.feature_ro_compat);
+		return false;
+	}
+
+	fs_readonly_ext4 = true;
+
+	const ext4_info_t *info = ext4_get_info();
+	printf("\next4 filesystem detected on primary disk:\n");
+	printf("block size = %d Byte, total blocks = %d, total inode = %d\n",
+		info->block_size,
+		ext4_sb.blocks_count_lo,
+		ext4_sb.inodes_count);
+	printf("inodes per group = %d, blocks per group = %d, inode size = %d\n\n",
+		ext4_sb.inodes_per_group,
+		ext4_sb.blocks_per_group,
+		ext4_sb.inode_size);
+	return true;
+}
+
 void fs_init()
 {
+	fs_readonly_ext4 = false;
 	// 初始化缓冲系统
 	buffer_init();
 	// 初始化inode缓存与锁
@@ -339,8 +424,12 @@ void fs_init()
 	// 归还缓冲（不修改，不需要写回）
 	buffer_put(b);
 
-	// 打印布局信息
-	sb_print();
+	if (sb.magic_num == FS_MAGIC) {
+		// 打印布局信息
+		sb_print();
+	} else if (!fs_try_ext4_preview()) {
+		printf("\nunknown filesystem on primary disk: block0 magic = 0x%x\n\n", sb.magic_num);
+	}
 
 	// 初始化设备表
 	device_init();

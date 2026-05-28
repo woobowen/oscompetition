@@ -14,11 +14,13 @@ void plic_init()
 void plic_inithart()
 {
     int hartid = mycpuid();
+    printf("plic_inithart: hart=%d senable=%p spriority=%p\n", hartid, PLIC_SENABLE(hartid), PLIC_SPRIORITY(hartid));
     // 使能中断开关
     // 增加 VIRTIO_IRQ 的使能位
     *(uint32 *)PLIC_SENABLE(hartid) = (1 << UART_IRQ) | (1 << VIRTIO_IRQ);
     // 设置响应阈值
     *(uint32 *)PLIC_SPRIORITY(hartid) = 0;
+    printf("plic_inithart: done senable=0x%x\n", *(uint32 *)PLIC_SENABLE(hartid));
 }
 
 // 获取中断号

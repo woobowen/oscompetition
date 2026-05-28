@@ -1,5 +1,6 @@
 #include "../arch/mod.h"
 #include "../trap/mod.h"
+#include "../lib/mod.h"
 
 // 每个CPU在运行操作系统时需要一个初始的函数栈
 __attribute__((aligned(16))) uint8 CPU_stack[4096 * NCPU];
@@ -70,4 +71,31 @@ void start()
 
     // 触发状态迁移，回到上一个状态（M-mode->S-mode）
     asm volatile ("mret");
+}
+
+// Entry point when booted by firmware/OpenSBI into S-mode.
+// hartid is passed in a0 by the firmware (entry.S ensures this).
+void boot_start(uint64 id)
+{
+    uart_puts_early("[boot_start-enter]\n");
+    // Ensure paging is disabled and we operate in physical addressing
+    w_satp(0);
+
+    // set tp to hart id for later use
+    w_tp(id);
+    uart_puts_early("[boot_start-after-tp]\n");
+
+    // Set S-mode trap vector to kernel's trap handler
+    w_stvec((uint64)kernel_vector);
+
+    // Enable S-mode interrupts (software, timer, external)
+    w_sie(r_sie() | SIE_SEIE | SIE_STIE | SIE_SSIE);
+
+    // Call the common main entry
+    // early boot marker: may run before uart_init
+    uart_puts_early("[boot_start]\n");
+    main();
+
+    // If main returns, halt
+    for(;;) asm volatile("wfi");
 }

@@ -291,6 +291,39 @@ void inode_rw(inode_t *ip, bool write)
 */
 inode_t *inode_get(uint32 inode_num)
 {
+	if (ext4_is_active()) {
+		spinlock_acquire(&lk_inode_cache);
+		inode_t *free_inode = NULL;
+		for (int i = 0; i < (int)N_INODE; i++) {
+			inode_t *ip = &inode_cache[i];
+			if (ip->ref > 0 && ip->inode_num == inode_num) {
+				ip->ref++;
+				spinlock_release(&lk_inode_cache);
+				return ip;
+			}
+			if (free_inode == NULL && ip->ref == 0)
+				free_inode = ip;
+		}
+		if (free_inode == NULL)
+			panic("inode_get: no free inode");
+		free_inode->ref = 1;
+		free_inode->inode_num = inode_num;
+		free_inode->valid_info = false;
+		spinlock_release(&lk_inode_cache);
+		sleeplock_acquire(&free_inode->slk);
+		if (ext4_fill_inode(inode_num, free_inode) < 0) {
+			sleeplock_release(&free_inode->slk);
+			spinlock_acquire(&lk_inode_cache);
+			free_inode->ref = 0;
+			free_inode->inode_num = INVALID_INODE_NUM;
+			free_inode->valid_info = false;
+			spinlock_release(&lk_inode_cache);
+			return NULL;
+		}
+		sleeplock_release(&free_inode->slk);
+		return free_inode;
+	}
+
 	spinlock_acquire(&lk_inode_cache);
 	inode_t *free_inode = NULL;
 	for (int i = 0; i < (int)N_INODE; i++) {
@@ -432,6 +465,28 @@ void inode_delete(inode_t *ip)
 */
 uint32 inode_read_data(inode_t *ip, uint32 offset, uint32 len, void *dst, bool is_user_dst)
 {
+	if (ext4_is_active()) {
+		uint8 *tmp = (uint8 *)pmem_alloc(true);
+		if (tmp == NULL)
+			return 0;
+		uint32 done = 0;
+		while (done < len) {
+			uint32 take = len - done;
+			if (take > BLOCK_SIZE)
+				take = BLOCK_SIZE;
+			take = ext4_read_inode_data(ip->inode_num, offset + done, take, tmp);
+			if (take == 0)
+				break;
+			if (is_user_dst)
+				uvm_copyout(myproc()->pgtbl, (uint64)dst + done, (uint64)tmp, take);
+			else
+				memmove((uint8*)dst + done, tmp, take);
+			done += take;
+		}
+		pmem_free((uint64)tmp, true);
+		return done;
+	}
+
 	/* 边界检查 */
 	uint32 fsize = ip->disk_info.size;
 	if (offset >= fsize)

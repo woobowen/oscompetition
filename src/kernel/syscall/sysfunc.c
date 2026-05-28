@@ -128,8 +128,12 @@ uint64 sys_fork()
 */
 uint64 sys_wait()
 {
-    uint64 addr_exit_state;
-    arg_uint64(0, &addr_exit_state); // 获取接收退出状态的用户地址
+    uint64 addr_exit_state = 0;
+    if (arg_raw(1) != 0 || arg_raw(2) != 0 || arg_raw(3) != 0) {
+        arg_uint64(1, &addr_exit_state); // Linux wait4(pid, status, options, rusage)
+    } else {
+        arg_uint64(0, &addr_exit_state); // SeaOS wait(status)
+    }
     return proc_wait(addr_exit_state);
 }
 
@@ -153,6 +157,25 @@ uint64 sys_exit()
 */
 uint64 sys_sleep()
 {
+    uint64 req = 0;
+    uint64 rem = 0;
+    if (arg_raw(1) != 0 || arg_raw(2) != 0) {
+        arg_uint64(0, &req);
+        arg_uint64(1, &rem);
+        (void)rem;
+        if (req == 0)
+            return 0;
+        uint64 ts[2] = {0, 0};
+        uvm_copyin(myproc()->pgtbl, (uint64)ts, req, sizeof(ts));
+        uint64 ntick = ts[0] * 10;
+        if (ts[1] > 0)
+            ntick += (ts[1] + 99999999ull) / 100000000ull;
+        if (ntick == 0)
+            ntick = 1;
+        timer_wait(ntick);
+        return 0;
+    }
+
     uint32 ntick;
     arg_uint32(0, &ntick); // 获取睡眠的tick数
     timer_wait((uint64)ntick);
@@ -191,17 +214,25 @@ uint64 sys_schedstat()
 uint64 sys_exec()
 {
     char path[STR_MAXLEN + 1];
-    arg_str(0, path, STR_MAXLEN);
-    
     uint64 argv_addr;
-    arg_uint64(1, &argv_addr);
-    
+    uint64 envp_addr = 0;
+
+    if (arg_raw(2) != 0) {
+        arg_str(0, path, STR_MAXLEN);
+        arg_uint64(1, &argv_addr);
+        arg_uint64(2, &envp_addr);
+        (void)envp_addr;
+    } else {
+        arg_str(0, path, STR_MAXLEN);
+        arg_uint64(1, &argv_addr);
+    }
+
     // 读取argv数组
     char *argv[32];
     int argc = 0;
     uint64 addr;
     proc_t *p = myproc();
-    
+
     while (argc < 32) {
         uvm_copyin(p->pgtbl, (uint64)&addr, argv_addr + argc * sizeof(uint64), sizeof(uint64));
         if (addr == 0) break;
@@ -209,7 +240,7 @@ uint64 sys_exec()
         argc++;
     }
     argv[argc] = NULL;
-    
+
     // 复制argv到内核
     char *kargv[32];
     for (int i = 0; i < argc; i++) {
@@ -221,14 +252,14 @@ uint64 sys_exec()
         uvm_copyin_str(p->pgtbl, (uint64)kargv[i], (uint64)argv[i], STR_MAXLEN);
     }
     kargv[argc] = NULL;
-    
+
     int ret = proc_exec(path, kargv);
-    
+
     // 释放内核argv
     for (int i = 0; i < argc; i++) {
         pmem_free((uint64)kargv[i], false);
     }
-    
+
     return ret;
 }
 
@@ -255,20 +286,56 @@ static uint32 alloc_fd(file_t *file)
 uint64 sys_open()
 {
     char path[STR_MAXLEN + 1];
-    arg_str(0, path, STR_MAXLEN);
-    
-    uint32 open_mode;
-    arg_uint32(1, &open_mode);
-    
+    uint64 arg0 = arg_raw(0);
+    uint64 arg1 = arg_raw(1);
+    uint64 arg2 = arg_raw(2);
+    uint64 arg3 = arg_raw(3);
+
+    uint32 open_mode = 0;
+    bool looks_like_openat = false;
+
+    // 兼容两种调用形态：
+    // 1) SeaOS 旧接口: open(path, mode)
+    // 2) Linux openat: openat(dirfd, path, flags, mode)
+    // 只有当参数形态明显像 openat 时才进入 openat 分支，避免被残留寄存器误导。
+    if (((int64)arg0) <= 4096 && arg0 != 0) {
+        looks_like_openat = true;
+    }
+    if (arg1 >= PGSIZE) {
+        looks_like_openat = true;
+    }
+    if (looks_like_openat && (arg2 != 0 || arg3 != 0)) {
+        uint64 dirfd;
+        uint32 flags;
+        uint32 mode;
+        arg_uint64(0, &dirfd);
+        arg_str(1, path, STR_MAXLEN);
+        arg_uint32(2, &flags);
+        arg_uint32(3, &mode);
+        (void)dirfd;
+        (void)mode;
+        if ((flags & 3) == 0)
+            open_mode |= FILE_OPEN_READ;
+        if ((flags & 3) == 1)
+            open_mode |= FILE_OPEN_WRITE;
+        if ((flags & 3) == 2)
+            open_mode |= FILE_OPEN_READ | FILE_OPEN_WRITE;
+        if (flags & 64)
+            open_mode |= FILE_OPEN_CREATE;
+    } else {
+        arg_str(0, path, STR_MAXLEN);
+        arg_uint32(1, &open_mode);
+    }
+
     file_t *file = file_open(path, open_mode);
     if (!file) return -1;
-    
+
     uint32 fd = alloc_fd(file);
     if (fd == (uint32)-1) {
         file_close(file);
         return -1;
     }
-    
+
     return fd;
 }
 
@@ -327,8 +394,55 @@ uint64 sys_write()
     
     uint64 addr;
     arg_uint64(2, &addr);
-    
+
     return file_write(file, len, addr, true);
+}
+
+static void sbi_system_shutdown()
+{
+    register uint64 a0 asm("a0") = 0;           // reset_type: shutdown
+    register uint64 a1 asm("a1") = 0;           // reset_reason: no reason
+    register uint64 a6 asm("a6") = 0;           // fid
+    register uint64 a7 asm("a7") = 0x53525354;  // EID "SRST"
+    asm volatile("ecall" : "+r"(a0), "+r"(a1) : "r"(a6), "r"(a7) : "memory");
+
+    while (1)
+        asm volatile("wfi");
+}
+
+uint64 sys_shutdown()
+{
+    printf("sys_shutdown: powering off via SBI SRST\n");
+    sbi_system_shutdown();
+    return 0;
+}
+
+static int sys_spawn_and_wait(char *path, char **argv)
+{
+    printf("sys_spawn_and_wait: spawn request path=%s\n", path);
+    int pid = proc_fork();
+    printf("sys_spawn_and_wait: fork returned pid=%d\n", pid);
+    if (pid < 0) {
+        printf("sys_spawn_and_wait: fork FAILED\n");
+        return -1;
+    }
+
+    /* 为子进程执行exec（在父进程上下文中替换子进程的地址空间） */
+    if (pid > 0) {
+        int eret = proc_exec_target(pid, path, argv);
+        if (eret < 0) {
+            printf("sys_spawn_and_wait: proc_exec_target failed for pid=%d\n", pid);
+            /* 如果失败，proc_exec_target 已将子进程置为ZOMBIE并唤醒父进程 */
+        }
+    }
+
+    printf("sys_spawn_and_wait: parent waiting for child pid=%d\n", pid);
+    if (proc_wait(0) < 0) {
+        printf("sys_spawn_and_wait: wait FAILED\n");
+        return -1;
+    }
+    printf("sys_spawn_and_wait: child exited\n");
+    return 0;
 }
 
 /*
@@ -383,10 +497,10 @@ uint64 sys_fstat()
 {
     file_t *file;
     if (arg_fd(0, NULL, &file) < 0) return -1;
-    
+
     uint64 addr;
     arg_uint64(1, &addr);
-    
+
     return file_get_stat(file, addr);
 }
 
@@ -400,14 +514,21 @@ uint64 sys_fstat()
 uint64 sys_get_dentries()
 {
     file_t *file;
-    if (arg_fd(0, NULL, &file) < 0) return -1;
-    
+    uint32 fd;
+    if (arg_fd(0, &fd, &file) < 0) {
+        return -1;
+    }
+
     uint64 addr;
     arg_uint64(1, &addr);
-    
+
     uint32 buffer_len;
     arg_uint32(2, &buffer_len);
-    
+
+    if (file == NULL) {
+        return -1;
+    }
+
     return file_read(file, buffer_len, addr, true);
 }
 
@@ -419,11 +540,21 @@ uint64 sys_get_dentries()
 uint64 sys_mkdir()
 {
     char path[STR_MAXLEN + 1];
-    arg_str(0, path, STR_MAXLEN);
-    
+    if (arg_raw(1) != 0 || arg_raw(2) != 0) {
+        uint64 dirfd;
+        uint32 mode;
+        arg_uint64(0, &dirfd);
+        arg_str(1, path, STR_MAXLEN);
+        arg_uint32(2, &mode);
+        (void)dirfd;
+        (void)mode;
+    } else {
+        arg_str(0, path, STR_MAXLEN);
+    }
+
     inode_t *ip = path_create_inode(path,INODE_TYPE_DIR, 0, 0);
     if (!ip) return -1;
-    
+
     inode_put(ip);
     return 0;
 }
@@ -460,14 +591,55 @@ uint64 sys_print_cwd()
 {
     proc_t *p = myproc();
     if (!p->cwd) return -1;
-    
+
     char path[STR_MAXLEN + 1];
     uint32 offset = inode_to_path(p->cwd, path, STR_MAXLEN + 1);
     if (offset == (uint32)-1) return -1;
-    
-    path[STR_MAXLEN+1] = '\0'; 
+
+    path[STR_MAXLEN] = '\0';
     printf("current work directory:%s\n", path + offset);
     return 0;
+}
+
+uint64 sys_spawn()
+{
+    char path[STR_MAXLEN + 1];
+    arg_str(0, path, STR_MAXLEN);
+
+    uint64 argv_addr;
+    arg_uint64(1, &argv_addr);
+
+    char *argv[32];
+    int argc = 0;
+    uint64 addr;
+    proc_t *p = myproc();
+
+    while (argc < 32) {
+        uvm_copyin(p->pgtbl, (uint64)&addr, argv_addr + argc * sizeof(uint64), sizeof(uint64));
+        if (addr == 0) break;
+        argv[argc] = (char*)addr;
+        argc++;
+    }
+    argv[argc] = NULL;
+
+    char *kargv[32];
+    for (int i = 0; i < argc; i++) {
+        kargv[i] = (char*)pmem_alloc(false);
+        if (!kargv[i]) {
+            for (int j = 0; j < i; j++) pmem_free((uint64)kargv[j], false);
+            return -1;
+        }
+        uvm_copyin_str(p->pgtbl, (uint64)kargv[i], (uint64)argv[i], STR_MAXLEN);
+    }
+    kargv[argc] = NULL;
+
+    int ret = sys_spawn_and_wait(path, kargv);
+
+    for (int i = 0; i < argc; i++) {
+        pmem_free((uint64)kargv[i], false);
+    }
+
+    return ret;
 }
 
 /*
@@ -479,9 +651,22 @@ uint64 sys_print_cwd()
 uint64 sys_link()
 {
     char old_path[STR_MAXLEN + 1], new_path[STR_MAXLEN + 1];
-    arg_str(0, old_path, STR_MAXLEN);
-    arg_str(1, new_path, STR_MAXLEN);
-    
+    if (arg_raw(2) != 0 || arg_raw(3) != 0 || arg_raw(4) != 0) {
+        uint64 olddirfd, newdirfd;
+        uint32 flags;
+        arg_uint64(0, &olddirfd);
+        arg_str(1, old_path, STR_MAXLEN);
+        arg_uint64(2, &newdirfd);
+        arg_str(3, new_path, STR_MAXLEN);
+        arg_uint32(4, &flags);
+        (void)olddirfd;
+        (void)newdirfd;
+        (void)flags;
+    } else {
+        arg_str(0, old_path, STR_MAXLEN);
+        arg_str(1, new_path, STR_MAXLEN);
+    }
+
     return path_link(old_path, new_path);
 }
 
@@ -494,7 +679,17 @@ uint64 sys_link()
 uint64 sys_unlink()
 {
     char path[STR_MAXLEN + 1];
-    arg_str(0, path, STR_MAXLEN);
-    
+    if (arg_raw(1) != 0 || arg_raw(2) != 0) {
+        uint64 dirfd;
+        uint32 flags;
+        arg_uint64(0, &dirfd);
+        arg_str(1, path, STR_MAXLEN);
+        arg_uint32(2, &flags);
+        (void)dirfd;
+        (void)flags;
+    } else {
+        arg_str(0, path, STR_MAXLEN);
+    }
+
     return path_unlink(path);
 }

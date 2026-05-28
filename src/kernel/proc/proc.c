@@ -73,6 +73,7 @@ static void mkv_on_stop_locked(proc_t *p, int yield_reason, uint64 now)
 }
 
 // 这个文件通过make build生成, 是proczero对应的ELF文件
+// NOTE: kernel embeds initcode bytes from this generated header.
 #include "../../user/initcode.h"
 #define initcode target_user_initcode
 #define initcode_len target_user_initcode_len
@@ -112,9 +113,14 @@ static void proc_return()
 {
     proc_t *p = myproc();
 
+    if (p->pid != 1) {
+        printf("proc_return: pid=%d a0=%d epc=%p\n", p->pid, (int)p->tf->a0, (void*)p->tf->user_to_kern_epc);
+    }
+
     spinlock_release(&p->lk); // 先释放锁
     // 如果是第一个进程(proczero)，则进行特殊初始化
     if (p->pid == 1) {
+        printf("proc_return: pid=1 entering fs_init\n");
         // 初始化文件系统
         fs_init();
         // 设置open_file: 打开stdin, stdout, stderr
@@ -122,7 +128,9 @@ static void proc_return()
         p->open_file[1] = file_open("/dev/stdout", FILE_OPEN_WRITE);
         p->open_file[2] = file_open("/dev/stderr", FILE_OPEN_WRITE);
         // 设置cwd为根目录
-        p->cwd = inode_get(ROOT_INODE);
+        p->cwd = inode_get(ext4_is_active() ? EXT4_ROOT_INO : ROOT_INODE);
+        printf("proc_return: pid=1 fs_init done, stdout=%p stdin=%p stderr=%p\n",
+            p->open_file[1], p->open_file[0], p->open_file[2]);
     }
 
     // 回到用户态
@@ -214,7 +222,7 @@ proc_t *proc_alloc()
             // 预设内核栈与上下文
             p->kstack = (uint64)KSTACK(i);
             p->ctx.ra = (uint64)proc_return; // 切入到该进程时，从这里返回到用户态入口
-            p->ctx.sp = p->kstack + PGSIZE;
+            p->ctx.sp = p->kstack + 2 * PGSIZE;
             return p; // 保持锁定返回
         }else{
             spinlock_release(&p->lk);
@@ -409,8 +417,11 @@ void proc_make_first()
     proczero = p;
     spinlock_release(&p->lk);
 
+    printf("proc_make_first: pid=1 enqueued on cpu %d\n", p->mlfq_cpu);
+
     // 入MLFQ就绪队列(避免持有 p->lk 时拿 mlfq 锁)
     mlfq_on_new(p);
+    printf("proc_make_first: mlfq_on_new done\n");
 }
 
 /*
@@ -469,8 +480,13 @@ int proc_fork()
     int pid = child->pid;
     spinlock_release(&child->lk);
 
+    // 调试信息：记录父子 pid 和子进程当前状态
+    printf("proc_fork: parent=%d child=%d state=%d\n", parent ? parent->pid : -1, pid, child->state);
+
     // 入MLFQ就绪队列(避免持有 child->lk 时拿 mlfq 锁)
+    printf("proc_fork: before mlfq_on_new child=%d\n", pid);
     mlfq_on_new(child);
+    printf("proc_fork: after mlfq_on_new child=%d\n", pid);
 
     return pid;
 }
@@ -722,6 +738,20 @@ void proc_wakeup(void *sleep_space)
     }
 }
 
+/* 查找pid对应的进程并返回（返回时持有该进程锁），找不到返回NULL */
+proc_t *proc_get_by_pid(int pid)
+{
+    for (int i = 0; i < N_PROC; i++) {
+        proc_t *p = &proc_list[i];
+        spinlock_acquire(&p->lk);
+        if (p->state != UNUSED && p->pid == pid) {
+            return p; // 返回时保持持锁
+        }
+        spinlock_release(&p->lk);
+    }
+    return NULL;
+}
+
 /* 
     用户进程切换到调度器
     tips: 调用者保证持有当前进程的锁
@@ -753,6 +783,8 @@ void proc_scheduler()
         proc_t *p = mlfq_pick_next();
         if (p == NULL)
             continue;
+
+        printf("proc_scheduler: cpu %d picked pid=%d\n", mycpuid(), p->pid);
 
         spinlock_acquire(&p->lk);
         if (p->state != RUNNABLE) {

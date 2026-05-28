@@ -61,10 +61,9 @@ void trap_user_handler()
             case 13:
             case 15:
             {
-                printf("page fault occured! trap_id = %d\n", trap_id);
                 uint64 old_ustack_npage = p->ustack_npage;
-                uint64 ret = uvm_ustack_grow(p->pgtbl, old_ustack_npage, r_stval());
-                printf("ustack_npage: %d -> %d\n", old_ustack_npage, ret);
+                uint64 new_ustack_npage = uvm_ustack_grow(p->pgtbl, old_ustack_npage, r_stval());
+                (void)new_ustack_npage;
                 break;
             }
             //! 其余异常类型暂时不处理，直接报错并输出信息
@@ -94,7 +93,7 @@ void trap_user_return()
 
     // 保存内核侧必要的信息到 trapframe，trampoline 会依赖这些字段来恢复内核环境
     tf->user_to_kern_satp = r_satp();                     
-    tf->user_to_kern_sp = p->kstack + PGSIZE;           
+    tf->user_to_kern_sp = p->kstack + 2 * PGSIZE;           
     tf->user_to_kern_trapvector = (uint64)trap_user_handler;
     tf->user_to_kern_hartid = mycpuid();      
 
@@ -106,6 +105,11 @@ void trap_user_return()
     w_stvec(user_vector_addr);
 
     // 设置返回用户态时的 sepc 和 sstatus（使 sret 返回到 U-mode）
+    // 防护性检查：确保要写入的 sepc 在合法的用户地址范围内，避免非法地址导致 sret 跳转到内核并触发页错误
+    if (tf->user_to_kern_epc < USER_BASE || tf->user_to_kern_epc >= TRAMPOLINE) {
+        printf("trap_user_return: bad user_to_kern_epc %p, replacing with UCODE_VA\n", (void*)tf->user_to_kern_epc);
+        tf->user_to_kern_epc = UCODE_VA;
+    }
     w_sepc(tf->user_to_kern_epc);
     uint64 sstatus = r_sstatus();
     sstatus &= ~SSTATUS_SPP; // 清 SPP，表示 sret 将返回到 U-mode

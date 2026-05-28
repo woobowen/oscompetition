@@ -38,13 +38,22 @@ uint32 inode_read_data(inode_t *ip, uint32 offset, uint32 len, void *dst, bool i
 uint32 inode_write_data(inode_t *ip, uint32 offset, uint32 len, void *src, bool is_user_src);
 void inode_print(inode_t *ip, char* name);
 
+/* ext4.c: EXT4 只读路径 */
+
+bool ext4_mount_from_super(const ext4_super_preview_t *sb);
+bool ext4_is_active();
+const ext4_info_t *ext4_get_info();
+int ext4_lookup_path(char *path, uint32 *inode_num, uint16 *inode_type);
+int ext4_fill_inode(uint32 inode_num, inode_t *ip);
+uint32 ext4_read_inode_data(uint32 inode_num, uint32 offset, uint32 len, void *dst);
+
 /* dentry.c: 关于目录项和文件路径 */
 
 uint32 dentry_search(inode_t *ip, char *name);
 uint32 dentry_search_2(inode_t *ip, uint32 inode_num, char *name);
 uint32 dentry_create(inode_t *ip, uint32 inode_num, char *name);
 uint32 dentry_delete(inode_t *ip, char *name);
-uint32 dentry_transmit(inode_t *ip, uint64 dst, uint32 len, bool is_user_dst);
+uint32 dentry_transmit(inode_t *ip, uint32 offset, uint64 dst, uint32 len, bool is_user_dst);
 void dentry_print(inode_t *ip);
 inode_t* path_to_inode(char *path);
 inode_t* path_to_parent_inode(char *path, char *name);
@@ -69,6 +78,7 @@ void fs_init();
 /* device.c: 设备文件 */
 
 void device_init();
+bool device_path_lookup(const char *path, uint16 *major);
 bool device_open_check(uint16 major, uint32 open_mode);
 uint32 device_read_data(uint16 major, uint32 len, uint64 dst, bool is_user_dst);
 uint32 device_write_data(uint16 major, uint32 len, uint64 src, bool is_user_src);

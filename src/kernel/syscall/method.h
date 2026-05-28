@@ -8,6 +8,7 @@ void arg_uint32(int n, uint32 *ip);
 void arg_uint64(int n, uint64 *ip);
 void arg_str(int n, char *buf, int maxlen);
 int arg_fd(int n, uint32 *pfd, file_t **pfile);
+uint64 arg_raw(int n);
 
 uint64 sys_brk();
 uint64 sys_mmap();
@@ -32,3 +33,5 @@ uint64 sys_print_cwd();
 uint64 sys_link();
 uint64 sys_unlink();
 uint64 sys_schedstat();
+uint64 sys_spawn();
+uint64 sys_shutdown();
