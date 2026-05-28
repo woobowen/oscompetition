@@ -8,22 +8,20 @@
 static void load_segment(inode_t *ip, pgtbl_t pgtbl, 
     uint64 seg_start, uint64 va_start, uint32 len)
 {
-    assert(va_start % PGSIZE == 0, "load_segment: va aligned!");
-
-    pte_t *pte;
-    uint64 pa;
     uint32 read_len, cut_len;
 
     for (read_len = 0; read_len < len; read_len += PGSIZE)
     {
-        /* 获取物理内存地址 */
-        pte = vm_getpte(pgtbl, va_start + read_len, false);
-        pa = PTE_TO_PA(*pte);
+        uint64 cur_va = va_start + read_len;
+        uint64 page_va = (cur_va / PGSIZE) * PGSIZE;
+        uint64 page_off = cur_va - page_va;
+        pte_t *pte = vm_getpte(pgtbl, page_va, false);
+        uint64 pa = PTE_TO_PA(*pte);
         assert(pa != 0, "load_segment: invalid pa!");
 
         /* 读入segment的一部分 */
-        cut_len = MIN(len - read_len, PGSIZE);
-        if (inode_read_data(ip, (uint32)seg_start + read_len, cut_len, (void*)pa, false) != cut_len)
+        cut_len = MIN(len - read_len, (uint32)(PGSIZE - page_off));
+        if (inode_read_data(ip, (uint32)seg_start + read_len, cut_len, (void*)(pa + page_off), false) != cut_len)
             panic("load_segment: read fail!");
     }
 }
@@ -53,8 +51,6 @@ static uint64 prepare_heap(pgtbl_t new_pgtbl, inode_t *ip, elf_header_t *eh)
         if (ph.mem_size < ph.file_size)
             return -1;
         if (ph.va + ph.mem_size < ph.va)
-            return -1;
-        if (ph.va % PGSIZE != 0)
             return -1;
         // Ensure the segment lies in user address space and not overlapping kernel/trampoline
         if (ph.va < USER_BASE || ph.va + ph.mem_size > MMAP_BEGIN) {
@@ -181,40 +177,56 @@ static int parse_shebang(inode_t *ip, char *interp_path, char *interp_arg)
 
 static int pick_script_interpreter(const char *requested, char *resolved_path, char *resolved_arg)
 {
-    const char *path_candidates[4];
-    const char *arg_candidates[4];
+    const char *path_candidates[8];
+    const char *arg_candidates[8];
     int candidate_count = 0;
 
     if (requested && requested[0] != '\0') {
+        if (candidate_count >= 8)
+            return -1;
         path_candidates[candidate_count] = requested;
         arg_candidates[candidate_count] = "";
         candidate_count++;
     }
 
+    if (candidate_count >= 8)
+        return -1;
     path_candidates[candidate_count] = "/bin/sh";
     arg_candidates[candidate_count] = "";
     candidate_count++;
 
+    if (candidate_count >= 8)
+        return -1;
     path_candidates[candidate_count] = "busybox";
     arg_candidates[candidate_count] = "sh";
     candidate_count++;
 
+    if (candidate_count >= 8)
+        return -1;
     path_candidates[candidate_count] = "/busybox";
     arg_candidates[candidate_count] = "sh";
     candidate_count++;
 
+    if (candidate_count >= 8)
+        return -1;
     path_candidates[candidate_count] = "/busybox";
     arg_candidates[candidate_count] = "ash";
     candidate_count++;
 
+    if (candidate_count >= 8)
+        return -1;
     path_candidates[candidate_count] = "/bin/busybox";
     arg_candidates[candidate_count] = "sh";
     candidate_count++;
 
+    if (candidate_count >= 8)
+        return -1;
     path_candidates[candidate_count] = "/musl/busybox";
     arg_candidates[candidate_count] = "sh";
     candidate_count++;
 
+    if (candidate_count >= 8)
+        return -1;
     path_candidates[candidate_count] = "/glibc/busybox";
     arg_candidates[candidate_count] = "sh";
     candidate_count++;

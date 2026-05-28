@@ -784,8 +784,6 @@ void proc_scheduler()
         if (p == NULL)
             continue;
 
-        printf("proc_scheduler: cpu %d picked pid=%d\n", mycpuid(), p->pid);
-
         spinlock_acquire(&p->lk);
         if (p->state != RUNNABLE) {
             spinlock_release(&p->lk);

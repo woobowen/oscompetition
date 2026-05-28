@@ -138,7 +138,6 @@ void external_interrupt_handler()
             break;
         // lab-7 新增处理磁盘中断
         case VIRTIO_IRQ:// 虚拟磁盘中断的中断号 定义在fs/type.h中
-            printf("[IRQ] virtio irq=%d\n", irq);
             virtio_disk_intr();
             break;
         default:
