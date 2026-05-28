@@ -1,144 +1,131 @@
-## 与 oscomp 初赛测评要求的差距分析（当前仓库状态）
+# SeaOS 当前对接 oscomp 初赛评测进度（截至本次调试）
 
-根据当前仓库实现与初赛公开测评要求对照，**SeaOS 目前还不能直接接入初赛自动测评**，已经确认的差距如下。
+## 一、已完成事项
 
-### 1. 构建入口不满足要求 【已改好】
+### 1) 评测构建入口已打通
 
-初赛要求评测系统在项目根目录执行 `make all`。
+- 已支持评测要求的 `make all`。
+- 根目录可生成：
+  - `kernel-rv`
+  - `kernel-la`（当前为占位复制，见后文说明）
 
-当前仓库的 `Makefile` 只有 `build`、`run`、`debug`、`clean` 目标，没有 `all` 目标，因此会在评测的编译阶段直接失败。
+相关位置：
 
-- 现状位置：[Makefile:128-146](Makefile#L128-L146)
-- 已实测现象：公开评测环境返回 `make: *** No rule to make target 'all'. Stop.`
+- [Makefile:128-134](Makefile#L128-L134)
 
-### 2. 未生成要求的内核产物名 【只改了 RISC-V 的 `kernel-rv`，LoongArch 的 `kernel-la` 还没改】
+### 2) RISC-V 启动路径已适配评测参数
 
-初赛要求 `make all` 编译后在项目根目录生成：
+根据 `os_serial_out_rv.txt`，当前可在评测参数下正常启动：
 
-- `kernel-rv`
-- `kernel-la`
+- `qemu-system-riscv64 -bios default -kernel kernel-rv ...`
+- OpenSBI 正常进入
+- 内核完成启动、调度、文件系统初始化
+- `initcode: started` 正常输出
 
-当前仓库只生成：
+说明 RISC-V 启动链路（`kernel-rv` + `-bios default`）已经打通。
 
-- `target/kernel/kernel-qemu.elf`
-- `target/mkfs/disk.img`
+### 3) EXT4 测试盘识别与脚本执行入口已打通
 
-并不会在项目根目录生成 `kernel-rv`，也完全没有生成 `kernel-la` 的 LoongArch 内核。
+当前日志已出现：
 
-- 现状位置：[Makefile:21-23](Makefile#L21-L23)
-- 当前构建目标：[Makefile:119-130](Makefile#L119-L130)
+- `ext4 filesystem detected on primary disk`
+- `run /musl/unixbench_testcode.sh unixbench_testcode`
 
-### 3. 仅支持 RISC-V，未支持 LoongArch 【后续再兼容 LoongArch，现在先确保 RISC-V 评测能过】
+并且 `proc_exec` 已经把 `.sh` 脚本切换到解释器执行路径（日志尾部 `script`）：
 
-初赛要求同时支持：
+- `proc_exec: ... exec done ... script`
 
-- RISC-V：`kernel-rv`
-- LoongArch：`kernel-la`
+这表示：
 
-当前仓库的构建、启动、链接脚本、启动汇编都围绕 RISC-V 展开，没有 LoongArch 对应实现。
+- 测试盘扫描与测试脚本选取已进入实跑阶段
+- shebang/解释器选择链路已生效（`parse_shebang` / `pick_script_interpreter`）
 
-- QEMU 配置：只定义了 `qemu-system-riscv64`，见 [Makefile:53-57](Makefile#L53-L57)
-- 启动代码：使用 RISC-V CSR 与 `mhartid`，见 [src/kernel/boot/entry.S:7-18](src/kernel/boot/entry.S#L7-L18)
-- 启动流程：直接操作 `mstatus`、`mepc`、`medeleg`、`mideleg` 等 RISC-V M 态寄存器，见 [src/kernel/boot/start.c:42-72](src/kernel/boot/start.c#L42-L72)
+---
 
-这意味着当前仓库**不具备生成 `kernel-la` 的基础**。
+## 二、当前阻塞点（最新）
 
-### 4. 启动方式与初赛 QEMU 参数不匹配 【rv 已改好，la 还没开始】
+RISC-V 目前阻塞在用户态程序启动后的 Linux 兼容 syscall 缺失：
 
-初赛 RISC-V 评测使用：
+- `unknown syscall 96 from pid = 2`
+- `panic! syscall`
 
-- `-bios default`
-- `-kernel kernel-rv`
+对应 `os_serial_out_rv.txt` 末尾可见。
 
-当前仓库本地运行使用：
+`96` 在 Linux/RISC-V ABI 中对应 `set_tid_address`。许多 musl/busybox 程序启动阶段会调用它；当前内核未实现，且“未知 syscall 直接 panic”，导致测试中断。
 
-- `-bios none`
-- `-kernel target/kernel/kernel-qemu.elf`
+**结论：现在不是启动问题，不是 ext4 扫描问题，也不是脚本解释器问题；核心是 syscall 兼容层还不够。**
 
-见 [Makefile:53-57](Makefile#L53-L57)。
+---
 
-同时当前启动代码假定系统从 M 态直接进入：
+## 三、LoongArch 当前状态
 
-- `entry.S` 直接读取 `mhartid`：见 [src/kernel/boot/entry.S:13](src/kernel/boot/entry.S#L13)
-- `start()` 中直接配置 M 态寄存器并通过 `mret` 进入 S 态：见 [src/kernel/boot/start.c:50-72](src/kernel/boot/start.c#L50-L72)
+LoongArch 仍未实装：
 
-因此当前实现**很可能不能直接适配 `-bios default` 的启动路径**。
+- `kernel-la` 目前不是 LoongArch 原生内核构建链产物
+- 评测侧仍会出现：`qemu-system-loongarch64: could not load kernel 'kernel-la': Failed to load ELF`
 
-### 5. 磁盘镜像使用方式与初赛要求不匹配 
+本轮工作优先级是先把 RISC-V 流程跑通，LoongArch 作为后续独立工作项。
 
-初赛要求：
+---
 
-- 主测试磁盘由评测机通过 `-drive file={fs}` 挂载
-- 该磁盘是 **EXT4 文件系统、无分区表**
-- 根目录中包含若干预编译 ELF 和 `xxxxx_testcode.sh` 脚本
-- 操作系统启动后要主动扫描该磁盘、依次运行测试点
-- 项目自行生成的 `disk.img` 只是可选辅助盘
+## 四、分工
 
-当前仓库生成的 `disk.img` 是由自定义 `mkfs` 工具生成的私有镜像，不是说明中要求的评测主盘格式。
+A、B 两条线可以并行推进：A 负责 RISC-V 得分主线，B 负责 LoongArch 架构启动主线。两边尽量避免同时大改公共文件；如果必须改 `Makefile`、通用头文件或 syscall 公共定义，需要提前同步。
 
-- 现状位置：[Makefile:123-126](Makefile#L123-L126)
-- 用户程序被打入自制镜像，而不是从评测主盘动态扫描
+### A：RISC-V syscall 兼容与测试推进
 
-也就是说，当前 SeaOS 的设计更像“把自带测试程序预置进自己的镜像”，而不是“启动后扫描评测机挂载的 EXT4 测试盘并依次执行脚本”。
+目标：从当前 `unknown syscall 96` 开始，补齐 Linux/RISC-V 兼容 syscall，至少跑通第一个 `/musl/unixbench_testcode.sh` 测试；如果时间允许，继续推进到下一个测试脚本。
 
-### 6. 目前没有按初赛要求主动扫描并串行执行测试脚本
+当前起点：
 
-初赛要求操作系统：
+- RISC-V 已经能启动
+- EXT4 测试盘已识别
+- 已经执行到 `/musl/unixbench_testcode.sh`
+- `.sh` 脚本解释器路径已生效
+- 当前阻塞在 `unknown syscall 96`
 
-- 扫描测试盘根目录
-- 找到 `xxxxx_testcode.sh`
-- 依次串行运行每个测试点
-- 输出规定格式的测试开始/结束提示
-- 运行完成后主动关机
+具体任务：
 
-当前仓库的用户程序组织是固定内置测试程序集，README 中列出的用户态程序包括：
+1. 补 `syscall 96 (set_tid_address)` 的最小实现。
+2. 用固定 docker 评测命令继续跑，记录下一个 `unknown syscall N` 或新的崩溃点。
+3. 按“最小可运行兼容”原则继续补 musl/busybox 启动期所需 syscall。
+4. 优先目标是让 `unixbench_testcode.sh` 能完整执行并返回。
+5. 若第一个测试跑通，继续尝试推进下一个测试脚本。
 
-- `test_1.c` 到 `test_5.c`
-- `test_mlfq_aging.c`
-- `test_mlfq_preempt.c`
-- `test_schedstat.c`
-- `test_workload_cpu.c`
-- `test_workload_io.c`
-- `test_workload_mix.c`
+验收标准：
 
-见 [README.md:129-147](README.md#L129-L147)。
+- 必须：不再停在 `unknown syscall 96`
+- 必须：`unixbench_testcode.sh` 至少能继续明显向后执行
+- 目标：完整跑完 `unixbench_testcode.sh`
+- 加分：继续进入并推进下一个测试脚本
 
-这说明当前仓库**尚未体现“扫描测试盘并按脚本逐个执行公开测试点”的机制**。
+### B：LoongArch 架构启动主线
 
-### 7. 系统调用 ABI 与公开测试程序预期大概率不一致
+目标：把 LoongArch 从“QEMU 无法加载 kernel-la”推进到“能加载、能进入早期内核、能看到明确启动日志”。不强求进入测试脚本，但最好可以像现在的risc-v一样能够进入测试脚本。
 
-初赛测试盘中的 ELF 可执行文件通常会按比赛规定 ABI 编译。当前 SeaOS 使用的是自定义 syscall 编号，例如：
+当前起点：
 
-- `SYS_read = 12`
-- `SYS_write = 13`
-- `SYS_open = 10`
-- `SYS_exit = 6`
+- `kernel-la` 还不是合法 LoongArch 内核
+- QEMU 当前报 `could not load kernel 'kernel-la': Failed to load ELF`
+- 当前仓库主体仍是 RISC-V 架构实现
 
-见 [src/user/syscall_num.h:1-25](src/user/syscall_num.h#L1-L25)。
+具体任务：
 
-如果初赛测试程序按 Linux/RISC-V 用户态 ABI 编译，那么当前 syscall 编号体系将不能直接兼容，测试程序无法正常运行。
+1. 建立 LoongArch 独立最小构建路径，生成真正的 LoongArch ELF，而不是复制 RISC-V ELF。
+2. 实现最小 LoongArch 入口和链接脚本，让 `qemu-system-loongarch64 -kernel kernel-la ...` 不再报 `Failed to load ELF`。
+3. 打通最小串口输出，至少能在 `os_serial_out_la.txt` 中看到自定义启动日志，例如 `loongarch boot start`。
+4. 梳理后续要进入测试还缺的模块清单：trap、syscall 入口、用户态返回、virtio 块设备、EXT4、initcode/test 扫描等。
+5. 尽量把 LoongArch 代码放在独立架构目录中，避免破坏 RISC-V 当前可运行路径。
 
-### 8. 第三方依赖提交方式基本符合要求 【目前没有问题，后续引入新依赖时注意】
+验收标准：
 
-初赛要求如果依赖第三方工具/库，应以源代码形式提交，不应直接提交二进制。
+- 必须：`kernel-la` 不再是 RISC-V ELF 复制品
+- 必须：QEMU LoongArch 不再报 `Failed to load ELF`
+- 目标：`os_serial_out_la.txt` 能看到 LoongArch 早期启动日志
+- 加分：进入更完整的内核初始化阶段，但不强制进入测试脚本
 
-当前仓库从代码结构看主要为自带源码构建，且已经把 `bin2c` 作为源码工具构建，方向上是符合要求的。
+### 协作要求
 
-但仍需注意：若后续为适配评测引入额外工具链、文件系统实现或脚本解释器，也应一并以源码方式进入仓库。
-
-### 当前结论
-
-综合来看，当前 SeaOS 与初赛评测要求之间的差距主要有两类：
-
-1. **构建/产物层面的硬性不匹配**
-   - 没有 `make all`
-   - 没有根目录 `kernel-rv`
-   - 没有 `kernel-la`
-
-2. **运行模型层面的结构性不匹配**
-   - 当前启动路径假定 `-bios none` + RISC-V M 态直启
-   - 当前磁盘/文件系统模型不是“评测机挂载 EXT4 测试盘后由系统主动扫描执行”
-   - 当前还没有公开测试脚本驱动框架
-   - 当前 syscall ABI 与公开测试 ELF 的兼容性未知且大概率不兼容
-
-因此，**当前仓库距离“可直接参加初赛自动测评”还有明显差距，且不仅是改 Makefile 即可解决的问题**。
+- A 的 RISC-V 主线优先保证不回退。
+- B 的 LoongArch 改动不要影响 `kernel-rv` 的构建和运行。
+- 合并前都用固定 docker 评测命令跑一次，确认 RISC-V 状态没有倒退。
