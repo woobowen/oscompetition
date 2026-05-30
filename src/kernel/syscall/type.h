@@ -11,6 +11,7 @@
 #define SYS_exit 93              // Linux/RISC-V exit
 #define SYS_sleep 101            // SeaOS nanosleep兼容入口
 #define SYS_getpid 172           // Linux/RISC-V getpid
+#define SYS_set_tid_address 96   // Linux/RISC-V set_tid_address
 #define SYS_exec 221             // Linux/RISC-V execve
 #define SYS_open 56              // Linux/RISC-V openat
 #define SYS_close 57             // Linux/RISC-V close

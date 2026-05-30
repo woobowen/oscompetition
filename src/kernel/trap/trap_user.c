@@ -61,9 +61,13 @@ void trap_user_handler()
             case 13:
             case 15:
             {
-                uint64 old_ustack_npage = p->ustack_npage;
-                uint64 new_ustack_npage = uvm_ustack_grow(p->pgtbl, old_ustack_npage, r_stval());
-                (void)new_ustack_npage;
+                if (uvm_ustack_grow(p->pgtbl, p->ustack_npage, r_stval()) == (uint64)-1) {
+                    printf("!!! PANIC INFO !!!\n");
+                    printf("scause = %p (trap_id = %d)\n", scause, trap_id);
+                    printf("sepc   = %p\n", sepc);
+                    printf("stval  = %p\n", r_stval());
+                    panic("trap_user_handler: bad user memory access (not stack growth)");
+                }
                 break;
             }
             //! 其余异常类型暂时不处理，直接报错并输出信息

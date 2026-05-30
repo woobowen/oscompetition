@@ -191,6 +191,18 @@ uint64 sys_getpid()
 }
 
 /*
+    set_tid_address(int *tidptr)
+    Linux 语义: 设置调用线程 clear_child_tid = tidptr, 返回调用者 TID。
+    SeaOS 单线程/进程模型下 TID == PID。
+    最小实现(docs/DECISIONS.md D3): 暂不存储 tidptr、不做退出时 clear_child_tid 清零+futex 唤醒,
+    仅返回 pid 满足 musl 启动期。
+*/
+uint64 sys_set_tid_address()
+{
+    return (uint64)(myproc()->pid);
+}
+
+/*
     拉取调度统计快照
     uint64 buf_user (sched_stat_t*)
     uint32 max_entries

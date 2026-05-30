@@ -30,3 +30,12 @@ qemu.log
 # should NOT be excluded as they contain compiler settings and other important
 # information for Eclipse / Flash Builder.
 target/
+data/*.img
+data/*.img.gz
+data/*.img.xz
+*Zone.Identifier
+autotest-for-oskernel/kernel.zip
+kernel-rv
+kernel-la
+target/
+qemu.log

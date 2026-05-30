@@ -78,43 +78,66 @@ static uint64 prepare_heap(pgtbl_t new_pgtbl, inode_t *ip, elf_header_t *eh)
     return new_heap_top;
 }
 
+/* Linux auxv 类型(最小集) */
+#define AT_NULL    0
+#define AT_PAGESZ  6
+#define AT_RANDOM  25
+
 /* 准备栈空间用于存储输入参数(4KB), 设置arg_count, 返回sp */
 static uint64 prepare_stack(pgtbl_t new_pgtbl, char **argv, int *arg_count)
 {
     uint64 ustack_page;
     uint64 sp = TRAPFRAME, sp_base = TRAPFRAME - PGSIZE;
-    uint64 sp_list[ELF_MAXARGS + 1];
+    uint64 argv_addr[ELF_MAXARGS + 1];   // 各 arg 字符串在用户栈中的地址
     uint32 argc, arg_len;
 
     ustack_page = (uint64)pmem_alloc(false);
+    if (!ustack_page)
+        return -1;
+    memset((void *)ustack_page, 0, PGSIZE);
     vm_mappages(new_pgtbl, sp_base, ustack_page, PGSIZE, PTE_R | PTE_W | PTE_U);
-    
-    for (argc = 0; argv[argc] != NULL; argc++)
-    {
+
+    // 1) 压入参数字符串(高地址), 记录每个串的用户地址
+    for (argc = 0; argv[argc] != NULL; argc++) {
         if (argc >= ELF_MAXARGS)
             return -1;
-        
         arg_len = strlen(argv[argc]) + 1;
-        sp -= ALIGN_UP(arg_len, 16);
+        sp -= arg_len;
         if (sp < sp_base)
             return -1;
-        
         uvm_copyout(new_pgtbl, sp, (uint64)argv[argc], arg_len);
-
-        sp_list[argc] = sp;
+        argv_addr[argc] = sp;
     }
-    sp_list[argc] = 0;
+    argv_addr[argc] = 0;   // argv NULL 终止(值)
 
-    arg_len = (argc + 1) * sizeof(uint64);
-    sp -= ALIGN_UP(arg_len, 16);
+    // 2) 压入 16 字节给 AT_RANDOM(musl 用于栈 canary/TLS)
+    sp -= 16;
+    sp &= ~15UL;
     if (sp < sp_base)
         return -1;
+    uint64 at_random_addr = sp;   // 内容为页内已清零的 16 字节即可
 
-    uvm_copyout(new_pgtbl, sp, (uint64)sp_list, arg_len);
+    // 3) 在内核侧拼出低端块: [argc][argv ptrs..][NULL][envp NULL][auxv: PAGESZ,RANDOM,NULL]
+    //    envp 取空(仅一个 NULL)
+    uint64 buf[1 + (ELF_MAXARGS + 1) + 1 + 6];
+    int idx = 0;
+    buf[idx++] = argc;                          // argc
+    for (uint32 i = 0; i <= argc; i++)          // argv[0..argc-1], 末尾 NULL(=0)
+        buf[idx++] = argv_addr[i];
+    buf[idx++] = 0;                             // envp 的 NULL
+    buf[idx++] = AT_PAGESZ; buf[idx++] = PGSIZE;
+    buf[idx++] = AT_RANDOM; buf[idx++] = at_random_addr;
+    buf[idx++] = AT_NULL;   buf[idx++] = 0;
+
+    uint64 bytes = (uint64)idx * sizeof(uint64);
+    sp -= bytes;
+    sp &= ~15UL;                                // 入口 sp 需 16 字节对齐
+    if (sp < sp_base)
+        return -1;
+    uvm_copyout(new_pgtbl, sp, (uint64)buf, bytes);
 
     *arg_count = argc;
-
-    return sp;
+    return sp;     // sp 指向 argc
 }
 
 static int is_script_path(const char *path)

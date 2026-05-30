@@ -206,17 +206,13 @@ docker run --rm `
 
 ## 5. 当前已知结果
 
-当前仓库在公开评测环境下已经实测到的第一处失败是：
+最新实测状态以这些文件为准（不在本文件重复，避免过时）：
 
-```text
-make: *** No rule to make target 'all'. Stop.
-```
+- 评测对接总体进度：[README.md](README.md)
+- syscall 逐个状态：[docs/SYSCALL_STATUS.md](docs/SYSCALL_STATUS.md)
+- 设计决策：[docs/DECISIONS.md](docs/DECISIONS.md)
 
-也就是说：
-
-- 公开评测环境已经能启动
-- 当前 SeaOS 仓库已经被评测器真正执行到编译阶段
-- 第一处明确不兼容点是 `Makefile` 没有 `all`
+（历史：早期"`make all` 缺失"问题已解决；当前主线为 Linux/RISC-V syscall 兼容层。）
 
 ---
 
