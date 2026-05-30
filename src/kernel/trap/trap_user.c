@@ -66,6 +66,7 @@ void trap_user_handler()
                     printf("scause = %p (trap_id = %d)\n", scause, trap_id);
                     printf("sepc   = %p\n", sepc);
                     printf("stval  = %p\n", r_stval());
+                    printf("user sp=%p a0=%p a1=%p ra=%p\n", (void*)tf->sp, (void*)tf->a0, (void*)tf->a1, (void*)tf->ra);
                     panic("trap_user_handler: bad user memory access (not stack growth)");
                 }
                 break;
