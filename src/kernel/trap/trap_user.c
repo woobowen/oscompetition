@@ -118,6 +118,7 @@ void trap_user_return()
     uint64 sstatus = r_sstatus();
     sstatus &= ~SSTATUS_SPP; // 清 SPP，表示 sret 将返回到 U-mode
     sstatus |= SSTATUS_SPIE; // 置 SPIE，使 sret 返回后 U-mode 中断可用
+    sstatus |= SSTATUS_FS_INITIAL; // 开启用户态 FPU，避免浮点指令触发非法指令异常
     w_sstatus(sstatus);
 
     // 跳转到 trampoline.S 的 user_return 处，返回用户态

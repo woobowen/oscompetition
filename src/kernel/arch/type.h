@@ -43,6 +43,7 @@ typedef enum
 #define SSTATUS_UPIE (1L << 4)
 #define SSTATUS_SIE (1L << 1)
 #define SSTATUS_UIE (1L << 0)
+#define SSTATUS_FS_INITIAL (1L << 13)   // FP = Initial (01), 允许用户态执行浮点指令
 
 /* Supervisor Interrupt Enable (sie) */
 #define SIE_SEIE (1L << 9) // S-mode 外设中断
