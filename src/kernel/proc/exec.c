@@ -10,7 +10,7 @@ static void load_segment(inode_t *ip, pgtbl_t pgtbl,
 {
     uint32 read_len, cut_len;
 
-    for (read_len = 0; read_len < len; read_len += PGSIZE)
+    for (read_len = 0; read_len < len; )
     {
         uint64 cur_va = va_start + read_len;
         uint64 page_va = (cur_va / PGSIZE) * PGSIZE;
@@ -23,6 +23,8 @@ static void load_segment(inode_t *ip, pgtbl_t pgtbl,
         cut_len = MIN(len - read_len, (uint32)(PGSIZE - page_off));
         if (inode_read_data(ip, (uint32)seg_start + read_len, cut_len, (void*)(pa + page_off), false) != cut_len)
             panic("load_segment: read fail!");
+
+        read_len += cut_len;   // ★ 按本轮实际拷贝字节数步进, 修复非页对齐段加载
     }
 }
 
