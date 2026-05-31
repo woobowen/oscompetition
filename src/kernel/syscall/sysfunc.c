@@ -705,3 +705,36 @@ uint64 sys_unlink()
 
     return path_unlink(path);
 }
+
+// 174 getuid / 176 getgid：当前无多用户, 一律 root
+uint64 sys_getuid() { return 0; }
+uint64 sys_getgid() { return 0; }
+
+// 135 rt_sigprocmask(how,set,oldset,sigsetsize)：暂不做信号, 返回成功
+uint64 sys_rt_sigprocmask() { return 0; }
+
+// 144 setgid / 146 setuid：单用户环境, 视作成功 no-op
+uint64 sys_setgid() { return 0; }
+uint64 sys_setuid() { return 0; }
+
+// 79 newfstatat(dirfd, path, statbuf, flags)
+uint64 sys_newfstatat()
+{
+    char path[STR_MAXLEN + 1];
+    uint64 flags   = arg_raw(3);
+    uint64 statbuf = arg_raw(2);
+    arg_str(1, path, STR_MAXLEN);
+
+    // AT_EMPTY_PATH(0x1000): 空路径 → 直接 stat dirfd 指向的文件(musl 的 fstat 走这条)
+    if (path[0] == '\0' && (flags & 0x1000)) {
+        file_t *file;
+        if (arg_fd(0, NULL, &file) < 0) return (uint64)(-EBADF);
+        return file_get_stat_linux(file, statbuf);
+    }
+    // 否则按路径打开后 stat(dirfd 暂按 cwd/绝对路径处理, 与现有 openat 一致)
+    file_t *file = file_open(path, FILE_OPEN_READ);
+    if (!file) return (uint64)(-ENOENT);
+    uint64 r = file_get_stat_linux(file, statbuf);
+    file_close(file);
+    return r;
+}

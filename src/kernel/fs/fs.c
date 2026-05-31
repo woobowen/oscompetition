@@ -361,6 +361,54 @@ uint32 file_get_stat(file_t* file, uint64 user_dst)
 	return 0;
 }
 
+// 填充 Linux/RISC-V struct stat(128B) 到用户空间, 供 musl 的 fstat/fstatat 使用。
+// 返回 0 成功, (uint32)-1 失败。
+uint32 file_get_stat_linux(file_t* file, uint64 user_dst)
+{
+	struct {
+		uint64 st_dev, st_ino;
+		uint32 st_mode, st_nlink, st_uid, st_gid;
+		uint64 st_rdev, __pad1;
+		uint64 st_size;
+		uint32 st_blksize, __pad2;
+		uint64 st_blocks;
+		uint64 st_atime_sec, st_atime_nsec;
+		uint64 st_mtime_sec, st_mtime_nsec;
+		uint64 st_ctime_sec, st_ctime_nsec;
+		uint32 __unused4, __unused5;
+	} st;
+	if (file == NULL) return (uint32)-1;
+	memset(&st, 0, sizeof(st));
+	st.st_blksize = 512;
+
+	if (file->is_device) {
+		st.st_mode  = 0020000 | 0666;   // S_IFCHR
+		st.st_nlink = 1;
+		st.st_ino   = 1;
+	} else {
+		if (file->ip == NULL) return (uint32)-1;
+		inode_t *ip = file->ip;
+		inode_lock(ip);
+		short  type  = ip->disk_info.type;
+		short  nlink = ip->disk_info.nlink;
+		uint32 size  = ip->disk_info.size;
+		uint32 inum  = ip->inode_num;
+		inode_unlock(ip);
+
+		uint32 mode;
+		if (type == INODE_TYPE_DIR)         mode = 0040000 | 0755;  // S_IFDIR
+		else if (type == INODE_TYPE_DIVICE) mode = 0020000 | 0666;  // S_IFCHR
+		else                                mode = 0100000 | 0755;  // S_IFREG
+		st.st_mode   = mode;
+		st.st_nlink  = (nlink > 0) ? (uint32)nlink : 1;
+		st.st_size   = size;
+		st.st_ino    = inum;
+		st.st_blocks = (size + 511) / 512;
+	}
+	uvm_copyout(myproc()->pgtbl, user_dst, (uint64)&st, sizeof(st));
+	return 0;
+}
+
 
 /* 基于superblock输出磁盘布局信息 (for debug) */
 static void sb_print()

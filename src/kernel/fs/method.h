@@ -73,6 +73,7 @@ uint32 file_write(file_t* file, uint32 len, uint64 src, bool is_user_src);
 uint32 file_lseek(file_t *file, uint32 lseek_offset, uint32 lseek_flag);
 file_t* file_dup(file_t* file);
 uint32 file_get_stat(file_t* file, uint64 user_dst);
+uint32 file_get_stat_linux(file_t* file, uint64 user_dst);
 void fs_init();
 
 /* device.c: 设备文件 */

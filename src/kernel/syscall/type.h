@@ -26,6 +26,12 @@
 #define SYS_print_cwd 17         // SeaOS print_cwd
 #define SYS_link 37              // Linux/RISC-V linkat
 #define SYS_unlink 35            // Linux/RISC-V unlinkat
+#define SYS_newfstatat 79        // Linux/RISC-V newfstatat (按路径 stat)
+#define SYS_rt_sigprocmask 135   // 信号屏蔽 (暂桩)
+#define SYS_setgid 144           // 暂桩返回 0
+#define SYS_setuid 146           // 暂桩返回 0
+#define SYS_getuid 174           // 返回 0 (root)
+#define SYS_getgid 176           // 返回 0
 
 #define SYS_schedstat 500        // SeaOS 私有: 拉取调度统计快照
 #define SYS_spawn     501        // SeaOS 私有: fork+exec+wait 串行执行程序
