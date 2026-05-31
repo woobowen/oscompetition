@@ -18,25 +18,20 @@ uint64 sys_brk()
     uint64 cur = p->heap_top;
 
     if (new_top == 0) { // look
-        printf("look event: ret_heap_top = %p\n", cur);
 
     }else if (new_top > cur) { // grow
         uint32 len = (uint32)(new_top - cur);
         uint64 ret = uvm_heap_grow(p->pgtbl, cur, len, PTE_R | PTE_W | PTE_U);
         if (ret == (uint64)-1) return (uint64)-1;
         p->heap_top = ret;
-        printf("grow event: ret_heap_top = %p old_heap_top = %p len = 0x%x\n", (void *)ret, (void *)cur, len);
 
     }else { // ungrow & stay
         uint32 len = (uint32)(cur - new_top);
         uint64 ret = uvm_heap_ungrow(p->pgtbl, cur, len);
         if (ret == (uint64)-1) return (uint64)-1;
         p->heap_top = ret;
-        printf("ungrow event: ret_heap_top = %p old_heap_top = %p len = 0x%x\n", (void *)ret, (void *)cur, len);
 
     }
-    printf("After the event: Current pgtbl:\n");
-    vm_print(p->pgtbl);
     // pop_off();
     return p->heap_top;
 }
@@ -408,6 +403,38 @@ uint64 sys_write()
     arg_uint64(2, &addr);
 
     return file_write(file, len, addr, true);
+}
+
+// 66 writev(fd, iovec*, iovcnt)：按 Linux ABI 逐段写出
+uint64 sys_writev()
+{
+    file_t *file;
+    if (arg_fd(0, NULL, &file) < 0) return (uint64)(-EBADF);
+    uint64 iov    = arg_raw(1);          // 用户态 struct iovec[] 指针
+    int    iovcnt = (int)arg_raw(2);
+    if (iovcnt <= 0) return 0;
+
+    uint64 total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        uint64 vec[2];                   // struct iovec { void* base; size_t len; } = 16B
+        uvm_copyin(myproc()->pgtbl, (uint64)vec, iov + (uint64)i * 16, 16);
+        uint64 base = vec[0];
+        uint64 len  = vec[1];
+        if (len == 0) continue;
+        uint32 w = file_write(file, (uint32)len, base, true);
+        total += w;
+        if (w < len) break;              // 短写, 停止
+    }
+    return total;
+}
+
+// 94 exit_group：当前单线程, 等价于 exit
+uint64 sys_exit_group()
+{
+    int exit_code;
+    arg_uint32(0, (uint32 *)&exit_code);
+    proc_exit(exit_code);
+    return 0; // 不会执行到这
 }
 
 static void sbi_system_shutdown()

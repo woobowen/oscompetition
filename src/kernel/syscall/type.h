@@ -32,6 +32,8 @@
 #define SYS_setuid 146           // 暂桩返回 0
 #define SYS_getuid 174           // 返回 0 (root)
 #define SYS_getgid 176           // 返回 0
+#define SYS_writev 66            // Linux/RISC-V writev
+#define SYS_exit_group 94        // exit_group (单线程下等价 exit)
 
 #define SYS_schedstat 500        // SeaOS 私有: 拉取调度统计快照
 #define SYS_spawn     501        // SeaOS 私有: fork+exec+wait 串行执行程序

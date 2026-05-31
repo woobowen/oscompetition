@@ -39,6 +39,8 @@ uint64 sys_setgid();
 uint64 sys_setuid();
 uint64 sys_getuid();
 uint64 sys_getgid();
+uint64 sys_writev();
+uint64 sys_exit_group();
 uint64 sys_schedstat();
 uint64 sys_spawn();
 uint64 sys_shutdown();
