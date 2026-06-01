@@ -374,13 +374,13 @@ uint64 sys_read()
 {
     file_t *file;
     if (arg_fd(0, NULL, &file) < 0) return 0;
-    
-    uint32 len;
-    arg_uint32(1, &len);
-    
+
+    // Linux/RISC-V ABI: read(fd=a0, buf=a1, count=a2)
     uint64 addr;
-    arg_uint64(2, &addr);
-    
+    arg_uint64(1, &addr);   // a1 = buf
+    uint32 len;
+    arg_uint32(2, &len);    // a2 = count
+
     return file_read(file, len, addr, true);
 }
 
@@ -395,12 +395,12 @@ uint64 sys_write()
 {
     file_t *file;
     if (arg_fd(0, NULL, &file) < 0) return 0;
-    
-    uint32 len;
-    arg_uint32(1, &len);
-    
+
+    // Linux/RISC-V ABI: write(fd=a0, buf=a1, count=a2)
     uint64 addr;
-    arg_uint64(2, &addr);
+    arg_uint64(1, &addr);   // a1 = buf
+    uint32 len;
+    arg_uint32(2, &len);    // a2 = count
 
     return file_write(file, len, addr, true);
 }

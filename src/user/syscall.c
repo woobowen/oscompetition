@@ -105,7 +105,7 @@ uint32 sys_close(uint32 fd)
 */
 uint32 sys_read(uint32 fd, uint32 len, void *addr)
 {
-	return syscall(SYS_read, fd, len, addr);
+	return syscall(SYS_read, fd, addr, len);   // 转 Linux 序: a1=buf, a2=count
 }
 
 /*
@@ -114,7 +114,7 @@ uint32 sys_read(uint32 fd, uint32 len, void *addr)
 */
 uint32 sys_write(uint32 fd, uint32 len, void *addr)
 {
-	return syscall(SYS_write, fd, len, addr);
+	return syscall(SYS_write, fd, addr, len);  // 转 Linux 序: a1=buf, a2=count
 }
 
 /*
