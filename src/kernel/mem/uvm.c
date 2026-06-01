@@ -50,7 +50,10 @@ void uvm_copyout(pgtbl_t pgtbl, uint64 dst, uint64 src, uint32 len)
             if (p != NULL) uvm_ustack_grow(pgtbl, p->ustack_npage, dst);
             pte = vm_getpte(pgtbl, dst, false);
             if (pte == NULL || !(*pte & PTE_V)) {
-                printf("uvm_copyout: invalid user address dst=%p\n", (void *)dst);
+                printf("uvm_copyout: invalid dst=%p syscall=%d a0=%p a1=%p a2=%p\n",
+                       (void *)dst, p ? (int)p->tf->a7 : -1,
+                       p ? (void *)p->tf->a0 : 0, p ? (void *)p->tf->a1 : 0,
+                       p ? (void *)p->tf->a2 : 0);
                 panic("uvm_copyout: invalid user address");
             }
         }
