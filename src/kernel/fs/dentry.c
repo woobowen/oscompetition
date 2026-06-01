@@ -429,7 +429,13 @@ inode_t* path_to_inode(char *path)
 	if (ext4_is_active()) {
 		uint32 inode_num;
 		uint16 inode_type;
-		if (ext4_lookup_path(path, &inode_num, &inode_type) < 0)
+		uint32 start = 0;   // 0 => ext4_lookup_path 内部用 EXT4_ROOT_INO
+		if (path[0] != '/') {
+			proc_t *p = myproc();
+			if (p != NULL && p->cwd != NULL && p->cwd->inode_num != INVALID_INODE_NUM)
+				start = p->cwd->inode_num;   // 相对路径: 从 cwd 起查
+		}
+		if (ext4_lookup_path(start, path, &inode_num, &inode_type) < 0)
 			return NULL;
 		return inode_get(inode_num);
 	}

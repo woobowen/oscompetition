@@ -43,7 +43,7 @@ void inode_print(inode_t *ip, char* name);
 bool ext4_mount_from_super(const ext4_super_preview_t *sb);
 bool ext4_is_active();
 const ext4_info_t *ext4_get_info();
-int ext4_lookup_path(char *path, uint32 *inode_num, uint16 *inode_type);
+int ext4_lookup_path(uint32 start_inode, char *path, uint32 *inode_num, uint16 *inode_type);
 int ext4_fill_inode(uint32 inode_num, inode_t *ip);
 uint32 ext4_read_inode_data(uint32 inode_num, uint32 offset, uint32 len, void *dst);
 

@@ -118,6 +118,19 @@ static void run_one(char *path, char **argv)
 		return;
 	}
 	if (pid == 0) {
+		// chdir 到脚本所在目录, 使脚本内相对路径(如 ./busybox)能解析
+		char dir[MAXLEN_STR + 1];
+		int last = -1;
+		for (int i = 0; path[i]; i++)
+			if (path[i] == '/') last = i;
+		if (last == 0) {
+			dir[0] = '/'; dir[1] = 0;
+			syscall(SYS_chdir, dir);
+		} else if (last > 0) {
+			for (int i = 0; i < last; i++) dir[i] = path[i];
+			dir[last] = 0;
+			syscall(SYS_chdir, dir);
+		}
 		int ret = (int)syscall(SYS_exec, path, argv, 0);
 		if (ret < 0)
 			syscall(SYS_write, 1, str_5, sizeof(str_5));

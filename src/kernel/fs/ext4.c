@@ -271,12 +271,12 @@ static char *ext4_get_element(char *path, char *name)
     return path;
 }
 
-int ext4_lookup_path(char *path, uint32 *inode_num, uint16 *inode_type)
+int ext4_lookup_path(uint32 start_inode, char *path, uint32 *inode_num, uint16 *inode_type)
 {
     if (!ext4_info.active || path == NULL)
         return -1;
 
-    uint32 cur = EXT4_ROOT_INO;
+    uint32 cur = (start_inode == 0) ? EXT4_ROOT_INO : start_inode;   // 0=从根; 否则从指定inode(相对路径=cwd)
     char name[MAXLEN_FILENAME];
     char *rest = path;
 
