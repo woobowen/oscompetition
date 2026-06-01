@@ -103,46 +103,46 @@ static void run_one(char *path, char **argv)
 	char str_4[] = "\n======== test fail   ========\n";
 	char str_5[] = "initcode: exec fail!\n";
 
-	syscall(SYS_write, 1, 4, "run ");
-	syscall(SYS_write, 1, local_strlen(path), path);
+	syscall(SYS_write, 1, "run ", 4);
+	syscall(SYS_write, 1, path, local_strlen(path));
 	for (int i = 0; argv[i] != 0; i++) {
-		syscall(SYS_write, 1, 1, " ");
-		syscall(SYS_write, 1, local_strlen(argv[i]), argv[i]);
+		syscall(SYS_write, 1, " ", 1);
+		syscall(SYS_write, 1, argv[i], local_strlen(argv[i]));
 	}
-	syscall(SYS_write, 1, 1, "\n");
-	syscall(SYS_write, 1, sizeof(str_2), str_2);
+	syscall(SYS_write, 1, "\n", 1);
+	syscall(SYS_write, 1, str_2, sizeof(str_2));
 
 	int pid = (int)syscall(SYS_fork);
 	if (pid < 0) {
-		syscall(SYS_write, 1, sizeof(str_1), str_1);
+		syscall(SYS_write, 1, str_1, sizeof(str_1));
 		return;
 	}
 	if (pid == 0) {
 		int ret = (int)syscall(SYS_exec, path, argv, 0);
 		if (ret < 0)
-			syscall(SYS_write, 1, sizeof(str_5), str_5);
+			syscall(SYS_write, 1, str_5, sizeof(str_5));
 		syscall(SYS_exit, 1);
 		while (1) ;
 	}
 
 	int ret = -1;
 	if ((int)syscall(SYS_wait, &ret) < 0) {
-		syscall(SYS_write, 1, sizeof(str_1), str_1);
+		syscall(SYS_write, 1, str_1, sizeof(str_1));
 		return;
 	}
 	if (ret != 0) {
-		syscall(SYS_write, 1, sizeof(str_4), str_4);
+		syscall(SYS_write, 1, str_4, sizeof(str_4));
 		return;
 	}
 
-	syscall(SYS_write, 1, sizeof(str_3), str_3);
+	syscall(SYS_write, 1, str_3, sizeof(str_3));
 }
 
 int main()
 {
 	char banner[] = "initcode: started\n";
 	char no_test[] = "initcode: no *_testcode.sh found\n";
-	syscall(SYS_write, 1, sizeof(banner) - 1, banner);
+	syscall(SYS_write, 1, banner, sizeof(banner) - 1);
 
 	char test_paths[MAX_TESTS][MAXLEN_STR + 1];
 	char argv0s[MAX_TESTS][MAXLEN_STR + 1];
@@ -156,7 +156,7 @@ int main()
 		count += load_test_entries("/", test_paths, argv0s, count, MAX_TESTS);
 
 	if (count == 0) {
-		syscall(SYS_write, 1, sizeof(no_test) - 1, no_test);
+		syscall(SYS_write, 1, no_test, sizeof(no_test) - 1);
 		while (1) ;
 	}
 
