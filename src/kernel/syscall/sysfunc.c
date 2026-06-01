@@ -765,3 +765,54 @@ uint64 sys_newfstatat()
     file_close(file);
     return r;
 }
+
+// 25 fcntl(fd, cmd, arg)：实现 F_DUPFD + 文件描述符/状态标志的常见命令
+uint64 sys_fcntl()
+{
+    file_t *file;
+    if (arg_fd(0, NULL, &file) < 0) return (uint64)(-EBADF);
+    int cmd = (int)arg_raw(1);
+    switch (cmd) {
+        case 0:      // F_DUPFD
+        case 1030: { // F_DUPFD_CLOEXEC：暂不区分 cloexec, 直接复制 fd
+            file_t *nf = file_dup(file);
+            if (!nf) return (uint64)-1;
+            uint32 nfd = alloc_fd(nf);
+            if (nfd == (uint32)-1) { file_close(nf); return (uint64)-1; }
+            return nfd;
+        }
+        case 1: return 0;     // F_GETFD：无 cloexec 跟踪, 返回 0
+        case 2: return 0;     // F_SETFD：忽略, 成功
+        case 3: return 2;     // F_GETFL：返回 O_RDWR(2)
+        case 4: return 0;     // F_SETFL：忽略, 成功
+        default: return 0;    // 其它命令暂作成功处理
+    }
+}
+
+// 134 rt_sigaction：暂不实现真实信号, 一律成功(避免 sh 报 Function not implemented)
+uint64 sys_rt_sigaction() { return 0; }
+
+// 160 uname：填 struct utsname(6 × 65 字节字段)
+uint64 sys_uname()
+{
+    uint64 addr = arg_raw(0);
+    struct {
+        char sysname[65], nodename[65], release[65], version[65], machine[65], domainname[65];
+    } u;
+    memset(&u, 0, sizeof(u));
+    memmove(u.sysname,  "SeaOS",   6);
+    memmove(u.nodename, "seaos",   6);
+    memmove(u.release,  "6.1.0",   6);   // 给个较新的内核版本号, 规避部分版本检查
+    memmove(u.version,  "SeaOS",   6);
+    memmove(u.machine,  "riscv64", 8);
+    uvm_copyout(myproc()->pgtbl, addr, (uint64)&u, sizeof(u));
+    return 0;
+}
+
+// 173 getppid：返回父进程 pid(无父则 1)
+uint64 sys_getppid()
+{
+    proc_t *p = myproc();
+    if (p && p->parent) return (uint64)p->parent->pid;
+    return 1;
+}

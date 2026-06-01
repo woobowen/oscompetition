@@ -34,6 +34,10 @@
 #define SYS_getgid 176           // 返回 0
 #define SYS_writev 66            // Linux/RISC-V writev
 #define SYS_exit_group 94        // exit_group (单线程下等价 exit)
+#define SYS_fcntl 25             // fcntl(fd,cmd,arg)
+#define SYS_rt_sigaction 134     // 装信号处理器 (暂桩)
+#define SYS_uname 160            // 系统信息
+#define SYS_getppid 173          // 父进程 pid
 
 #define SYS_schedstat 500        // SeaOS 私有: 拉取调度统计快照
 #define SYS_spawn     501        // SeaOS 私有: fork+exec+wait 串行执行程序
