@@ -38,6 +38,7 @@
 #define SYS_rt_sigaction 134     // 装信号处理器 (暂桩)
 #define SYS_uname 160            // 系统信息
 #define SYS_getppid 173          // 父进程 pid
+#define SYS_clone 220            // Linux/RISC-V clone (musl fork 依赖)
 
 #define SYS_schedstat 500        // SeaOS 私有: 拉取调度统计快照
 #define SYS_spawn     501        // SeaOS 私有: fork+exec+wait 串行执行程序

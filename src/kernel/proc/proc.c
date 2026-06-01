@@ -481,12 +481,12 @@ int proc_fork()
     spinlock_release(&child->lk);
 
     // 调试信息：记录父子 pid 和子进程当前状态
-    printf("proc_fork: parent=%d child=%d state=%d\n", parent ? parent->pid : -1, pid, child->state);
+    // printf("proc_fork: parent=%d child=%d state=%d\n", parent ? parent->pid : -1, pid, child->state);
 
     // 入MLFQ就绪队列(避免持有 child->lk 时拿 mlfq 锁)
-    printf("proc_fork: before mlfq_on_new child=%d\n", pid);
+    // printf("proc_fork: before mlfq_on_new child=%d\n", pid);
     mlfq_on_new(child);
-    printf("proc_fork: after mlfq_on_new child=%d\n", pid);
+    // printf("proc_fork: after mlfq_on_new child=%d\n", pid);
 
     return pid;
 }

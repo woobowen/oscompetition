@@ -117,6 +117,23 @@ uint64 sys_fork()
     return proc_fork();
 }
 
+uint64 sys_clone()
+{
+    // Linux/RISC-V clone(flags=a0, stack=a1, parent_tid=a2, tls=a3, child_tid=a4)
+    // musl fork() => clone(SIGCHLD=0x11, 0, ...): 复制地址空间, 子返回0, 父返回子pid
+    uint64 flags = arg_raw(0);
+    uint64 stack = arg_raw(1);
+
+    // 仅支持 fork 语义。CLONE_VM(0x100)=共享地址空间(线程)、或指定新栈, 暂不支持。
+    if ((flags & 0x100) || stack != 0) {
+        printf("sys_clone: unsupported flags=%p stack=%p -> -ENOSYS\n",
+               (void *)flags, (void *)stack);
+        return -ENOSYS;
+    }
+
+    return proc_fork();   // 子 a0 已置0、epc+4; 父返回子 pid (与 fork 完全一致)
+}
+
 /*
     等待子进程退出
     uint64 addr_exit_state
