@@ -10,8 +10,16 @@ void uvm_copyin(pgtbl_t pgtbl, uint64 dst, uint64 src, uint32 len)
 
     while (copied < len) {
         // 获取src对应的PTE和物理地址
-        pte_t *pte = vm_getpte(pgtbl, src, false); 
-        if (pte == NULL || !(*pte & PTE_V))  panic("uvm_copyin: invalid user address");
+        pte_t *pte = vm_getpte(pgtbl, src, false);
+        if (pte == NULL || !(*pte & PTE_V)) {
+            proc_t *p = myproc();
+            if (p != NULL) uvm_ustack_grow(pgtbl, p->ustack_npage, src);
+            pte = vm_getpte(pgtbl, src, false);
+            if (pte == NULL || !(*pte & PTE_V)) {
+                printf("uvm_copyin: invalid user address src=%p\n", (void *)src);
+                panic("uvm_copyin: invalid user address");
+            }
+        }
         uint64 pa = PTE_TO_PA(*pte); 
         // 处理不page-aligned的情况-计算页内偏移和本页可拷贝字节数
         uint64 offset = src % PGSIZE; //! 页内偏移
@@ -34,8 +42,18 @@ void uvm_copyout(pgtbl_t pgtbl, uint64 dst, uint64 src, uint32 len)
     uint32 copied = 0;
 
     while (copied < len) {
-        pte_t *pte = vm_getpte(pgtbl,dst, false);
-        if (pte == NULL || !(*pte & PTE_V))  panic("uvm_copyout: invalid user address");
+        pte_t *pte = vm_getpte(pgtbl, dst, false);
+        if (pte == NULL || !(*pte & PTE_V)) {
+            // 目标用户页未映射: 若落在可增长的栈区则按需增长后重试。
+            // uvm_ustack_grow 自带范围保护: dst 不在 (MMAP_END, TRAPFRAME) 时返回 -1, 无副作用。
+            proc_t *p = myproc();
+            if (p != NULL) uvm_ustack_grow(pgtbl, p->ustack_npage, dst);
+            pte = vm_getpte(pgtbl, dst, false);
+            if (pte == NULL || !(*pte & PTE_V)) {
+                printf("uvm_copyout: invalid user address dst=%p\n", (void *)dst);
+                panic("uvm_copyout: invalid user address");
+            }
+        }
         uint64 pa = PTE_TO_PA(*pte);
     
         uint64 offset = dst % PGSIZE;
