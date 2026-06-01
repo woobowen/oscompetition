@@ -37,6 +37,7 @@ static uint64 (*syscalls[])(void) = {
     [SYS_rt_sigaction] sys_rt_sigaction,
     [SYS_uname] sys_uname,
     [SYS_getppid] sys_getppid,
+    [SYS_gettid] sys_gettid,
     [SYS_clone] sys_clone,
     [SYS_schedstat] sys_schedstat,
     [SYS_spawn] sys_spawn,

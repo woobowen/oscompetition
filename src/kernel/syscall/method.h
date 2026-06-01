@@ -45,6 +45,7 @@ uint64 sys_fcntl();
 uint64 sys_rt_sigaction();
 uint64 sys_uname();
 uint64 sys_getppid();
+uint64 sys_gettid();
 uint64 sys_clone();
 uint64 sys_schedstat();
 uint64 sys_spawn();

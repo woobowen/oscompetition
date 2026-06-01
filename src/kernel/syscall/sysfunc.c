@@ -202,6 +202,11 @@ uint64 sys_getpid()
     return (uint64)(myproc()->pid);
 }
 
+uint64 sys_gettid()
+{
+    return myproc()->pid;   // 单线程: tid == pid
+}
+
 /*
     set_tid_address(int *tidptr)
     Linux 语义: 设置调用线程 clear_child_tid = tidptr, 返回调用者 TID。
