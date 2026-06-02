@@ -215,6 +215,11 @@ static int mlfq_choose_cpu_for_wakeup(int local_cpu)
 		int load = mlfq_cpu_load_locked(c);
 		spinlock_release(&mlfq_rq[c].lk);
 
+		// 避免把唤醒进程迁到未运行调度器的 CPU(如 -smp 1 时只有 cpu0 在跑):
+		// 否则进程入队到死核的 L0, 而 pick_next 的工作窃取从不偷 L0 -> 永远跑不到。
+		if (!mlfq_cpu_running[c] && c != mycpuid())
+			load += 0x100000; // 与 mlfq_choose_cpu_for_newproc 同样的死核惩罚
+
 		if (c == local_cpu)
 			local_load = load;
 		if (load < best_load) {
