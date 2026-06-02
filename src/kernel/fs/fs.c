@@ -25,6 +25,133 @@ void file_init()
 	spinlock_release(&lk_file_table);
 }
 
+/* ===================== 管道实现 (pipe) ===================== */
+static pipe_t pipe_pool[N_PIPE];
+static spinlock_t lk_pipe_pool;
+
+void pipe_init(void)
+{
+	spinlock_init(&lk_pipe_pool, "pipepool");
+	for (int i = 0; i < N_PIPE; i++)
+		pipe_pool[i].used = 0;
+}
+
+static pipe_t *pipe_pool_alloc(void)
+{
+	spinlock_acquire(&lk_pipe_pool);
+	for (int i = 0; i < N_PIPE; i++) {
+		if (!pipe_pool[i].used) {
+			pipe_pool[i].used = 1;
+			spinlock_release(&lk_pipe_pool);
+			return &pipe_pool[i];
+		}
+	}
+	spinlock_release(&lk_pipe_pool);
+	return NULL;
+}
+
+static void pipe_pool_free(pipe_t *pi)
+{
+	spinlock_acquire(&lk_pipe_pool);
+	pi->used = 0;
+	spinlock_release(&lk_pipe_pool);
+}
+
+// 创建管道: *rf=读端, *wf=写端。成功返回0, 失败-1。
+int pipe_alloc(file_t **rf, file_t **wf)
+{
+	pipe_t *pi = pipe_pool_alloc();
+	if (pi == NULL)
+		return -1;
+	spinlock_init(&pi->lk, "pipe");
+	pi->nread = 0;
+	pi->nwrite = 0;
+	pi->readopen = 1;
+	pi->writeopen = 1;
+
+	*rf = file_alloc();
+	*wf = file_alloc();
+	if (*rf == NULL || *wf == NULL) {
+		if (*rf) file_close(*rf);
+		if (*wf) file_close(*wf);
+		pipe_pool_free(pi);
+		return -1;
+	}
+	(*rf)->is_pipe = true; (*rf)->pipe = pi; (*rf)->readable = true;  (*rf)->writbale = false;
+	(*wf)->is_pipe = true; (*wf)->pipe = pi; (*wf)->readable = false; (*wf)->writbale = true;
+	return 0;
+}
+
+// 读管道: 空且写端开 -> 睡等; 写端关且空 -> 返回0(EOF)。一次最多 PIPE_SIZE。
+uint32 pipe_read(pipe_t *pi, uint64 addr, uint32 n, bool is_user)
+{
+	char buf[PIPE_SIZE];
+	uint32 i = 0;
+	spinlock_acquire(&pi->lk);
+	while (pi->nread == pi->nwrite && pi->writeopen) {
+		proc_sleep(&pi->nread, &pi->lk);   // 返回后仍持有 pi->lk
+	}
+	for (i = 0; i < n && i < PIPE_SIZE && pi->nread != pi->nwrite; i++) {
+		buf[i] = pi->data[pi->nread % PIPE_SIZE];
+		pi->nread++;
+	}
+	proc_wakeup(&pi->nwrite);   // 唤醒写者
+	spinlock_release(&pi->lk);
+
+	if (i > 0) {
+		if (is_user) uvm_copyout(myproc()->pgtbl, addr, (uint64)buf, i);
+		else memmove((void *)addr, buf, i);
+	}
+	return i;
+}
+
+// 写管道: 满 -> 唤醒读者并睡等; 读端关 -> 返回已写(或-1)。
+uint32 pipe_write(pipe_t *pi, uint64 addr, uint32 n, bool is_user)
+{
+	char buf[PIPE_SIZE];
+	uint32 total = 0;
+	while (total < n) {
+		uint32 chunk = n - total;
+		if (chunk > PIPE_SIZE) chunk = PIPE_SIZE;
+		if (is_user) uvm_copyin(myproc()->pgtbl, (uint64)buf, addr + total, chunk);
+		else memmove(buf, (void *)(addr + total), chunk);
+
+		spinlock_acquire(&pi->lk);
+		uint32 w = 0;
+		while (w < chunk) {
+			if (!pi->readopen) {
+				spinlock_release(&pi->lk);
+				return total > 0 ? total : (uint32)-1;   // broken pipe
+			}
+			if (pi->nwrite == pi->nread + PIPE_SIZE) {    // 满
+				proc_wakeup(&pi->nread);
+				proc_sleep(&pi->nwrite, &pi->lk);
+				continue;
+			}
+			pi->data[pi->nwrite % PIPE_SIZE] = buf[w];
+			pi->nwrite++;
+			w++;
+		}
+		proc_wakeup(&pi->nread);
+		spinlock_release(&pi->lk);
+		total += chunk;
+	}
+	return total;
+}
+
+// 关闭管道一端(由 file_close 在 ref 归零时调用)
+void pipe_close(pipe_t *pi, bool writable)
+{
+	spinlock_acquire(&pi->lk);
+	if (writable) { pi->writeopen = 0; proc_wakeup(&pi->nread); }
+	else          { pi->readopen = 0;  proc_wakeup(&pi->nwrite); }
+	int both_closed = (pi->readopen == 0 && pi->writeopen == 0);
+	spinlock_release(&pi->lk);
+	if (both_closed)
+		pipe_pool_free(pi);
+}
+/* =================== 管道实现结束 =================== */
+
 /* 从file_table中获取1个空闲file */
 file_t* file_alloc()
 {
@@ -39,6 +166,8 @@ file_t* file_alloc()
             file_table[i].readable = false;
             file_table[i].writbale = false;
             file_table[i].offset = 0;
+            file_table[i].is_pipe = false;
+            file_table[i].pipe = NULL;
             spinlock_release(&lk_file_table);
             return &file_table[i]; // 返回分配的file
 		}
@@ -147,14 +276,22 @@ void file_close(file_t *file)
 
 	// 此时 ref == 0：回收槽位
 	ip = file->ip;
+	bool was_pipe = file->is_pipe;
+	pipe_t *pi = file->pipe;
+	bool was_writable = file->writbale;
     file->ip = NULL;
 	file->is_device = false;
 	file->dev_major = 0;
     file->readable = false;
     file->writbale = false;
     file->offset = 0;
+	file->is_pipe = false;
+	file->pipe = NULL;
 
 	spinlock_release(&lk_file_table);
+
+	if (was_pipe && pi != NULL)
+		pipe_close(pi, was_writable);
 
 	if (ip != NULL)
 		inode_put(ip); // 释放inode
@@ -169,6 +306,9 @@ uint32 file_read(file_t* file, uint32 len, uint64 dst, bool is_user_dst)
     if (!file->readable){
 		return (uint32)-1;
 	}
+
+	if (file->is_pipe)
+		return pipe_read(file->pipe, dst, len, is_user_dst);
 
 	if (file->is_device)
 		return device_read_data(file->dev_major, len, dst, is_user_dst);
@@ -225,6 +365,9 @@ uint32 file_write(file_t* file, uint32 len, uint64 src, bool is_user_src)
     if (!file->writbale){
 		return (uint32)-1;
 	}
+
+	if (file->is_pipe)
+		return pipe_write(file->pipe, src, len, is_user_src);
 
 	if (file->is_device)
 		return device_write_data(file->dev_major, len, src, is_user_src);
@@ -464,6 +607,8 @@ void fs_init()
 	buffer_init();
 	// 初始化inode缓存与锁
 	inode_init();
+	// 初始化管道池
+	pipe_init();
 
 	// 读取超级块
 	buffer_t *b = buffer_get(FS_SB_BLOCK);

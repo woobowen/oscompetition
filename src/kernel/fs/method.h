@@ -64,6 +64,11 @@ uint32 path_unlink(char *path);
 
 /* fs.c: 文件系统 */
 
+void pipe_init(void);
+int pipe_alloc(file_t **rf, file_t **wf);
+uint32 pipe_read(pipe_t *pi, uint64 addr, uint32 n, bool is_user);
+uint32 pipe_write(pipe_t *pi, uint64 addr, uint32 n, bool is_user);
+void pipe_close(pipe_t *pi, bool writable);
 void file_init();
 file_t* file_alloc();
 file_t* file_open(char *path, uint32 open_mode);

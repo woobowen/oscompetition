@@ -449,6 +449,18 @@ typedef struct dentry {
 #define FILE_LSEEK_ADD   1     // file->offset += lseek_offset
 #define FILE_LSEEK_SUB   2     // file->offset -= lseek_offset
 
+#define PIPE_SIZE 512
+#define N_PIPE 16
+typedef struct pipe {
+    spinlock_t lk;
+    char data[PIPE_SIZE];
+    uint32 nread;      // 已读字节数(单调递增)
+    uint32 nwrite;     // 已写字节数(单调递增)
+    int readopen;      // 读端是否打开
+    int writeopen;     // 写端是否打开
+    int used;          // 槽位占用
+} pipe_t;
+
 typedef struct file {
     inode_t *ip;        // 对应的inode
     bool is_device;     // 是否为虚拟设备文件(不依赖磁盘inode)
@@ -457,6 +469,8 @@ typedef struct file {
     bool writbale;      // 是否可写
     uint32 offset;      // 读/写指针的偏移量
     uint32 ref;         // 引用数 (lk_file_table保护)
+    bool is_pipe;       // 是否为管道
+    struct pipe *pipe;  // 管道对象(is_pipe 时有效)
 } file_t;
 
 #define N_FILE 128      // file_table中file的数量

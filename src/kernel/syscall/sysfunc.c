@@ -881,3 +881,29 @@ uint64 sys_getrusage()
     uvm_copyout(myproc()->pgtbl, usage, (uint64)buf, sizeof(buf));
     return 0;
 }
+
+uint64 sys_pipe2()
+{
+    // pipe2(int pipefd[2]=a0, int flags=a1)。flags(O_CLOEXEC/O_NONBLOCK)暂忽略。
+    uint64 fdarray = arg_raw(0);
+    file_t *rf = NULL, *wf = NULL;
+    if (pipe_alloc(&rf, &wf) < 0)
+        return -1;
+    uint32 fd0 = alloc_fd(rf);
+    uint32 fd1 = alloc_fd(wf);
+    if (fd0 == (uint32)-1 || fd1 == (uint32)-1) {
+        if (fd0 != (uint32)-1) myproc()->open_file[fd0] = NULL;
+        file_close(rf);
+        file_close(wf);
+        return -1;
+    }
+    int fds[2] = { (int)fd0, (int)fd1 };
+    uvm_copyout(myproc()->pgtbl, fdarray, (uint64)fds, sizeof(fds));
+    return 0;
+}
+
+uint64 sys_umask()
+{
+    // umask(mask): 返回旧 mask。最小桩: 旧值 0。
+    return 0;
+}

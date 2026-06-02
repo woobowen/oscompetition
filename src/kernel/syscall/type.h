@@ -43,6 +43,8 @@
 #define SYS_clock_gettime 113    // Linux/RISC-V clock_gettime
 #define SYS_getrusage 165        // Linux/RISC-V getrusage (零填充桩)
 #define SYS_gettimeofday 169     // Linux/RISC-V gettimeofday
+#define SYS_pipe2 59             // Linux/RISC-V pipe2
+#define SYS_umask 166            // Linux/RISC-V umask (桩, 返回0)
 
 #define SYS_schedstat 500        // SeaOS 私有: 拉取调度统计快照
 #define SYS_spawn     501        // SeaOS 私有: fork+exec+wait 串行执行程序
