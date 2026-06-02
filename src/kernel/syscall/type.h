@@ -40,6 +40,9 @@
 #define SYS_getppid 173          // 父进程 pid
 #define SYS_gettid 178           // Linux/RISC-V gettid (单线程 = pid)
 #define SYS_clone 220            // Linux/RISC-V clone (musl fork 依赖)
+#define SYS_clock_gettime 113    // Linux/RISC-V clock_gettime
+#define SYS_getrusage 165        // Linux/RISC-V getrusage (零填充桩)
+#define SYS_gettimeofday 169     // Linux/RISC-V gettimeofday
 
 #define SYS_schedstat 500        // SeaOS 私有: 拉取调度统计快照
 #define SYS_spawn     501        // SeaOS 私有: fork+exec+wait 串行执行程序

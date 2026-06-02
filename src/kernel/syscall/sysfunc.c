@@ -838,3 +838,46 @@ uint64 sys_getppid()
     if (p && p->parent) return (uint64)p->parent->pid;
     return 1;
 }
+
+// qemu virt 的 time CSR 频率: INTERVAL=1e6 cycle≈0.1s => 10MHz
+#define TIMEBASE_HZ 10000000ull
+
+// 113 clock_gettime：获取时钟时间（高精度）
+uint64 sys_clock_gettime()
+{
+    // clock_gettime(clk_id=a0(忽略, 统一用单调10MHz计数), struct timespec *tp=a1)
+    uint64 tp = arg_raw(1);
+    if (tp == 0) return 0;
+    uint64 t = r_time();
+    uint64 ts[2];
+    ts[0] = t / TIMEBASE_HZ;             // tv_sec
+    ts[1] = (t % TIMEBASE_HZ) * 100;     // tv_nsec (1/10MHz = 100ns)
+    uvm_copyout(myproc()->pgtbl, tp, (uint64)ts, sizeof(ts));
+    return 0;
+}
+
+// 169 gettimeofday：获取当前时间（微秒精度）
+uint64 sys_gettimeofday()
+{
+    // gettimeofday(struct timeval *tv=a0, struct timezone *tz=a1(忽略))
+    uint64 tv = arg_raw(0);
+    if (tv == 0) return 0;
+    uint64 t = r_time();
+    uint64 val[2];
+    val[0] = t / TIMEBASE_HZ;            // tv_sec
+    val[1] = (t % TIMEBASE_HZ) / 10;     // tv_usec (10MHz/10 = 1MHz)
+    uvm_copyout(myproc()->pgtbl, tv, (uint64)val, sizeof(val));
+    return 0;
+}
+
+// 165 getrusage：获取资源使用统计（最小桩：全零）
+uint64 sys_getrusage()
+{
+    // getrusage(int who=a0, struct rusage *usage=a1) 最小桩: 全零(144字节)返回0
+    uint64 usage = arg_raw(1);
+    if (usage == 0) return 0;
+    char buf[144];
+    memset(buf, 0, sizeof(buf));
+    uvm_copyout(myproc()->pgtbl, usage, (uint64)buf, sizeof(buf));
+    return 0;
+}
