@@ -72,10 +72,6 @@ static uint64 prepare_heap(pgtbl_t new_pgtbl, inode_t *ip, elf_header_t *eh, exe
     {
         if (inode_read_data(ip, off, sizeof(ph), &ph, false) != sizeof(ph))
             return -1;
-         printf("proc_prepare_heap: ph_idx=%d type=%d va=%p off=%p file_size=%p mem_size=%p flags=0x%x\n",
-             (int)((off - eh->ph_off) / sizeof(ph)), ph.type,
-             (void*)ph.va, (void*)ph.off,
-             (void*)ph.file_size, (void*)ph.mem_size, ph.flags);
 
         if (ph.type == ELF_PT_PHDR) {
             info->phdr_addr = ph.va;
@@ -576,7 +572,7 @@ int proc_exec(char *path, char **argv)
     }
     p->name[i] = '\0';
     p->name[sizeof(p->name) - 1] = '\0';
-    printf("proc_exec: pid=%d exec done argc=%d heap_top=%p tf=%p%s\n", p->pid, argc, (void*)p->heap_top, (void*)p->tf, use_script ? " script" : "");
+    printf("proc_exec: pid=%d exec done argc=%d heap_top=%p tf=%p entry=%p%s\n", p->pid, argc, (void*)p->heap_top, (void*)p->tf, (void*)entry_pc, use_script ? " script" : "");
     
     return argc;
 }

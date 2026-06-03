@@ -38,39 +38,43 @@ uint64 sys_brk()
 
 /*
     增加一段内存映射
-    uint64 start 起始地址
-    uint32 len   范围 (字节,需检查是否是page-aligned)
-    成功返回映射空间的起始地址, 失败返回-1
+    mmap(addr, length, prot, flags, fd, offset)
+    成功返回映射空间的起始地址, 失败返回(uint64)-1
 */
 uint64 sys_mmap()
 {
-    uint64 start; // 起始地址
-    uint64 len;   // 地址范围
+    uint64 start;
+    uint64 len;
+    uint64 prot;
+    uint64 flags;
     arg_uint64(0, &start);
     arg_uint64(1, &len);
+    arg_uint64(2, &prot);
+    arg_uint64(3, &flags);
+    // a4=fd, a5=offset 仅文件映射需要，匿名映射忽略
 
-    if (len == 0) {
-        printf("sys_mmap: len == 0\n");
+    if (len == 0)
         return (uint64)-1;
-    }
-    if (start != 0 && start % PGSIZE != 0) {
-        printf("sys_mmap: start not page-aligned\n");
+    if (start != 0 && start % PGSIZE != 0)
         return (uint64)-1;
-    }
 
     uint64 aligned_len = (len + PGSIZE - 1) & ~(PGSIZE - 1);
     uint32 npages = aligned_len / PGSIZE;
-    int perm = PTE_R | PTE_W | PTE_U;
+
+    // 根据 prot 设置 PTE 权限
+    // PROT_READ=1, PROT_WRITE=2, PROT_EXEC=4
+    int perm = PTE_U;
+    if (prot & 1) perm |= PTE_R;
+    if (prot & 2) perm |= PTE_W;
+    if (prot & 4) perm |= PTE_X;
+    // 若 prot=PROT_NONE(0) 或未设置读权限，给最小读权限避免 musl 访问头部失败
+    if (!(perm & (PTE_R | PTE_W | PTE_X)))
+        perm |= PTE_R;
 
     uint64 ret_addr = uvm_mmap(start, npages, perm);
-
-    // // 调试
-    // proc_t *p = myproc();
-    // printf("sys_mmap: start = %p, len = 0x%x, ret_addr = %p\n", (void *)start, len, (void *)ret_addr);
-    // uvm_show_mmaplist(p->mmap);
-    // vm_print(p->pgtbl);
-    // printf("\n");
-
+    printf("sys_mmap: start=%p len=0x%llx prot=%llu flags=%llu npages=%u ret=%p\n",
+           (void*)start, (unsigned long long)len, (unsigned long long)prot,
+           (unsigned long long)flags, (unsigned)npages, (void*)ret_addr);
     return ret_addr;
 }
 

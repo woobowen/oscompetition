@@ -31,6 +31,10 @@ void trap_user_handler()
 
     tf->user_to_kern_epc = sepc;
 
+    if (p->pid >= 2 && tf->gp == 0 && sepc > USER_BASE)
+        printf("[DBG] pid=%d sepc=%p gp=0 scause=%p sp=%p\n",
+               p->pid, sepc, (void*)scause, (void*)tf->sp);
+
     //开始处理 trap
     int trap_id = scause & 0x3FF;  // 取低10位（RISC-V标准）
 
@@ -64,16 +68,16 @@ void trap_user_handler()
             case 15:
             {
                 if (uvm_ustack_grow(p->pgtbl, p->ustack_npage, r_stval()) == (uint64)-1) {
-                    printf("[SEGV] pid=%d trap_id=%d sepc=%p stval=%p sp=%p\n",
-                           p->pid, trap_id, sepc, r_stval(), (void*)tf->sp);
+                    printf("[SEGV] pid=%d t=%d pc=%p stval=%p gp=%p sp=%p\n",
+                           p->pid, trap_id, sepc, r_stval(), (void*)tf->gp, (void*)tf->sp);
                     proc_exit(-11);
                 }
                 break;
             }
             default:
             {
-                printf("[SEGV] pid=%d trap_id=%d sepc=%p stval=%p\n",
-                       p->pid, trap_id, sepc, r_stval());
+                printf("[SEGV] pid=%d t=%d pc=%p stval=%p gp=%p sp=%p\n",
+                       p->pid, trap_id, sepc, r_stval(), (void*)tf->gp, (void*)tf->sp);
                 proc_exit(-11);
             }
         }
