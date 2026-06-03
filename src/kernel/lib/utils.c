@@ -21,6 +21,15 @@ void memmove(void *dst, const void *src, uint32 n)
     }
 }
 
+void *memcpy(void *dst, const void *src, uint32 n)
+{
+    uint8 *d = (uint8 *)dst;
+    const uint8 *s = (const uint8 *)src;
+    for (uint32 i = 0; i < n; i++)
+        d[i] = s[i];
+    return dst;
+}
+
 // 字符串p的前n个字符与q做比较
 // 按照ASCII码大小逐个比较
 // 相同返回0 大于或小于返回正数或负数

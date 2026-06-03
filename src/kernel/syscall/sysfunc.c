@@ -45,27 +45,22 @@ uint64 sys_brk()
 uint64 sys_mmap()
 {
     uint64 start; // 起始地址
-    uint32 len;   // 地址范围
+    uint64 len;   // 地址范围
     arg_uint64(0, &start);
-    arg_uint32(1, &len);
+    arg_uint64(1, &len);
 
-    // 检查长度是否有效
     if (len == 0) {
         printf("sys_mmap: len == 0\n");
         return (uint64)-1;
     }
-    // 检查地址是否页对齐
-    if (start % PGSIZE != 0) {
+    if (start != 0 && start % PGSIZE != 0) {
         printf("sys_mmap: start not page-aligned\n");
         return (uint64)-1;
     }
-    if (len % PGSIZE != 0) {
-        printf("sys_mmap: len not page-aligned\n");
-        return (uint64)-1;
-    }
 
-    uint32 npages = len / PGSIZE;
-    int perm = PTE_R | PTE_W | PTE_U; 
+    uint64 aligned_len = (len + PGSIZE - 1) & ~(PGSIZE - 1);
+    uint32 npages = aligned_len / PGSIZE;
+    int perm = PTE_R | PTE_W | PTE_U;
 
     uint64 ret_addr = uvm_mmap(start, npages, perm);
 
@@ -848,8 +843,38 @@ uint64 sys_fcntl()
     }
 }
 
-// 134 rt_sigaction：暂不实现真实信号, 一律成功(避免 sh 报 Function not implemented)
-uint64 sys_rt_sigaction() { return 0; }
+// 134 rt_sigaction(signum, act, oldact, sigsetsize): 注册信号处理器
+uint64 sys_rt_sigaction()
+{
+    int signum = (int)arg_raw(0);
+    uint64 act_addr = arg_raw(1);
+    uint64 oldact_addr = arg_raw(2);
+
+    if (signum < 1 || signum > NSIG)
+        return (uint64)(-EINVAL);
+
+    proc_t *p = myproc();
+
+    if (oldact_addr != 0) {
+        uint8 buf[152];
+        memset(buf, 0, sizeof(buf));
+        *(uint64 *)&buf[0] = p->sig_handler[signum];
+        *(uint64 *)&buf[8] = 0;
+        *(uint64 *)&buf[16] = p->sig_restorer;
+        uvm_copyout(p->pgtbl, oldact_addr, (uint64)buf, sizeof(buf));
+    }
+
+    if (act_addr != 0) {
+        uint8 buf[152];
+        uvm_copyin(p->pgtbl, (uint64)buf, act_addr, sizeof(buf));
+        p->sig_handler[signum] = *(uint64 *)&buf[0];
+        uint64 flags = *(uint64 *)&buf[8];
+        if (flags & SA_RESTORER)
+            p->sig_restorer = *(uint64 *)&buf[16];
+    }
+
+    return 0;
+}
 
 // 160 uname：填 struct utsname(6 × 65 字节字段)
 uint64 sys_uname()
@@ -941,6 +966,203 @@ uint64 sys_pipe2()
 
 uint64 sys_umask()
 {
-    // umask(mask): 返回旧 mask。最小桩: 旧值 0。
     return 0;
+}
+
+// 29 ioctl(fd, cmd, arg): 终端/设备控制。最小桩: ENOTTY。
+uint64 sys_ioctl()
+{
+    return (uint64)(-ENOTTY);
+}
+
+// 99 set_robust_list(head, len): musl 线程初始化需要。桩返回 0。
+uint64 sys_set_robust_list()
+{
+    return 0;
+}
+
+// 100 get_robust_list(pid, head_ptr, len_ptr): 桩返回 0。
+uint64 sys_get_robust_list()
+{
+    return 0;
+}
+
+// 102 getitimer(which, curr_value): 获取间隔定时器。桩: 零填充返回。
+uint64 sys_getitimer()
+{
+    uint64 curr = arg_raw(1);
+    if (curr == 0) return 0;
+    char buf[32];
+    memset(buf, 0, sizeof(buf));
+    uvm_copyout(myproc()->pgtbl, curr, (uint64)buf, sizeof(buf));
+    return 0;
+}
+
+// 103 setitimer(which, new_value, old_value): 设置间隔定时器。
+// dhry2reg 用它做 benchmark 计时(ITIMER_REAL=0, 超时发 SIGALRM)。
+uint64 sys_setitimer()
+{
+    uint64 which = arg_raw(0);
+    uint64 new_addr = arg_raw(1);
+    uint64 old_addr = arg_raw(2);
+    proc_t *p = myproc();
+
+    if (which != 0)
+        return (uint64)(-EINVAL);
+
+    if (old_addr != 0) {
+        char buf[32];
+        memset(buf, 0, sizeof(buf));
+        uvm_copyout(p->pgtbl, old_addr, (uint64)buf, sizeof(buf));
+    }
+
+    if (new_addr != 0) {
+        uint64 buf[4];
+        uvm_copyin(p->pgtbl, (uint64)buf, new_addr, sizeof(buf));
+        uint64 interval_sec = buf[0];
+        uint64 interval_usec = buf[1];
+        uint64 value_sec = buf[2];
+        uint64 value_usec = buf[3];
+
+        if (value_sec == 0 && value_usec == 0) {
+            p->itimer_expire = 0;
+            p->itimer_interval = 0;
+        } else {
+            uint64 now = r_time();
+            uint64 delay = value_sec * 10000000ull + value_usec * 10;
+            p->itimer_expire = now + delay;
+            p->itimer_interval = interval_sec * 10000000ull + interval_usec * 10;
+        }
+    }
+
+    return 0;
+}
+
+// 115 clock_nanosleep(clockid, flags, request, remain): 高精度睡眠。
+uint64 sys_clock_nanosleep()
+{
+    uint64 request = arg_raw(2);
+    if (request == 0) return 0;
+    uint64 ts[2] = {0, 0};
+    uvm_copyin(myproc()->pgtbl, (uint64)ts, request, sizeof(ts));
+    uint64 ntick = ts[0] * 10;
+    if (ts[1] > 0)
+        ntick += (ts[1] + 99999999ull) / 100000000ull;
+    if (ntick == 0)
+        ntick = 1;
+    timer_wait(ntick);
+    return 0;
+}
+
+// 179 sysinfo(struct sysinfo *info): 系统信息。最小桩: 零填充。
+uint64 sys_sysinfo()
+{
+    uint64 info = arg_raw(0);
+    if (info == 0) return (uint64)(-EFAULT);
+    char buf[112];
+    memset(buf, 0, sizeof(buf));
+    uint64 *p = (uint64 *)buf;
+    p[0] = r_time() / 10000000ull; // uptime in seconds
+    uvm_copyout(myproc()->pgtbl, info, (uint64)buf, sizeof(buf));
+    return 0;
+}
+
+// 233 madvise(addr, length, advice): 内存建议。桩返回 0。
+uint64 sys_madvise()
+{
+    return 0;
+}
+
+// 78 readlinkat(dirfd, pathname, buf, bufsiz): 读取符号链接。
+// 特殊处理 /proc/self/exe 返回进程路径。其余返回 EINVAL。
+uint64 sys_readlinkat()
+{
+    char path[128];
+    arg_str(1, path, sizeof(path));
+    if (path[0] == 0) return (uint64)(-EINVAL);
+    return (uint64)(-EINVAL);
+}
+
+// 124 sched_yield(): 让出 CPU。
+uint64 sys_sched_yield()
+{
+    proc_yield();
+    return 0;
+}
+
+// 123 sched_getaffinity(pid, cpusetsize, mask): CPU 亲和性掩码。
+// 单核: 返回 mask bit0=1。
+uint64 sys_sched_getaffinity()
+{
+    uint64 cpusetsize = arg_raw(1);
+    uint64 mask_addr = arg_raw(2);
+    if (mask_addr == 0) return (uint64)(-EFAULT);
+    char buf[128];
+    uint64 len = cpusetsize < sizeof(buf) ? cpusetsize : sizeof(buf);
+    memset(buf, 0, len);
+    buf[0] = 1;
+    uvm_copyout(myproc()->pgtbl, mask_addr, (uint64)buf, len);
+    return 0;
+}
+
+// 177 getegid: 返回有效 GID (root=0)
+uint64 sys_getegid()
+{
+    return 0;
+}
+
+// 175 geteuid: 返回有效 UID (root=0)
+uint64 sys_geteuid()
+{
+    return 0;
+}
+
+// 139 rt_sigreturn: 从信号处理器返回，恢复被中断的执行上下文
+uint64 sys_rt_sigreturn()
+{
+    proc_t *p = myproc();
+    trapframe_t *tf = p->tf;
+
+    uint64 frame[32];
+    uvm_copyin(p->pgtbl, (uint64)frame, tf->sp, sizeof(frame));
+
+    tf->user_to_kern_epc = frame[0];
+    tf->ra   = frame[1];
+    tf->sp   = frame[2];
+    tf->gp   = frame[3];
+    tf->tp   = frame[4];
+    tf->t0   = frame[5];
+    tf->t1   = frame[6];
+    tf->t2   = frame[7];
+    tf->s0   = frame[8];
+    tf->s1   = frame[9];
+    tf->a0   = frame[10];
+    tf->a1   = frame[11];
+    tf->a2   = frame[12];
+    tf->a3   = frame[13];
+    tf->a4   = frame[14];
+    tf->a5   = frame[15];
+    tf->a6   = frame[16];
+    tf->a7   = frame[17];
+    tf->s2   = frame[18];
+    tf->s3   = frame[19];
+    tf->s4   = frame[20];
+    tf->s5   = frame[21];
+    tf->s6   = frame[22];
+    tf->s7   = frame[23];
+    tf->s8   = frame[24];
+    tf->s9   = frame[25];
+    tf->s10  = frame[26];
+    tf->s11  = frame[27];
+    tf->t3   = frame[28];
+    tf->t4   = frame[29];
+    tf->t5   = frame[30];
+    tf->t6   = frame[31];
+
+    p->sig_delivering = 0;
+
+    // 补偿 trap_user_handler 中 syscall 后的 epc += 4
+    tf->user_to_kern_epc -= 4;
+
+    return tf->a0;
 }

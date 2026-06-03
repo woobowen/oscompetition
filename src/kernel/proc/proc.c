@@ -223,6 +223,15 @@ proc_t *proc_alloc()
             p->kstack = (uint64)KSTACK(i);
             p->ctx.ra = (uint64)proc_return; // 切入到该进程时，从这里返回到用户态入口
             p->ctx.sp = p->kstack + 2 * PGSIZE;
+
+            // Signal 初始化
+            memset(p->sig_handler, 0, sizeof(p->sig_handler));
+            p->sig_restorer = 0;
+            p->sig_pending = 0;
+            p->sig_delivering = 0;
+            p->itimer_expire = 0;
+            p->itimer_interval = 0;
+
             return p; // 保持锁定返回
         }else{
             spinlock_release(&p->lk);
@@ -310,6 +319,14 @@ void proc_free(proc_t *p)
     p->sched_preempt_higher = 0;
     p->sched_yield_voluntary = 0;
     p->sched_sleep_count = 0;
+
+    // Signal 清理
+    memset(p->sig_handler, 0, sizeof(p->sig_handler));
+    p->sig_restorer = 0;
+    p->sig_pending = 0;
+    p->sig_delivering = 0;
+    p->itimer_expire = 0;
+    p->itimer_interval = 0;
 
     p->state = UNUSED;
 }
@@ -470,6 +487,14 @@ int proc_fork()
             child->open_file[i] = NULL;
         }
     }
+
+    // 继承信号处理器
+    memcpy(child->sig_handler, parent->sig_handler, sizeof(parent->sig_handler));
+    child->sig_restorer = parent->sig_restorer;
+    child->sig_pending = 0;
+    child->sig_delivering = 0;
+    child->itimer_expire = 0;
+    child->itimer_interval = 0;
     // 继承cwd
     if (parent->cwd) {
         child->cwd = inode_dup(parent->cwd);

@@ -163,6 +163,18 @@ void timer_interrupt_handler()
     if (p && p->state == RUNNING)
         p->sched_cpu_ticks++;
 
+    // ITIMER_REAL 到期检查：若定时器已到期则标记 SIGALRM 待投递
+    if (p && p->state == RUNNING && p->itimer_expire != 0) {
+        uint64 now = r_time();
+        if (now >= p->itimer_expire) {
+            p->sig_pending |= (1UL << (SIGALRM - 1));
+            if (p->itimer_interval != 0)
+                p->itimer_expire = now + p->itimer_interval;
+            else
+                p->itimer_expire = 0;
+        }
+    }
+
     // 打印tick信息（调试）
     // uint64 ticks = timer_get_ticks();
     // if (ticks % 10 == 0) {

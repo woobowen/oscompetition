@@ -34,3 +34,24 @@
 ## D6（2026-06-03）mprotect (226) 桩实现
 - 决策：直接返回 0，不做任何页表权限修改。
 - 理由：动态链接器自重定位时调用 mprotect 修改段权限；由于 D4 已用 RWX 映射所有段，权限实际已满足，桩即可。
+
+## D7（2026-06-04）mmap (222) len 自动 page 对齐
+- 决策：`sys_mmap` 对非页对齐的 `len` 参数自动向上对齐：`aligned_len = (len + PGSIZE - 1) & ~(PGSIZE - 1)`；同时将 `len` 类型从 `uint32` 改为 `uint64`（超过 4GB 映射场景安全）。
+- 理由：Linux 内核 mmap(2) 规范明确说明 length 会自动向上对齐到页边界。musl 的 `__init_tp`（TLS 初始化）调用 `mmap(NULL, tls_size, ...)` 时 `tls_size` 不一定对齐，原内核直接返回 -1 导致 `tp = -1`，后续 `*(tp - 0x6F8)` = `0xfffffffffffff908` 触发 store page fault，所有 musl 测试崩溃于 sepc=0x1048a8。
+- 代价：多分配 < 1 页内存（可接受）；start=0 时 `start % PGSIZE != 0` 检查保留 `start != 0` 守卫，避免误拒内核选址请求。
+
+## D8（2026-06-04）用户态非法访问 panic → proc_exit(-11)
+- 决策：`trap_user.c` 的异常 default 分支和 `uvm_ustack_grow` 失败时，改为 `proc_exit(-11)`（SIGSEGV 语义），不再 `panic`。
+- 理由：用户程序 bug 不应拉垮整个内核；`proc_exit` 让进程终止、父进程 wait 回收，后续测试可继续运行。原 panic 会导致评测在第一个出错测试处停止，无法评估后续测试的通过情况。
+- 代价：非法访问变"静默失败"而非"硬停"，调试时需依赖 `[SEGV]` printf 日志定位。
+
+## D9（2026-06-04）信号系统最小实现（itimer → SIGALRM → 信号投递链）
+- 决策：实现完整的信号投递闭环：
+  1. `proc_t` 增加 `sig_handler[65]`、`sig_restorer`、`sig_pending`、`sig_delivering`、`itimer_expire`、`itimer_interval` 字段。
+  2. `sys_rt_sigaction` 读取 musl sigaction 结构（152B），存储 handler 和 restorer。
+  3. `sys_setitimer` 将 ITIMER_REAL 超时转换为 CLINT 到期时间写入 proc_t。
+  4. `timer_interrupt_handler` 检查 `p->itimer_expire`，到期时置 `sig_pending` SIGALRM bit 并重设 interval。
+  5. `trap_user_handler` 在返回用户态前检查 `sig_pending`，构建 256B signal frame（epc + 31 GP 寄存器）写入用户栈，重定向 tf 执行 handler。
+  6. `sys_rt_sigreturn` 从用户栈恢复 signal frame，epc -= 4 补偿 syscall 路径的 epc += 4。
+- 理由：dhry2reg 测试依赖 setitimer/SIGALRM 判断 10 秒计时结束；无信号投递则 dhry2reg 死循环，无法产出分数。
+- 代价：signal frame 仅保存 GP 寄存器（不含 FP/向量寄存器）；嵌套信号通过 `sig_delivering` 标志简单阻止（非 Linux 完整语义）。

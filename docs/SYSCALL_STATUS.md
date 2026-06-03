@@ -56,9 +56,32 @@
 ## 进行中 / 下一个
 | 号 | 名 | 状态 | 计划 |
 |---|---|---|---|
-| 99 | set_robust_list | 待实现 | 桩返回 0，musl 线程初始化调用 |
+| 99  | set_robust_list | 已实现 | 桩返回 0 |
+| 100 | get_robust_list | 已实现 | 桩返回 0 |
+| 102 | getitimer | 已实现 | 桩，零填充返回 |
+| 103 | setitimer | 已实现 | ITIMER_REAL 写 proc_t.itimer_expire/interval |
+| 115 | clock_nanosleep | 已实现 | 按 request 睡眠 |
+| 123 | sched_getaffinity | 已实现 | 单核 mask bit0=1 |
+| 124 | sched_yield | 已实现 | 调用 proc_yield |
+| 134 | rt_sigaction | 已实现 | 读 musl sigaction(152B)，存 handler/restorer |
+| 139 | rt_sigreturn | 已实现 | 从用户栈恢复 256B signal frame，清 sig_delivering |
+| 175 | geteuid | 已实现 | 返回 0 (root) |
+| 177 | getegid | 已实现 | 返回 0 |
+| 179 | sysinfo | 已实现 | 零填充 112B，uptime 填入 |
+| 233 | madvise | 已实现 | 桩返回 0 |
+| 78  | readlinkat | 已实现 | 桩返回 -EINVAL |
+| 29  | ioctl | 已实现 | 桩返回 -ENOTTY |
 
-## 已知缺口链
-> 跑 dhry2reg 评测暴露的缺口：
-- syscall 99 (set_robust_list)：musl 线程初始化调用，阻塞 dhry2reg 继续执行
-- 后续缺口待补 set_robust_list 后再次评测暴露
+## 进行中 / 下一个
+| 号 | 名 | 状态 | 计划 |
+|---|---|---|---|
+| 222 | mmap | len 对齐修复待验证 | 非页对齐 len 自动 round-up（已改代码，未重跑评测）|
+
+## 已知缺口链（2026-06-04 评测结果）
+- **musl 脚本通用崩溃**：`[SEGV] trap_id=15 sepc=0x1048a8 stval=0xfffffffffffff908`
+  - 根因：mmap 拒绝非对齐 len → musl tp=-1 → TLS 访问无效地址
+  - 修复代码已写入 sys_mmap，待重跑评测确认
+- **glibc 脚本通用崩溃**：`[SEGV] trap_id=13 sepc=0xd10b0 stval=0xfffffffffffffeb8`
+  - 类似 TLS 初始化问题，mmap 修复后可能同步解决
+- **多个 .sh 脚本 ELF 头解析失败**：文件内容为纯文本 shell 脚本，需要 shebang 解析或通过 shell 解释器执行
+  - cyclictest/netperf/iperf/libcbench/libctest/iozone/lua/basic 等均受影响

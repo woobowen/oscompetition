@@ -28,6 +28,7 @@
 #define SYS_unlink 35            // Linux/RISC-V unlinkat
 #define SYS_newfstatat 79        // Linux/RISC-V newfstatat (按路径 stat)
 #define SYS_rt_sigprocmask 135   // 信号屏蔽 (暂桩)
+#define SYS_rt_sigreturn 139     // Linux/RISC-V rt_sigreturn
 #define SYS_setgid 144           // 暂桩返回 0
 #define SYS_setuid 146           // 暂桩返回 0
 #define SYS_getuid 174           // 返回 0 (root)
@@ -47,6 +48,19 @@
 #define SYS_umask 166            // Linux/RISC-V umask (桩, 返回0)
 #define SYS_dup3 24              // Linux/RISC-V dup3
 #define SYS_mprotect 226         // Linux/RISC-V mprotect
+#define SYS_ioctl 29             // Linux/RISC-V ioctl
+#define SYS_set_robust_list 99   // Linux/RISC-V set_robust_list
+#define SYS_get_robust_list 100  // Linux/RISC-V get_robust_list
+#define SYS_getitimer 102        // Linux/RISC-V getitimer
+#define SYS_setitimer 103        // Linux/RISC-V setitimer
+#define SYS_clock_nanosleep 115  // Linux/RISC-V clock_nanosleep
+#define SYS_sysinfo 179          // Linux/RISC-V sysinfo
+#define SYS_madvise 233          // Linux/RISC-V madvise
+#define SYS_readlinkat 78        // Linux/RISC-V readlinkat
+#define SYS_sched_yield 124      // Linux/RISC-V sched_yield
+#define SYS_sched_getaffinity 123 // Linux/RISC-V sched_getaffinity
+#define SYS_getegid 177          // Linux/RISC-V getegid
+#define SYS_geteuid 175          // Linux/RISC-V geteuid
 
 #define SYS_schedstat 500        // SeaOS 私有: 拉取调度统计快照
 #define SYS_spawn     501        // SeaOS 私有: fork+exec+wait 串行执行程序

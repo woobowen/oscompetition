@@ -55,29 +55,84 @@ void trap_user_handler()
             case 8: // Environment call from U-mode (ecall)
             {
                 syscall();
-                tf->user_to_kern_epc += 4; // 系统调用返回时,PC=sepc + 4（类似中断）
+                tf = p->tf; // exec 可能替换 trapframe，刷新指针
+                tf->user_to_kern_epc += 4;
                 break;
             }
+            case 12:
             case 13:
             case 15:
             {
                 if (uvm_ustack_grow(p->pgtbl, p->ustack_npage, r_stval()) == (uint64)-1) {
-                    printf("!!! PANIC INFO !!!\n");
-                    printf("scause = %p (trap_id = %d)\n", scause, trap_id);
-                    printf("sepc   = %p\n", sepc);
-                    printf("stval  = %p\n", r_stval());
-                    printf("user sp=%p a0=%p a1=%p ra=%p\n", (void*)tf->sp, (void*)tf->a0, (void*)tf->a1, (void*)tf->ra);
-                    panic("trap_user_handler: bad user memory access (not stack growth)");
+                    printf("[SEGV] pid=%d trap_id=%d sepc=%p stval=%p sp=%p\n",
+                           p->pid, trap_id, sepc, r_stval(), (void*)tf->sp);
+                    proc_exit(-11);
                 }
                 break;
             }
-            //! 其余异常类型暂时不处理，直接报错并输出信息
             default:
-                printf("!!! PANIC INFO !!!\n");
-                printf("scause = %p (trap_id = %d)\n", scause, trap_id);
-                printf("sepc   = %p\n", sepc);
-                printf("stval  = %p\n", r_stval());
-                panic("trap_user_handler: unknown exception");
+            {
+                printf("[SEGV] pid=%d trap_id=%d sepc=%p stval=%p\n",
+                       p->pid, trap_id, sepc, r_stval());
+                proc_exit(-11);
+            }
+        }
+    }
+
+    // 信号投递: 返回用户态前检查是否有待投递信号
+    if (p->sig_pending != 0 && !p->sig_delivering) {
+        for (int sig = 1; sig <= NSIG; sig++) {
+            if (!(p->sig_pending & (1UL << (sig - 1))))
+                continue;
+            if (p->sig_handler[sig] <= 1)
+                continue;
+
+            p->sig_pending &= ~(1UL << (sig - 1));
+            p->sig_delivering = 1;
+
+            uint64 frame[32];
+            frame[0]  = tf->user_to_kern_epc;
+            frame[1]  = tf->ra;
+            frame[2]  = tf->sp;
+            frame[3]  = tf->gp;
+            frame[4]  = tf->tp;
+            frame[5]  = tf->t0;
+            frame[6]  = tf->t1;
+            frame[7]  = tf->t2;
+            frame[8]  = tf->s0;
+            frame[9]  = tf->s1;
+            frame[10] = tf->a0;
+            frame[11] = tf->a1;
+            frame[12] = tf->a2;
+            frame[13] = tf->a3;
+            frame[14] = tf->a4;
+            frame[15] = tf->a5;
+            frame[16] = tf->a6;
+            frame[17] = tf->a7;
+            frame[18] = tf->s2;
+            frame[19] = tf->s3;
+            frame[20] = tf->s4;
+            frame[21] = tf->s5;
+            frame[22] = tf->s6;
+            frame[23] = tf->s7;
+            frame[24] = tf->s8;
+            frame[25] = tf->s9;
+            frame[26] = tf->s10;
+            frame[27] = tf->s11;
+            frame[28] = tf->t3;
+            frame[29] = tf->t4;
+            frame[30] = tf->t5;
+            frame[31] = tf->t6;
+
+            uint64 new_sp = (tf->sp - 256) & ~0xFUL;
+            uvm_copyout(p->pgtbl, new_sp, (uint64)frame, sizeof(frame));
+
+            tf->user_to_kern_epc = p->sig_handler[sig];
+            tf->a0 = (uint64)sig;
+            tf->sp = new_sp;
+            tf->ra = p->sig_restorer;
+
+            break;
         }
     }
 

@@ -560,8 +560,16 @@ int proc_exec(char *path, char **argv)
     p->pgtbl = new_pgtbl;
     p->tf = new_tf;
     p->heap_top = new_heap_top;
-    p->ustack_npage = 1;     
+    p->ustack_npage = 1;
     p->mmap = NULL;
+
+    // exec 时重置信号状态
+    memset(p->sig_handler, 0, sizeof(p->sig_handler));
+    p->sig_restorer = 0;
+    p->sig_pending = 0;
+    p->sig_delivering = 0;
+    p->itimer_expire = 0;
+    p->itimer_interval = 0;
     int i;
     for(i = 0; i < sizeof(p->name) - 1 && path[i] != '\0'; i++){
         p->name[i] = path[i];

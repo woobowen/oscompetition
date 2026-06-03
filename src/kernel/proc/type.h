@@ -103,6 +103,11 @@ enum proc_state
 // 单个进程最多打开N_OPEN_FILE_PER_PROC个文件
 #define N_OPEN_FILE_PER_PROC 32
 
+// Signal
+#define NSIG        64
+#define SIGALRM     14
+#define SA_RESTORER 0x04000000
+
 #define PROC_NAME_LEN 16
 
 // 进程
@@ -172,6 +177,15 @@ typedef struct proc
 
     inode_t *cwd;          // 工作目录
     file_t *open_file[N_OPEN_FILE_PER_PROC]; // 打开文件表
+
+    // Signal
+    uint64 sig_handler[NSIG + 1]; // 信号处理器地址 (1..64), 0=SIG_DFL, 1=SIG_IGN
+    uint64 sig_restorer;          // musl 设置的 sa_restorer (调用 rt_sigreturn)
+    uint64 sig_pending;           // 待投递信号位图 (bit N-1 = signal N)
+    uint8  sig_delivering;        // 正在投递信号中(防嵌套)
+    // ITIMER_REAL
+    uint64 itimer_expire;         // 到期时的 CLINT 时间 (0=未激活)
+    uint64 itimer_interval;       // 重复间隔 (CLINT ticks, 0=单次)
 
 } proc_t;
 
