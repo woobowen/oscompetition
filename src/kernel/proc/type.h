@@ -101,7 +101,7 @@ enum proc_state
 #define MLFQ_MKV_STATES 9
 
 // 单个进程最多打开N_OPEN_FILE_PER_PROC个文件
-#define N_OPEN_FILE_PER_PROC 10
+#define N_OPEN_FILE_PER_PROC 32
 
 #define PROC_NAME_LEN 16
 

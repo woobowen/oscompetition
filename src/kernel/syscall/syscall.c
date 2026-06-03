@@ -44,6 +44,8 @@ static uint64 (*syscalls[])(void) = {
     [SYS_gettimeofday] sys_gettimeofday,
     [SYS_pipe2] sys_pipe2,
     [SYS_umask] sys_umask,
+    [SYS_dup3] sys_dup3,
+    [SYS_mprotect] sys_mprotect,
     [SYS_schedstat] sys_schedstat,
     [SYS_spawn] sys_spawn,
     [SYS_shutdown] sys_shutdown,

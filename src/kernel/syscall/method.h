@@ -52,6 +52,8 @@ uint64 sys_gettimeofday();
 uint64 sys_getrusage();
 uint64 sys_pipe2();
 uint64 sys_umask();
+uint64 sys_dup3();
+uint64 sys_mprotect();
 uint64 sys_schedstat();
 uint64 sys_spawn();
 uint64 sys_shutdown();

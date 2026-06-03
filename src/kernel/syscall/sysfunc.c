@@ -549,6 +549,43 @@ uint64 sys_dup()
 }
 
 /*
+    dup3(oldfd, newfd, flags)
+    复制 oldfd 到指定的 newfd, 若 newfd 已打开则先关闭
+    flags 忽略 (O_CLOEXEC 暂不实现)
+    成功返回 newfd, 失败返回 -EBADF/-EINVAL
+*/
+uint64 sys_dup3()
+{
+    uint32 oldfd = (uint32)arg_raw(0);
+    uint32 newfd = (uint32)arg_raw(1);
+
+    proc_t *p = myproc();
+    if (oldfd >= N_OPEN_FILE_PER_PROC || p->open_file[oldfd] == NULL)
+        return (uint64)(-EBADF);
+    if (newfd >= N_OPEN_FILE_PER_PROC)
+        return (uint64)(-EBADF);
+    if (oldfd == newfd)
+        return (uint64)(-EINVAL);
+
+    if (p->open_file[newfd] != NULL) {
+        file_close(p->open_file[newfd]);
+        p->open_file[newfd] = NULL;
+    }
+
+    p->open_file[newfd] = file_dup(p->open_file[oldfd]);
+    return newfd;
+}
+
+/*
+    mprotect(addr, len, prot) — 桩实现, 总是成功
+    动态链接器自重定位时调用, 因为解释器段以 RWX 加载所以安全
+*/
+uint64 sys_mprotect()
+{
+    return 0;
+}
+
+/*
     获取文件信息
     uint32 fd
     uint64 addr

@@ -1,5 +1,34 @@
 #include "mod.h"
 
+/* Linux auxv 类型(最小集) */
+#define AT_NULL    0
+#define AT_PHDR    3
+#define AT_PHENT   4
+#define AT_PHNUM   5
+#define AT_PAGESZ  6
+#define AT_BASE    7
+#define AT_ENTRY   9
+#define AT_UID     11
+#define AT_EUID    12
+#define AT_GID     13
+#define AT_EGID    14
+#define AT_RANDOM  25
+
+#define ELF_PT_INTERP 3
+#define ELF_PT_PHDR   6
+
+#define INTERP_LOAD_BASE 0x40000000UL
+
+typedef struct {
+    uint64 phdr_addr;
+    uint16 phnum;
+    uint16 phent;
+    uint64 entry;
+    uint64 interp_base;
+    uint64 interp_entry;
+    char   interp_path[128];
+} exec_info_t;
+
 /*
     将ELF文件中的segment放入内存中制定位置
     inode逻辑区域: [seg_start, seg_start + len)
@@ -29,68 +58,76 @@ static void load_segment(inode_t *ip, pgtbl_t pgtbl,
 }
 
 /* 将程序的代码区和数据区读入用户堆中, 返回new_heap_top */
-static uint64 prepare_heap(pgtbl_t new_pgtbl, inode_t *ip, elf_header_t *eh)
+static uint64 prepare_heap(pgtbl_t new_pgtbl, inode_t *ip, elf_header_t *eh, exec_info_t *info)
 {
     program_header_t ph;
     uint64 new_heap_top = USER_BASE, old_heap_top = USER_BASE;
-    
+
+    info->phdr_addr = 0;
+    info->phnum = eh->ph_ent_num;
+    info->phent = sizeof(program_header_t);
+    info->interp_path[0] = '\0';
+
     for (uint32 off = eh->ph_off; off < eh->ph_off + eh->ph_ent_num * sizeof(ph); off += sizeof(ph))
     {
-        // 读入一个program header
         if (inode_read_data(ip, off, sizeof(ph), &ph, false) != sizeof(ph))
             return -1;
-         // debug: 打印 program header 信息
          printf("proc_prepare_heap: ph_idx=%d type=%d va=%p off=%p file_size=%p mem_size=%p flags=0x%x\n",
              (int)((off - eh->ph_off) / sizeof(ph)), ph.type,
              (void*)ph.va, (void*)ph.off,
              (void*)ph.file_size, (void*)ph.mem_size, ph.flags);
-        
-        // 判断是否有必要载入
+
+        if (ph.type == ELF_PT_PHDR) {
+            info->phdr_addr = ph.va;
+            continue;
+        }
+
+        if (ph.type == ELF_PT_INTERP) {
+            uint32 path_len = ph.file_size < 127 ? (uint32)ph.file_size : 127;
+            if (inode_read_data(ip, (uint32)ph.off, path_len, info->interp_path, false) != path_len)
+                return -1;
+            info->interp_path[path_len] = '\0';
+            if (path_len > 0 && info->interp_path[path_len - 1] == '\n')
+                info->interp_path[path_len - 1] = '\0';
+            continue;
+        }
+
         if (ph.type != ELF_PROG_LOAD)
             continue;
-        
-        // program header参数的合法性检查
+
         if (ph.mem_size < ph.file_size)
             return -1;
         if (ph.va + ph.mem_size < ph.va)
             return -1;
-        // Ensure the segment lies in user address space and not overlapping kernel/trampoline
         if (ph.va < USER_BASE || ph.va + ph.mem_size > MMAP_BEGIN) {
             printf("proc_prepare_heap: ph_idx=%d va %p mem_size %p out of user range\n",
                    (int)((off - eh->ph_off) / sizeof(ph)), (void*)ph.va, (void*)ph.mem_size);
             return -1;
         }
-        
-        //! 用户堆生长
+
         uint32 perm = PTE_U;
         if(ph.flags & ELF_PROG_FLAG_READ) perm |= PTE_R;
         if(ph.flags & ELF_PROG_FLAG_WRITE) perm |= PTE_W;
         if(ph.flags & ELF_PROG_FLAG_EXEC) perm |= PTE_X;
 
         new_heap_top = uvm_heap_grow(new_pgtbl, old_heap_top,
-                        ph.va + ph.mem_size - old_heap_top, perm);//! 更灵活的权限设置
+                        ph.va + ph.mem_size - old_heap_top, perm);
         if (new_heap_top != ph.va + ph.mem_size)
             return -1;
         old_heap_top = new_heap_top;
 
-        // segment读入
         load_segment(ip, new_pgtbl, ph.off, ph.va, ph.file_size);
     }
 
     return new_heap_top;
 }
 
-/* Linux auxv 类型(最小集) */
-#define AT_NULL    0
-#define AT_PAGESZ  6
-#define AT_RANDOM  25
-
 /* 准备栈空间用于存储输入参数(4KB), 设置arg_count, 返回sp */
-static uint64 prepare_stack(pgtbl_t new_pgtbl, char **argv, int *arg_count)
+static uint64 prepare_stack(pgtbl_t new_pgtbl, char **argv, int *arg_count, exec_info_t *info)
 {
     uint64 ustack_page;
     uint64 sp = TRAPFRAME, sp_base = TRAPFRAME - PGSIZE;
-    uint64 argv_addr[ELF_MAXARGS + 1];   // 各 arg 字符串在用户栈中的地址
+    uint64 argv_addr[ELF_MAXARGS + 1];
     uint32 argc, arg_len;
 
     ustack_page = (uint64)pmem_alloc(false);
@@ -99,7 +136,6 @@ static uint64 prepare_stack(pgtbl_t new_pgtbl, char **argv, int *arg_count)
     memset((void *)ustack_page, 0, PGSIZE);
     vm_mappages(new_pgtbl, sp_base, ustack_page, PGSIZE, PTE_R | PTE_W | PTE_U);
 
-    // 1) 压入参数字符串(高地址), 记录每个串的用户地址
     for (argc = 0; argv[argc] != NULL; argc++) {
         if (argc >= ELF_MAXARGS)
             return -1;
@@ -110,36 +146,115 @@ static uint64 prepare_stack(pgtbl_t new_pgtbl, char **argv, int *arg_count)
         uvm_copyout(new_pgtbl, sp, (uint64)argv[argc], arg_len);
         argv_addr[argc] = sp;
     }
-    argv_addr[argc] = 0;   // argv NULL 终止(值)
+    argv_addr[argc] = 0;
 
-    // 2) 压入 16 字节给 AT_RANDOM(musl 用于栈 canary/TLS)
     sp -= 16;
     sp &= ~15UL;
     if (sp < sp_base)
         return -1;
-    uint64 at_random_addr = sp;   // 内容为页内已清零的 16 字节即可
+    uint64 at_random_addr = sp;
 
-    // 3) 在内核侧拼出低端块: [argc][argv ptrs..][NULL][envp NULL][auxv: PAGESZ,RANDOM,NULL]
-    //    envp 取空(仅一个 NULL)
-    uint64 buf[1 + (ELF_MAXARGS + 1) + 1 + 6];
+    uint64 buf[1 + (ELF_MAXARGS + 1) + 1 + 26];
     int idx = 0;
-    buf[idx++] = argc;                          // argc
-    for (uint32 i = 0; i <= argc; i++)          // argv[0..argc-1], 末尾 NULL(=0)
+    buf[idx++] = argc;
+    for (uint32 i = 0; i <= argc; i++)
         buf[idx++] = argv_addr[i];
-    buf[idx++] = 0;                             // envp 的 NULL
-    buf[idx++] = AT_PAGESZ; buf[idx++] = PGSIZE;
-    buf[idx++] = AT_RANDOM; buf[idx++] = at_random_addr;
-    buf[idx++] = AT_NULL;   buf[idx++] = 0;
+    buf[idx++] = 0;                             // envp NULL
+
+    if (info->phdr_addr != 0) {
+        buf[idx++] = AT_PHDR;    buf[idx++] = info->phdr_addr;
+        buf[idx++] = AT_PHENT;   buf[idx++] = info->phent;
+        buf[idx++] = AT_PHNUM;   buf[idx++] = info->phnum;
+    }
+    buf[idx++] = AT_PAGESZ;  buf[idx++] = PGSIZE;
+    if (info->interp_base != 0) {
+        buf[idx++] = AT_BASE;    buf[idx++] = info->interp_base;
+    }
+    if (info->entry != 0) {
+        buf[idx++] = AT_ENTRY;   buf[idx++] = info->entry;
+    }
+    buf[idx++] = AT_UID;     buf[idx++] = 0;
+    buf[idx++] = AT_EUID;    buf[idx++] = 0;
+    buf[idx++] = AT_GID;     buf[idx++] = 0;
+    buf[idx++] = AT_EGID;    buf[idx++] = 0;
+    buf[idx++] = AT_RANDOM;  buf[idx++] = at_random_addr;
+    buf[idx++] = AT_NULL;    buf[idx++] = 0;
 
     uint64 bytes = (uint64)idx * sizeof(uint64);
     sp -= bytes;
-    sp &= ~15UL;                                // 入口 sp 需 16 字节对齐
+    sp &= ~15UL;
     if (sp < sp_base)
         return -1;
     uvm_copyout(new_pgtbl, sp, (uint64)buf, bytes);
 
     *arg_count = argc;
-    return sp;     // sp 指向 argc
+    return sp;
+}
+
+/* 加载 ELF 动态链接器到 base 偏移处, 返回入口地址; 失败返回 -1 */
+static uint64 load_interp(pgtbl_t pgtbl, char *interp_path, uint64 base)
+{
+    static const char *fallbacks[] = {
+        "/musl/lib/libc.so",
+        "/lib/libc.so",
+        "/lib/ld-musl-riscv64-sf.so.1",
+        "/musl/lib/ld-musl-riscv64-sf.so.1",
+    };
+
+    inode_t *ip = path_to_inode(interp_path);
+    if (!ip) {
+        for (int i = 0; i < 4; i++) {
+            ip = path_to_inode((char*)fallbacks[i]);
+            if (ip) break;
+        }
+        if (!ip) {
+            printf("load_interp: cannot find interpreter (tried %s + fallbacks)\n", interp_path);
+            return -1;
+        }
+    }
+
+    elf_header_t eh;
+    if (inode_read_data(ip, 0, sizeof(eh), &eh, false) != sizeof(eh) || eh.magic != ELF_MAGIC) {
+        inode_put(ip);
+        printf("load_interp: %s not a valid ELF\n", interp_path);
+        return -1;
+    }
+
+    program_header_t ph;
+    for (uint32 off = eh.ph_off; off < eh.ph_off + eh.ph_ent_num * sizeof(ph); off += sizeof(ph)) {
+        if (inode_read_data(ip, off, sizeof(ph), &ph, false) != sizeof(ph)) {
+            inode_put(ip);
+            return -1;
+        }
+        if (ph.type != ELF_PROG_LOAD)
+            continue;
+        if (ph.mem_size < ph.file_size) {
+            inode_put(ip);
+            return -1;
+        }
+
+        uint64 seg_va = base + ph.va;
+        uint64 page_start = (seg_va / PGSIZE) * PGSIZE;
+        uint64 page_end = ((seg_va + ph.mem_size + PGSIZE - 1) / PGSIZE) * PGSIZE;
+
+        for (uint64 va = page_start; va < page_end; va += PGSIZE) {
+            pte_t *pte = vm_getpte(pgtbl, va, false);
+            if (pte && (*pte & PTE_V))
+                continue;
+            void *pa = pmem_alloc(false);
+            if (!pa) {
+                inode_put(ip);
+                return -1;
+            }
+            memset(pa, 0, PGSIZE);
+            vm_mappages(pgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W | PTE_X | PTE_U);
+        }
+
+        load_segment(ip, pgtbl, ph.off, seg_va, ph.file_size);
+    }
+
+    inode_put(ip);
+    return base + eh.entry;
 }
 
 static int is_script_path(const char *path)
@@ -385,31 +500,47 @@ int proc_exec(char *path, char **argv)
     }
     
     // step-3: 按照顺序读取需要载入内存的Segment, 填充到用户堆区域
-    uint64 new_heap_top = prepare_heap(new_pgtbl, ip, &eh);
+    exec_info_t dyn;
+    memset(&dyn, 0, sizeof(dyn));
+    uint64 new_heap_top = prepare_heap(new_pgtbl, ip, &eh, &dyn);
     if (new_heap_top == -1) {
         inode_put(ip);
-        // pmem_free((uint64)new_tf, false); 【修复】
         uvm_destroy_pgtbl(new_pgtbl);
         printf("proc_exec: pid=%d prepare_heap failed\n", p ? p->pid : -1);
         return -1;
     }
-    
+
     // step-4: 释放ELF的inode
     inode_put(ip);
-    
+
+    // step-4b: 如果有动态链接器, 加载它
+    dyn.entry = eh.entry;
+    dyn.interp_base = 0;
+    dyn.interp_entry = 0;
+    uint64 entry_pc = eh.entry;
+    if (dyn.interp_path[0] != '\0') {
+        uint64 ie = load_interp(new_pgtbl, dyn.interp_path, INTERP_LOAD_BASE);
+        if (ie == (uint64)-1) {
+            uvm_destroy_pgtbl(new_pgtbl);
+            printf("proc_exec: pid=%d load_interp failed\n", p ? p->pid : -1);
+            return -1;
+        }
+        dyn.interp_base = INTERP_LOAD_BASE;
+        dyn.interp_entry = ie;
+        entry_pc = ie;
+    }
+
     // step-5: 处理输入的参数列表argv, 填充到用户栈区域
     int argc;
-    uint64 sp = prepare_stack(new_pgtbl, argv, &argc);
+    uint64 sp = prepare_stack(new_pgtbl, argv, &argc, &dyn);
     if (sp == -1) {
-        // pmem_free((uint64)new_tf, false); 【修复】
         uvm_destroy_pgtbl(new_pgtbl);
         printf("proc_exec: pid=%d prepare_stack failed\n", p ? p->pid : -1);
         return -1;
     }
-    
+
     // step-6: 新的地址空间构建完毕, 释放旧资源
     uvm_destroy_pgtbl(p->pgtbl);
-    // pmem_free((uint64)p->tf, false); 【修复】
     if (p->mmap) {
         mmap_region_t *mmap = p->mmap;
         while (mmap) {
@@ -418,11 +549,11 @@ int proc_exec(char *path, char **argv)
             mmap = next;
         }
     }
-    
+
     // step-7: 设置trapframe的相关字段
-    new_tf->a0 = argc;       
-    new_tf->a1 = sp;        
-    new_tf->user_to_kern_epc = eh.entry;   
+    new_tf->a0 = argc;
+    new_tf->a1 = sp;
+    new_tf->user_to_kern_epc = entry_pc;
     new_tf->sp = sp;          
     
     // step-8: 更新进程的相关字段
@@ -532,7 +663,9 @@ int proc_exec_target(int pid, char *path, char **argv)
         goto exec_fail;
     }
 
-    uint64 new_heap_top = prepare_heap(new_pgtbl, ip, &eh);
+    exec_info_t dyn;
+    memset(&dyn, 0, sizeof(dyn));
+    uint64 new_heap_top = prepare_heap(new_pgtbl, ip, &eh, &dyn);
     if (new_heap_top == (uint64)-1) {
         inode_put(ip);
         uvm_destroy_pgtbl(new_pgtbl);
@@ -541,8 +674,24 @@ int proc_exec_target(int pid, char *path, char **argv)
 
     inode_put(ip);
 
+    dyn.entry = eh.entry;
+    dyn.interp_base = 0;
+    dyn.interp_entry = 0;
+    uint64 entry_pc = eh.entry;
+    if (dyn.interp_path[0] != '\0') {
+        uint64 ie = load_interp(new_pgtbl, dyn.interp_path, INTERP_LOAD_BASE);
+        if (ie == (uint64)-1) {
+            uvm_destroy_pgtbl(new_pgtbl);
+            printf("proc_exec_target: pid=%d load_interp failed\n", p->pid);
+            goto exec_fail;
+        }
+        dyn.interp_base = INTERP_LOAD_BASE;
+        dyn.interp_entry = ie;
+        entry_pc = ie;
+    }
+
     int argc;
-    uint64 sp = prepare_stack(new_pgtbl, argv, &argc);
+    uint64 sp = prepare_stack(new_pgtbl, argv, &argc, &dyn);
     if (sp == (uint64)-1) {
         uvm_destroy_pgtbl(new_pgtbl);
         goto exec_fail;
@@ -562,7 +711,7 @@ int proc_exec_target(int pid, char *path, char **argv)
     /* 设置trapframe与进程字段 */
     new_tf->a0 = argc;
     new_tf->a1 = sp;
-    new_tf->user_to_kern_epc = eh.entry;
+    new_tf->user_to_kern_epc = entry_pc;
     new_tf->sp = sp;
 
     p->pgtbl = new_pgtbl;

@@ -10,35 +10,55 @@
 | 4 | fork | SeaOS |
 | 17 | print_cwd | SeaOS 私有 |
 | 23 | dup | |
+| 24 | dup3 | 忽略 flags (O_CLOEXEC) |
+| 25 | fcntl | 最小实现 |
 | 34 | mkdir(at) | |
 | 35 | unlink(at) | |
 | 37 | link(at) | |
 | 49 | chdir | |
 | 56 | open(at) | |
 | 57 | close | |
+| 59 | pipe2 | 阻塞管道 |
 | 61 | getdents64 | |
 | 62 | lseek | |
 | 63 | read | |
 | 64 | write | |
+| 66 | writev | |
+| 79 | newfstatat | 按路径 stat |
 | 80 | fstat | |
 | 93 | exit | |
+| 94 | exit_group | 单线程下等价 exit |
 | 96 | set_tid_address | 返回 pid（D3 最小实现） |
 | 101 | nanosleep(兼容) | |
+| 113 | clock_gettime | |
+| 134 | rt_sigaction | 桩，返回 0 |
+| 135 | rt_sigprocmask | 桩，返回 0 |
+| 144 | setgid | 桩，返回 0 |
+| 146 | setuid | 桩，返回 0 |
+| 160 | uname | |
+| 165 | getrusage | 零填充桩 |
+| 166 | umask | 桩，返回 0 |
+| 169 | gettimeofday | |
 | 172 | getpid | |
+| 173 | getppid | |
+| 174 | getuid | 返回 0 (root) |
+| 176 | getgid | 返回 0 |
+| 178 | gettid | 单线程 = pid |
 | 214 | brk | |
 | 215 | munmap | |
-| 221 | execve | |
+| 220 | clone | musl fork 依赖 |
+| 221 | execve | 支持动态链接 ELF (D4) |
 | 222 | mmap | |
+| 226 | mprotect | 桩，返回 0 |
 | 260 | wait4 | |
 | 500/501/502 | schedstat/spawn/shutdown | SeaOS 私有 |
 
 ## 进行中 / 下一个
 | 号 | 名 | 状态 | 计划 |
 |---|---|---|---|
-| （待 docker 评测暴露） | | | |
+| 99 | set_robust_list | 待实现 | 桩返回 0，musl 线程初始化调用 |
 
-## 已知缺口链（待 docker 复跑后填充）
-> Spec #1 落地"未知 syscall 返回 -ENOSYS"后，跑 unixbench_testcode.sh，
-> 把日志里新出现的 `unknown syscall N` 逐个登记到这里，再按批补齐。
-
-（注：Docker 评测环境缓存问题导致无法获取新缺口链，需在真实评测环境中验证）
+## 已知缺口链
+> 跑 dhry2reg 评测暴露的缺口：
+- syscall 99 (set_robust_list)：musl 线程初始化调用，阻塞 dhry2reg 继续执行
+- 后续缺口待补 set_robust_list 后再次评测暴露
