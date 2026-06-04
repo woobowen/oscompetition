@@ -61,6 +61,9 @@
 #define SYS_sched_getaffinity 123 // Linux/RISC-V sched_getaffinity
 #define SYS_getegid 177          // Linux/RISC-V getegid
 #define SYS_geteuid 175          // Linux/RISC-V geteuid
+#define SYS_ppoll 73             // Linux/RISC-V ppoll
+#define SYS_sendfile 71          // Linux/RISC-V sendfile64
+#define SYS_sched_setscheduler 119  // Linux/RISC-V sched_setscheduler
 
 #define SYS_schedstat 500        // SeaOS 私有: 拉取调度统计快照
 #define SYS_spawn     501        // SeaOS 私有: fork+exec+wait 串行执行程序

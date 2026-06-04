@@ -10,13 +10,6 @@ void virtio_disk_init()
     spinlock_init(&disk.vdisk_lock, "virtio_disk");
 
     uint32 magic = *R(VIRTIO_MMIO_MAGIC_VALUE);
-    uint32 ver = *R(VIRTIO_MMIO_VERSION);
-    uint32 devid = *R(VIRTIO_MMIO_DEVICE_ID);
-    uint32 vendor = *R(VIRTIO_MMIO_VENDOR_ID);
-    // Always print MMIO header values to help debug mapping issues.
-    // Use hex formatting to ensure visibility on minimal printf implementations.
-    printf("virtio: mmio magic=0x%x ver=0x%x devid=0x%x vendor=0x%x base=0x%x\n",
-        magic, ver, devid, vendor, VIRTIO_BASE);
 
     // If not found at configured base, do a quick scan of likely MMIO region
     if (magic != 0x74726976) {
@@ -67,8 +60,6 @@ void virtio_disk_init()
     // initialize queue 0.
     *R(VIRTIO_MMIO_QUEUE_SEL) = 0;
     uint32 max = *R(VIRTIO_MMIO_QUEUE_NUM_MAX);
-    // Print queue info to help diagnose why device reports zero.
-    printf("virtio: queue_num_max=0x%x (reg_addr=0x%x)\n", max, (uint32)(VIRTIO_BASE + VIRTIO_MMIO_QUEUE_NUM_MAX));
     if (max == 0)
         panic("virtio disk has no queue 0");
     if (max < VIRTIO_NUM)

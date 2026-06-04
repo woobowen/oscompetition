@@ -342,7 +342,6 @@ void mlfq_on_new(proc_t *p)
 	mlfq_enqueue_locked_plocked(cpu, p, 0, true, false);
 	spinlock_release(&p->lk);
 	spinlock_release(&mlfq_rq[cpu].lk);
-	printf("mlfq_on_new: enqueued pid=%d cpu=%d\n", p->pid, cpu);
 }
 
 void mlfq_on_wakeup(proc_t *p)

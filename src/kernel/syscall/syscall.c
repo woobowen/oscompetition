@@ -60,10 +60,16 @@ static uint64 (*syscalls[])(void) = {
     [SYS_sched_getaffinity] sys_sched_getaffinity,
     [SYS_getegid] sys_getegid,
     [SYS_geteuid] sys_geteuid,
+    [SYS_ppoll] sys_ppoll,
+    [SYS_sendfile] sys_sendfile,
+    [SYS_sched_setscheduler] sys_sched_setscheduler,
     [SYS_schedstat] sys_schedstat,
     [SYS_spawn] sys_spawn,
     [SYS_shutdown] sys_shutdown,
 };
+
+// 每个未知 syscall 号只打印一次，避免 UART 洪水
+static uint8 warned[SYS_MAX_NUM + 1];
 
 // 基于系统调用表的请求跳转
 void syscall()
@@ -72,7 +78,10 @@ void syscall()
 
     int sys_num = p->tf->a7;
     if (sys_num < 0 || sys_num > SYS_MAX_NUM || syscalls[sys_num] == NULL) {
-        printf("unknown syscall %d from pid = %d -> return -ENOSYS\n", sys_num, p->pid);
+        if (sys_num >= 0 && sys_num <= SYS_MAX_NUM && !warned[sys_num]) {
+            warned[sys_num] = 1;
+            printf("unknown syscall %d from pid = %d\n", sys_num, p->pid);
+        }
         p->tf->a0 = (uint64)(-ENOSYS);
     } else {
         p->tf->a0 = syscalls[sys_num]();

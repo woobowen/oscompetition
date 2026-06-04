@@ -114,23 +114,17 @@ static void proc_return()
     proc_t *p = myproc();
 
     if (p->pid != 1) {
-        printf("proc_return: pid=%d a0=%d epc=%p\n", p->pid, (int)p->tf->a0, (void*)p->tf->user_to_kern_epc);
+//        printf("proc_return: pid=%d a0=%d epc=%p\n", p->pid, (int)p->tf->a0, (void*)p->tf->user_to_kern_epc);
     }
 
     spinlock_release(&p->lk); // 先释放锁
     // 如果是第一个进程(proczero)，则进行特殊初始化
     if (p->pid == 1) {
-        printf("proc_return: pid=1 entering fs_init\n");
-        // 初始化文件系统
         fs_init();
-        // 设置open_file: 打开stdin, stdout, stderr
         p->open_file[0] = file_open("/dev/stdin", FILE_OPEN_READ);
         p->open_file[1] = file_open("/dev/stdout", FILE_OPEN_WRITE);
         p->open_file[2] = file_open("/dev/stderr", FILE_OPEN_WRITE);
-        // 设置cwd为根目录
         p->cwd = inode_get(ext4_is_active() ? EXT4_ROOT_INO : ROOT_INODE);
-        printf("proc_return: pid=1 fs_init done, stdout=%p stdin=%p stderr=%p\n",
-            p->open_file[1], p->open_file[0], p->open_file[2]);
     }
 
     // 回到用户态
@@ -252,18 +246,10 @@ void proc_free(proc_t *p)
         p->pgtbl = NULL;
     }
 
-    // 释放open_file
-    for (int i = 0; i < N_OPEN_FILE_PER_PROC; i++) {
-        if (p->open_file[i]) {
-            file_close(p->open_file[i]);
-            p->open_file[i] = NULL;
-        }
-    }
-    // 释放cwd
-    if (p->cwd) {
-        inode_put(p->cwd);
-        p->cwd = NULL;
-    }
+    // open_file 和 cwd 已由 proc_exit 关闭，这里只做防御性清理
+    for (int i = 0; i < N_OPEN_FILE_PER_PROC; i++)
+        p->open_file[i] = NULL;
+    p->cwd = NULL;
 
     // 清空结构体并置为 UNUSED
     memset(p->name, 0, sizeof(p->name));
@@ -434,11 +420,8 @@ void proc_make_first()
     proczero = p;
     spinlock_release(&p->lk);
 
-    printf("proc_make_first: pid=1 enqueued on cpu %d\n", p->mlfq_cpu);
-
     // 入MLFQ就绪队列(避免持有 p->lk 时拿 mlfq 锁)
     mlfq_on_new(p);
-    printf("proc_make_first: mlfq_on_new done\n");
 }
 
 /*
@@ -458,7 +441,6 @@ int proc_fork()
     trapframe_t *tf = (trapframe_t *)pmem_alloc(false);
     if (!tf) { spinlock_release(&child->lk); return -1; }
     *tf = *parent->tf;
-    tf->user_to_kern_epc += 4;
     tf->a0=0;
 
     // 填充子进程结构体
@@ -643,10 +625,23 @@ static void proc_try_wakeup(proc_t *p)
 void proc_exit(int exit_code)
 {
     proc_t *p = myproc();
+
+    // 关闭所有打开的文件描述符（必须在获取进程锁前完成，因为 file_close 可能 sleep）
+    for (int i = 0; i < N_OPEN_FILE_PER_PROC; i++) {
+        if (p->open_file[i]) {
+            file_close(p->open_file[i]);
+            p->open_file[i] = NULL;
+        }
+    }
+    if (p->cwd) {
+        inode_put(p->cwd);
+        p->cwd = NULL;
+    }
+
     spinlock_acquire(&p->lk);
     p->exit_code = exit_code;
     // 将孩子过继给 proczero
-    proc_reparent(p); 
+    proc_reparent(p);
     // 标记为 ZOMBIE 并尝试唤醒父进程
     p->state = ZOMBIE;
     proc_try_wakeup(p);
@@ -655,12 +650,11 @@ void proc_exit(int exit_code)
 }
 
 /*
-    父进程等待一个子进程进入ZOMBIE状态
-    1. 如果等到: 释放子进程, 返回子进程的pid, 将子进程的退出状态传出到user_addr
-    2. 如果发现没孩子: 返回-1
-    3. 如果没等到: 父进程进入睡眠状态 
+    wait4(wait_pid, user_addr, wnohang)
+    wait_pid: -1=任意子进程, >0=等特定pid
+    wnohang: 1=非阻塞(没有ZOMBIE子进程立即返回0)
 */
-int proc_wait(uint64 user_addr)
+int proc_wait4(int64 wait_pid, uint64 user_addr, int wnohang)
 {
     proc_t *parent = myproc();
 
@@ -668,17 +662,22 @@ int proc_wait(uint64 user_addr)
         int has_child = 0;
         for (int i = 0; i < N_PROC; i++) {
             proc_t *p = &proc_list[i];
-            if (p == parent) continue; // 跳过自己
+            if (p == parent) continue;
             spinlock_acquire(&p->lk);
             if (p->parent == parent && p->state != UNUSED) {
+                // pid过滤：-1=任意，>0=特定pid
+                if (wait_pid > 0 && p->pid != (int)wait_pid) {
+                    spinlock_release(&p->lk);
+                    continue;
+                }
                 has_child = 1;
                 if (p->state == ZOMBIE) {
-                    // 拷贝退出状态到用户地址
                     if (user_addr) {
-                        uvm_copyout(parent->pgtbl, user_addr, (uint64)&p->exit_code, sizeof(int));
+                        // Linux wait4 *status 编码: exit_code << 8
+                        int wstatus = (p->exit_code & 0xff) << 8;
+                        uvm_copyout(parent->pgtbl, user_addr, (uint64)&wstatus, sizeof(int));
                     }
                     int pid = p->pid;
-                    // 回收子进程
                     proc_free(p);
                     spinlock_release(&p->lk);
                     return pid;
@@ -687,14 +686,15 @@ int proc_wait(uint64 user_addr)
             spinlock_release(&p->lk);
         }
 
-        if (!has_child) {
-            return -1; // 无子进程
+        if (!has_child)
+            return -1;
 
-        }
+        if (wnohang)
+            return 0;   // WNOHANG: 没有ZOMBIE子进程，立即返回0
+
         spinlock_acquire(&parent->lk);
-        // 进入睡眠，等待子进程退出
         proc_sleep(parent, &parent->lk);
-        spinlock_release(&parent->lk); 
+        spinlock_release(&parent->lk);
     }
 }
 

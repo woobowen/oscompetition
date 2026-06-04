@@ -39,3 +39,6 @@ kernel-rv
 kernel-la
 target/
 qemu.log
+
+# test
+testsuits-for-oskernel/

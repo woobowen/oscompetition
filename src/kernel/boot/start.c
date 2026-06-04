@@ -91,6 +91,9 @@ void boot_start(uint64 id)
     // Enable S-mode interrupts (software, timer, external)
     w_sie(r_sie() | SIE_SEIE | SIE_STIE | SIE_SSIE);
 
+    // Initialize SBI timer (request first S-mode timer interrupt)
+    timer_init_sbi();
+
     // Call the common main entry
     // early boot marker: may run before uart_init
     uart_puts_early("[boot_start]\n");

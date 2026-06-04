@@ -1,5 +1,15 @@
 #include "mod.h"
 
+/*-------------------- SBI timer interface --------------------*/
+
+static void sbi_set_timer(uint64 stime_value)
+{
+    register uint64 a0 asm("a0") = stime_value;
+    register uint64 a6 asm("a6") = 0;
+    register uint64 a7 asm("a7") = 0x54494D45; // EID "TIME"
+    asm volatile("ecall" : "+r"(a0) : "r"(a6), "r"(a7) : "memory");
+}
+
 /*-------------------- 工作在M-mode --------------------*/
 
 // in trap.S M-mode时钟中断处理流程()
@@ -35,6 +45,13 @@ void timer_init()
 
     // 打开 M-mode 时钟中断分开关
     w_mie(r_mie() | MIE_MTIE);
+}
+
+// SBI 模式下的定时器初始化（OpenSBI 启动路径使用）
+void timer_init_sbi()
+{
+    uint64 now = r_time();
+    sbi_set_timer(now + INTERVAL);
 }
 
 /*--------------------- 工作在S-mode --------------------*/

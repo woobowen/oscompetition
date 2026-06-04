@@ -9,7 +9,7 @@ void proc_free(proc_t *p);                          // 进程释放
 pgtbl_t proc_pgtbl_init(uint64 trapframe);          // 页表初始化
 void proc_make_first();                             // 创建第一个用户进程
 int proc_fork();                                    // 复制子进程
-int proc_wait(uint64 addr);                         // 等待子进程退出
+int proc_wait4(int64 wait_pid, uint64 user_addr, int wnohang); // 等待子进程退出
 void proc_exit(int exit_state);                     // 进程退出
 void proc_yield();                                  // 进程放弃CPU
 void proc_sleep(void *sleep_space, spinlock_t *lk); // 进程睡眠

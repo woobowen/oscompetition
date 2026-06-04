@@ -483,6 +483,21 @@ static void copy_range(pgtbl_t old, pgtbl_t new, uint64 begin, uint64 end)
     }
 }
 
+// 稀疏复制：跳过未映射的页
+static void copy_range_sparse(pgtbl_t old, pgtbl_t new, uint64 begin, uint64 end)
+{
+    for (uint64 va = begin; va < end; va += PGSIZE) {
+        pte_t *pte = vm_getpte(old, va, false);
+        if (!pte || !(*pte & PTE_V))
+            continue;
+        uint64 pa = (uint64)PTE_TO_PA(*pte);
+        int flags = (int)PTE_FLAGS(*pte);
+        uint64 page = (uint64)pmem_alloc(false);
+        memmove((char *)page, (const char *)pa, PGSIZE);
+        vm_mappages(new, va, page, PGSIZE, flags);
+    }
+}
+
 // 拷贝页表 (拷贝并不包括 trapframe 和 trampoline)
 // 拷贝的页表管理的物理页是原来页表的复制品
 void uvm_copy_pgtbl(pgtbl_t old, pgtbl_t new, uint64 heap_top, uint64 ustack_npage, mmap_region_t *mmap)
@@ -494,6 +509,12 @@ void uvm_copy_pgtbl(pgtbl_t old, pgtbl_t new, uint64 heap_top, uint64 ustack_npa
         if (end > begin) {
             copy_range(old, new, begin, end);
         }
+    }
+
+    // 复制动态链接器区域 [heap_top, MMAP_BEGIN) — 稀疏复制跳过未映射页
+    uint64 interp_begin = ((heap_top + PGSIZE - 1) / PGSIZE) * PGSIZE;
+    if (interp_begin < MMAP_BEGIN) {
+        copy_range_sparse(old, new, interp_begin, MMAP_BEGIN);
     }
 
     // 复制 mmap 链表所描述的离散映射区域

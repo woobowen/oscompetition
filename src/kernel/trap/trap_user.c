@@ -21,7 +21,7 @@ void trap_user_handler()
 {
     // 进入内核后切回 kernel_vector
     w_stvec((uint64)kernel_vector);
-    
+
     proc_t *p = myproc(); // 获取当前进程
     trapframe_t *tf = p->tf;
 
@@ -30,10 +30,6 @@ void trap_user_handler()
     uint64 scause = r_scause();
 
     tf->user_to_kern_epc = sepc;
-
-    if (p->pid >= 2 && tf->gp == 0 && sepc > USER_BASE)
-        printf("[DBG] pid=%d sepc=%p gp=0 scause=%p sp=%p\n",
-               p->pid, sepc, (void*)scause, (void*)tf->sp);
 
     //开始处理 trap
     int trap_id = scause & 0x3FF;  // 取低10位（RISC-V标准）
@@ -44,6 +40,11 @@ void trap_user_handler()
             case 1: // S-mode软件中断
                 timer_interrupt_handler();
                 // MLFQ: 仅当时间片用完/需要抢占时才让出CPU
+                if (proc_on_tick())
+                    proc_yield();
+                break;
+            case 5: // S-mode timer interrupt (sstc extension)
+                timer_interrupt_handler();
                 if (proc_on_tick())
                     proc_yield();
                 break;
@@ -58,26 +59,28 @@ void trap_user_handler()
         switch (trap_id) {
             case 8: // Environment call from U-mode (ecall)
             {
-                syscall();
-                tf = p->tf; // exec 可能替换 trapframe，刷新指针
                 tf->user_to_kern_epc += 4;
+                syscall();
+                tf = p->tf;
                 break;
             }
             case 12:
             case 13:
             case 15:
             {
-                if (uvm_ustack_grow(p->pgtbl, p->ustack_npage, r_stval()) == (uint64)-1) {
-                    printf("[SEGV] pid=%d t=%d pc=%p stval=%p gp=%p sp=%p\n",
-                           p->pid, trap_id, sepc, r_stval(), (void*)tf->gp, (void*)tf->sp);
+                uint64 fault_addr = r_stval();
+                uint64 res = uvm_ustack_grow(p->pgtbl, p->ustack_npage, fault_addr);
+                if (res == (uint64)-1) {
+                    printf("[SEGV] pid=%d t=%d pc=%p stval=%p gp=%p tp=%p sp=%p ra=%p\n",
+                           p->pid, trap_id, sepc, (void*)fault_addr, (void*)tf->gp, (void*)tf->tp, (void*)tf->sp, (void*)tf->ra);
                     proc_exit(-11);
                 }
                 break;
             }
             default:
             {
-                printf("[SEGV] pid=%d t=%d pc=%p stval=%p gp=%p sp=%p\n",
-                       p->pid, trap_id, sepc, r_stval(), (void*)tf->gp, (void*)tf->sp);
+                printf("[SEGV] pid=%d t=%d pc=%p stval=%p gp=%p tp=%p sp=%p\n",
+                       p->pid, trap_id, sepc, r_stval(), (void*)tf->gp, (void*)tf->tp, (void*)tf->sp);
                 proc_exit(-11);
             }
         }

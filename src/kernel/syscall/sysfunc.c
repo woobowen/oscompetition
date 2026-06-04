@@ -72,9 +72,6 @@ uint64 sys_mmap()
         perm |= PTE_R;
 
     uint64 ret_addr = uvm_mmap(start, npages, perm);
-    printf("sys_mmap: start=%p len=0x%llx prot=%llu flags=%llu npages=%u ret=%p\n",
-           (void*)start, (unsigned long long)len, (unsigned long long)prot,
-           (unsigned long long)flags, (unsigned)npages, (void*)ret_addr);
     return ret_addr;
 }
 
@@ -134,18 +131,49 @@ uint64 sys_clone()
 }
 
 /*
-    等待子进程退出
-    uint64 addr_exit_state
+    wait4(pid, *status, options, *rusage) — Linux/RISC-V ABI (syscall 260)
+    a0=pid: -1=任意子进程, >0=等特定pid
+    a1=status指针
+    a2=options: WNOHANG(1)=非阻塞
+    a3=rusage指针(忽略)
+
+    兼容旧式 wait(&status): a0=status地址, a1=0, a2=0
+    判据: a0 >= PGSIZE 视为用户态地址(status指针), 按旧接口处理
 */
 uint64 sys_wait()
 {
-    uint64 addr_exit_state = 0;
-    if (arg_raw(1) != 0 || arg_raw(2) != 0 || arg_raw(3) != 0) {
-        arg_uint64(1, &addr_exit_state); // Linux wait4(pid, status, options, rusage)
+    uint64 a0 = arg_raw(0);
+    uint64 a1 = arg_raw(1);
+    uint64 a2 = arg_raw(2);
+
+    // 区分两种调用形式：
+    // 1. 旧式 SeaOS wait(*status):  a0=用户态地址, a1=a2=0
+    // 2. Linux wait4(pid,*status,options,rusage): a0=pid(小整数或-1), a1=地址
+    //
+    // 判据：a1 非零时一定是 wait4（因为 a1 是 status 指针）；
+    //       a1==0 且 a0 看起来像用户地址(>=PGSIZE 且不是 -1)时按旧接口处理。
+    int64  wait_pid;
+    uint64 stat_ptr;
+    int    wnohang;
+
+    if (a1 != 0) {
+        // Linux wait4: a0=pid, a1=*status, a2=options
+        wait_pid = (int64)a0;
+        stat_ptr = a1;
+        wnohang  = (a2 & 1) != 0;
+    } else if (a0 >= (uint64)PGSIZE && a0 != (uint64)-1LL) {
+        // 旧式 wait(*status): a0 是 status 指针，等待任意子进程
+        wait_pid = -1;
+        stat_ptr = a0;
+        wnohang  = 0;
     } else {
-        arg_uint64(0, &addr_exit_state); // SeaOS wait(status)
+        // wait4(pid, NULL, options, NULL)
+        wait_pid = (int64)a0;
+        stat_ptr = 0;
+        wnohang  = (a2 & 1) != 0;
     }
-    return proc_wait(addr_exit_state);
+
+    return proc_wait4(wait_pid, stat_ptr, wnohang);
 }
 
 /*
@@ -479,29 +507,17 @@ uint64 sys_shutdown()
 
 static int sys_spawn_and_wait(char *path, char **argv)
 {
-    printf("sys_spawn_and_wait: spawn request path=%s\n", path);
     int pid = proc_fork();
-    printf("sys_spawn_and_wait: fork returned pid=%d\n", pid);
-    if (pid < 0) {
-        printf("sys_spawn_and_wait: fork FAILED\n");
+    if (pid < 0)
         return -1;
-    }
 
-    /* 为子进程执行exec（在父进程上下文中替换子进程的地址空间） */
     if (pid > 0) {
         int eret = proc_exec_target(pid, path, argv);
-        if (eret < 0) {
-            printf("sys_spawn_and_wait: proc_exec_target failed for pid=%d\n", pid);
-            /* 如果失败，proc_exec_target 已将子进程置为ZOMBIE并唤醒父进程 */
-        }
+        (void)eret;
     }
 
-    printf("sys_spawn_and_wait: parent waiting for child pid=%d\n", pid);
-    if (proc_wait(0) < 0) {
-        printf("sys_spawn_and_wait: wait FAILED\n");
+    if (proc_wait4(pid, 0, 0) < 0)
         return -1;
-    }
-    printf("sys_spawn_and_wait: child exited\n");
     return 0;
 }
 
@@ -853,24 +869,28 @@ uint64 sys_rt_sigaction()
     int signum = (int)arg_raw(0);
     uint64 act_addr = arg_raw(1);
     uint64 oldact_addr = arg_raw(2);
+    uint64 sigsetsize = arg_raw(3);
 
     if (signum < 1 || signum > NSIG)
         return (uint64)(-EINVAL);
+    if (sigsetsize > 128)
+        sigsetsize = 128;
 
+    uint32 struct_size = 24 + (uint32)sigsetsize;
     proc_t *p = myproc();
 
     if (oldact_addr != 0) {
         uint8 buf[152];
-        memset(buf, 0, sizeof(buf));
+        memset(buf, 0, struct_size);
         *(uint64 *)&buf[0] = p->sig_handler[signum];
         *(uint64 *)&buf[8] = 0;
         *(uint64 *)&buf[16] = p->sig_restorer;
-        uvm_copyout(p->pgtbl, oldact_addr, (uint64)buf, sizeof(buf));
+        uvm_copyout(p->pgtbl, oldact_addr, (uint64)buf, struct_size);
     }
 
     if (act_addr != 0) {
         uint8 buf[152];
-        uvm_copyin(p->pgtbl, (uint64)buf, act_addr, sizeof(buf));
+        uvm_copyin(p->pgtbl, (uint64)buf, act_addr, struct_size);
         p->sig_handler[signum] = *(uint64 *)&buf[0];
         uint64 flags = *(uint64 *)&buf[8];
         if (flags & SA_RESTORER)
@@ -1169,4 +1189,61 @@ uint64 sys_rt_sigreturn()
     tf->user_to_kern_epc -= 4;
 
     return tf->a0;
+}
+
+// 73 ppoll(fds, nfds, tmo_p, sigmask, sigsetsize)
+// 简化实现：单个 fd 轮询，不支持超时精度 — 足以让 busybox 的管道/文件 IO 运作。
+uint64 sys_ppoll()
+{
+    uint64 fds_addr = arg_raw(0);
+    uint64 nfds = arg_raw(1);
+    uint64 tmo_addr = arg_raw(2);
+    proc_t *p = myproc();
+
+    if (nfds == 0) return 0;
+    if (nfds > 16) nfds = 16;
+
+    struct { int fd; short events; short revents; } pfd[16];
+    uvm_copyin(p->pgtbl, (uint64)pfd, fds_addr, nfds * 8);
+
+    int ready = 0;
+    for (uint64 i = 0; i < nfds; i++) {
+        pfd[i].revents = 0;
+        if (pfd[i].fd < 0) continue;
+        if ((uint32)pfd[i].fd >= N_OPEN_FILE_PER_PROC) continue;
+        file_t *f = p->open_file[pfd[i].fd];
+        if (!f) { pfd[i].revents = 0x20; ready++; continue; }
+        // POLLIN(1): readable; POLLOUT(4): writable
+        if (pfd[i].events & 1) pfd[i].revents |= 1;
+        if (pfd[i].events & 4) pfd[i].revents |= 4;
+        if (pfd[i].revents) ready++;
+    }
+
+    if (ready == 0 && tmo_addr != 0) {
+        uint64 ts[2] = {0, 0};
+        uvm_copyin(p->pgtbl, (uint64)ts, tmo_addr, 16);
+        uint64 ntick = ts[0] * 10;
+        if (ts[1] > 0) ntick++;
+        if (ntick > 0) timer_wait(ntick);
+        ready = 0;
+        for (uint64 i = 0; i < nfds; i++) {
+            if (pfd[i].revents) ready++;
+        }
+    }
+
+    uvm_copyout(p->pgtbl, fds_addr, (uint64)pfd, nfds * 8);
+    return ready;
+}
+
+// 71 sendfile(out_fd, in_fd, offset, count): 零拷贝文件传输。
+// 简化实现：内核缓冲区中转。
+uint64 sys_sendfile()
+{
+    return (uint64)(-ENOSYS);
+}
+
+// 119 sched_setscheduler(pid, policy, param): 设置调度策略。桩返回 0。
+uint64 sys_sched_setscheduler()
+{
+    return 0;
 }

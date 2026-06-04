@@ -55,3 +55,50 @@
   6. `sys_rt_sigreturn` 从用户栈恢复 signal frame，epc -= 4 补偿 syscall 路径的 epc += 4。
 - 理由：dhry2reg 测试依赖 setitimer/SIGALRM 判断 10 秒计时结束；无信号投递则 dhry2reg 死循环，无法产出分数。
 - 代价：signal frame 仅保存 GP 寄存器（不含 FP/向量寄存器）；嵌套信号通过 `sig_delivering` 标志简单阻止（非 Linux 完整语义）。
+
+## D10（2026-06-04）ecall 处理中 epc+=4 的执行顺序（关键 fork/exec bug 修复）
+
+- 决策：在 `trap_user.c` 中，ecall 异常处理的 `epc += 4` 必须在 `syscall()` **之前** 执行，而非之后。
+- 根因链：
+  1. 原代码在 `syscall()` 后执行 `epc += 4`
+  2. fork 时子进程复制父进程的 trapframe（此时父进程的 epc 已 +4）
+  3. proc_fork 在返回前又 `epc += 4`（导致 epc 总计 +8，跳过两条关键指令）
+  4. 对于 fork 后 exec 的进程：exec 将 trapframe 的 `user_to_kern_epc` 设为 entry_pc（未含 +4），返回用户态时被 trap 处理器再 +4，导致 entry_pc 指令被跳过
+  5. **关键**：_start 的第一条指令 `auipc gp, 0x154` 被跳过，导致 gp 未初始化，后续 gp-relative 访问都崩溃
+- 修复：
+  ```c
+  case 8: // ecall from U-mode
+  {
+      tf->user_to_kern_epc += 4;  // <-- 前置：在 syscall() 之前
+      syscall();
+      tf = p->tf;                 // syscall 可能替换 trapframe（如 exec），需重新读取
+      break;
+  }
+  ```
+  这样：fork 时 trapframe 中 epc 已正确 +4；proc_fork 无需二次加；exec 设置 entry_pc 时无需补偿。
+- 涉及文件：[trap_user.c:57](src/kernel/trap/trap_user.c#L57)、[proc.c:458-461](src/kernel/proc/proc.c#L458-L461)（删除冗余 epc+=4）
+
+## D11（2026-06-04）rt_sigaction (134) 缓冲区溢出修复
+
+- 决策：`sys_rt_sigaction()` 中，sigaction 结构的大小必须由第 4 参数 `sigsetsize` 决定，而非固定 152 字节。
+- 根因：
+  1. musl 的 sigaction 结构为 `struct { void *handler; uint64 flags; void *restorer; sigset_t mask; }`，总大小 = 24 + sigsetsize 字节
+  2. sigsetsize 通常为 8 字节（64 位掩码），但代码写 152 字节到用户栈，超额写入 144 字节
+  3. 超额写入覆盖栈上的返回地址、进程指针等，导致返回后 pc=0 或随机地址崩溃
+- 修复：
+  ```c
+  uint32 struct_size = 24 + (uint32)sigsetsize;  // 精确计算
+  uvm_copyout(p->pgtbl, oldact_addr, (uint64)buf, struct_size);  // 精确写出
+  ```
+- 涉及文件：[sysfunc.c:863-872](src/kernel/syscall/sysfunc.c#L863-L872)
+- 代价：若用户传入 sigsetsize > 128，会被截断至 128（为防止过大分配）；但 musl 通常不超过 128
+
+## D12（2026-06-04）评测超时修复：data/config.json 设置 qemu.timeout=3600
+
+- 决策：在 `data/config.json` 新建配置，设置 `"qemu.timeout": 3600`。本地测试时此文件映射到容器 `/coursegrader/testdata/config.json`，被评测框架读取。
+- 根因：`run_qemu.py` 中 `config.get('qemu.timeout', 60)` 默认 60 秒。内核启动（OpenSBI）+ 5 项 unixbench 测试总耗时 ~50-70 秒。当 60s 超时触发，QEMU 被 kill，评分框架只能读到 DHRY2 + WHETSTONE，score=0。
+- 修复：设置 3600s 超时留出充足余量。评测对比 `judge/config.json` 中的 timeout 定义（也是 3600），保持一致。
+- 验证：修复后 unixbench 5 项全部出分（DHRY2 47M lps, WHETSTONE 1134 MFLOPS, SYSCALL 115K lps, CONTEXT 9688 lps, PIPE 11358 lps）。
+- 代价：无。死循环的内核仍会被 timeout 终止；真实死循环不会因超时充足而漏检。
+- 注：平台评测时，testdata 路径由平台管理，`data/config.json` 不会被用上。平台应有自己的 timeout 配置；若平台继承 60s 默认，评分将受限。
+

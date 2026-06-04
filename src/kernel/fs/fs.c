@@ -587,16 +587,6 @@ static bool fs_try_ext4_preview()
 
 	fs_readonly_ext4 = true;
 
-	const ext4_info_t *info = ext4_get_info();
-	printf("\next4 filesystem detected on primary disk:\n");
-	printf("block size = %d Byte, total blocks = %d, total inode = %d\n",
-		info->block_size,
-		ext4_sb.blocks_count_lo,
-		ext4_sb.inodes_count);
-	printf("inodes per group = %d, blocks per group = %d, inode size = %d\n\n",
-		ext4_sb.inodes_per_group,
-		ext4_sb.blocks_per_group,
-		ext4_sb.inode_size);
 	return true;
 }
 

@@ -62,6 +62,9 @@ static uint64 prepare_heap(pgtbl_t new_pgtbl, inode_t *ip, elf_header_t *eh, exe
 {
     program_header_t ph;
     uint64 new_heap_top = USER_BASE, old_heap_top = USER_BASE;
+    uint64 first_load_va = 0;
+    uint64 first_load_off = 0;
+    int has_first_load = 0;
 
     info->phdr_addr = 0;
     info->phnum = eh->ph_ent_num;
@@ -101,10 +104,23 @@ static uint64 prepare_heap(pgtbl_t new_pgtbl, inode_t *ip, elf_header_t *eh, exe
             return -1;
         }
 
+        if (!has_first_load) {
+            first_load_va = ph.va;
+            first_load_off = ph.off;
+            has_first_load = 1;
+        }
+
         uint32 perm = PTE_U;
         if(ph.flags & ELF_PROG_FLAG_READ) perm |= PTE_R;
         if(ph.flags & ELF_PROG_FLAG_WRITE) perm |= PTE_W;
         if(ph.flags & ELF_PROG_FLAG_EXEC) perm |= PTE_X;
+
+        // 段地址必须单调递增，否则 len 下溢成天文数字，会 OOM panic
+        if (ph.va < old_heap_top) {
+            printf("prepare_heap: va=%p < old_heap_top=%p, out of order segment\n",
+                   (void*)ph.va, (void*)old_heap_top);
+            return -1;
+        }
 
         new_heap_top = uvm_heap_grow(new_pgtbl, old_heap_top,
                         ph.va + ph.mem_size - old_heap_top, perm);
@@ -113,6 +129,10 @@ static uint64 prepare_heap(pgtbl_t new_pgtbl, inode_t *ip, elf_header_t *eh, exe
         old_heap_top = new_heap_top;
 
         load_segment(ip, new_pgtbl, ph.off, ph.va, ph.file_size);
+    }
+
+    if (info->phdr_addr == 0 && has_first_load) {
+        info->phdr_addr = first_load_va + (eh->ph_off - first_load_off);
     }
 
     return new_heap_top;
@@ -216,6 +236,7 @@ static uint64 load_interp(pgtbl_t pgtbl, char *interp_path, uint64 base)
         return -1;
     }
 
+//    printf("load_interp: loading %s base=%p phnum=%d\n", interp_path, (void*)base, (int)eh.ph_ent_num);
     program_header_t ph;
     for (uint32 off = eh.ph_off; off < eh.ph_off + eh.ph_ent_num * sizeof(ph); off += sizeof(ph)) {
         if (inode_read_data(ip, off, sizeof(ph), &ph, false) != sizeof(ph)) {
@@ -405,7 +426,7 @@ static int pick_script_interpreter(const char *requested, char *resolved_path, c
 int proc_exec(char *path, char **argv)
 {
     proc_t *p = myproc();
-    printf("proc_exec: pid=%d path=%s\n", p ? p->pid : -1, path);
+//    printf("proc_exec: pid=%d path=%s\n", p ? p->pid : -1, path);
     
     // step-0: 准备全新的pagetable和trapframe
     // 分配一个新的物理页作为 Trapframe
@@ -437,15 +458,16 @@ int proc_exec(char *path, char **argv)
     // step-2: 读取ELF_header
     elf_header_t eh;
     uint32 data_size = inode_read_data(ip, 0, sizeof(eh), &eh, false);
-            printf("proc_exec: pid=%d read elf header size=%d entry=%p ph_off=%p ph_ent_num=%d\n",
-                p ? p->pid : -1, (int)data_size, (void*)eh.entry, (void*)eh.ph_off, (int)eh.ph_ent_num);
     char script_interp[STR_MAXLEN + 1];
     char script_interp_arg[STR_MAXLEN + 1];
     char *script_argv[ELF_MAXARGS + 1];
-    int use_script = 0;
 
     if (data_size != sizeof(eh) || eh.magic != ELF_MAGIC) {
-        if (is_script_path(path) && parse_shebang(ip, script_interp, script_interp_arg) == 0) {
+        if (is_script_path(path)) {
+            if (parse_shebang(ip, script_interp, script_interp_arg) != 0) {
+                script_interp[0] = '\0';
+                script_interp_arg[0] = '\0';
+            }
             char resolved_interp[STR_MAXLEN + 1];
             char resolved_interp_arg[STR_MAXLEN + 1];
 
@@ -464,7 +486,6 @@ int proc_exec(char *path, char **argv)
                 return -1;
             }
             argv = script_argv;
-            use_script = 1;
             path = resolved_interp;
             inode_put(ip);
             ip = path_to_inode(path);
@@ -572,7 +593,7 @@ int proc_exec(char *path, char **argv)
     }
     p->name[i] = '\0';
     p->name[sizeof(p->name) - 1] = '\0';
-    printf("proc_exec: pid=%d exec done argc=%d heap_top=%p tf=%p entry=%p%s\n", p->pid, argc, (void*)p->heap_top, (void*)p->tf, (void*)entry_pc, use_script ? " script" : "");
+//    printf("proc_exec: pid=%d exec done argc=%d heap_top=%p tf=%p entry=%p%s\n", p->pid, argc, (void*)p->heap_top, (void*)p->tf, (void*)entry_pc, use_script ? " script" : "");
     
     return argc;
 }
@@ -584,7 +605,7 @@ int proc_exec_target(int pid, char *path, char **argv)
     proc_t *p = proc_get_by_pid(pid);
     if (!p) return -1;
 
-    printf("proc_exec_target: pid=%d path=%s\n", p->pid, path);
+//    printf("proc_exec_target: pid=%d path=%s\n", p->pid, path);
 
     /* 类似 proc_exec 的实现，但对指定进程p操作（p的锁已持有） */
     trapframe_t *new_tf = (trapframe_t*)pmem_alloc(false);
@@ -607,15 +628,16 @@ int proc_exec_target(int pid, char *path, char **argv)
 
     elf_header_t eh;
     uint32 data_size = inode_read_data(ip, 0, sizeof(eh), &eh, false);
-          printf("proc_exec_target: pid=%d read elf header size=%d entry=%p ph_off=%p ph_ent_num=%d\n",
-              p ? p->pid : -1, (int)data_size, (void*)eh.entry, (void*)eh.ph_off, (int)eh.ph_ent_num);
     char script_interp[STR_MAXLEN + 1];
     char script_interp_arg[STR_MAXLEN + 1];
     char *script_argv[ELF_MAXARGS + 1];
-    int use_script = 0;
 
     if (data_size != sizeof(eh) || eh.magic != ELF_MAGIC) {
-        if (is_script_path(path) && parse_shebang(ip, script_interp, script_interp_arg) == 0) {
+        if (is_script_path(path)) {
+            if (parse_shebang(ip, script_interp, script_interp_arg) != 0) {
+                script_interp[0] = '\0';
+                script_interp_arg[0] = '\0';
+            }
             char resolved_interp[STR_MAXLEN + 1];
             char resolved_interp_arg[STR_MAXLEN + 1];
 
@@ -634,7 +656,6 @@ int proc_exec_target(int pid, char *path, char **argv)
                 goto exec_fail;
             }
             argv = script_argv;
-            use_script = 1;
             path = resolved_interp;
             inode_put(ip);
             ip = path_to_inode(path);
@@ -643,10 +664,8 @@ int proc_exec_target(int pid, char *path, char **argv)
                 printf("proc_exec_target: pid=%d script interpreter path_to_inode(%s) failed\n", p->pid, path);
                 goto exec_fail;
             }
-                 data_size = inode_read_data(ip, 0, sizeof(eh), &eh, false);
-                      printf("proc_exec_target: pid=%d interp elf entry=%p ph_off=%p ph_ent_num=%d\n",
-                          p ? p->pid : -1, (void*)eh.entry, (void*)eh.ph_off, (int)eh.ph_ent_num);
-                 if (data_size != sizeof(eh) || eh.magic != ELF_MAGIC) {
+            data_size = inode_read_data(ip, 0, sizeof(eh), &eh, false);
+            if (data_size != sizeof(eh) || eh.magic != ELF_MAGIC) {
                 inode_put(ip);
                 uvm_destroy_pgtbl(new_pgtbl);
                 printf("proc_exec_target: pid=%d script interpreter is not ELF\n", p->pid);
@@ -730,7 +749,7 @@ int proc_exec_target(int pid, char *path, char **argv)
     p->name[i] = '\0';
     p->name[sizeof(p->name) - 1] = '\0';
 
-    printf("proc_exec_target: pid=%d exec done argc=%d heap_top=%p tf=%p%s\n", p->pid, argc, (void*)p->heap_top, (void*)p->tf, use_script ? " script" : "");
+//    printf("proc_exec_target: pid=%d exec done argc=%d heap_top=%p tf=%p%s\n", p->pid, argc, (void*)p->heap_top, (void*)p->tf, use_script ? " script" : "");
 
     /* 完成，释放p->lk */
     spinlock_release(&p->lk);

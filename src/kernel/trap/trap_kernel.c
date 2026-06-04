@@ -52,28 +52,16 @@ uint64 kernel_trap_saved_sp[NCPU];
 // 初始化trap中各个核心共享的东西
 void trap_kernel_init()
 {
-    printf("trap_kernel_init: begin\n");
-    // PLIC初始化
     plic_init();
-
-    // 系统时钟创建
     timer_create();
-    printf("trap_kernel_init: done\n");
 }
 
 // 初始化trap中各个核心独有的东西
 void trap_kernel_inithart()
 {
-    printf("trap_kernel_inithart: begin\n");
-    // PLIC核心初始化
     plic_inithart();
-
-    // 填写内核态中断处理函数
     w_stvec((uint64)kernel_vector);
-
-    // 打开中断
     intr_on();
-    printf("trap_kernel_inithart: done\n");
 }
 
 // 在kernel_vector()里面调用
@@ -98,6 +86,9 @@ void trap_kernel_handler()
         switch (trap_id) // 中断产生原因分类
         {
             case 1: // S-mode软件中断
+                timer_interrupt_handler();
+                break;
+            case 5: // S-mode timer interrupt (SBI/sstc path)
                 timer_interrupt_handler();
                 break;
             case 9: // S-mode外设中断
@@ -149,7 +140,7 @@ void external_interrupt_handler()
     plic_complete(irq);
 }
 
-// 时钟中断处理 (基于CLINT)
+// 时钟中断处理 (基于CLINT 或 SBI timer)
 void timer_interrupt_handler()
 {
     // 由于sys_timer是共享资源, 但每个CPU都能收到时钟中断
@@ -175,14 +166,7 @@ void timer_interrupt_handler()
         }
     }
 
-    // 打印tick信息（调试）
-    // uint64 ticks = timer_get_ticks();
-    // if (ticks % 10 == 0) {
-    //     printf("[U] tick=%d\n", (int)ticks);
-    // }
-
-    // 清除 SSIP bit (S-mode software interrupt pending)
-    // 宣布 S-mode 软件中断处理完成
-    // 在 trap.S 里面有对应的两条命令, 去找找
+    // 调度下一次 SBI 定时器中断并清除待决位
+    timer_init_sbi();
     w_sip(r_sip() & ~2);
 }
