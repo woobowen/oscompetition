@@ -37,8 +37,8 @@ LA_CC = $(LA_TOOLPREFIX)gcc
 LA_LD = $(LA_TOOLPREFIX)ld
 LA_BUILD_MODE ?= $(if $(shell command -v $(LA_CC) >/dev/null 2>&1 && command -v $(LA_LD) >/dev/null 2>&1 && echo yes),source,stub)
 LA_KERNEL_LD = $(KernelPath)/loongarch/kernel.ld
-LA_SOURCE_FILE = $(KernelPath)/loongarch/entry.S $(KernelPath)/loongarch/boot.c $(KernelPath)/loongarch/trap_entry.S $(KernelPath)/loongarch/trap.c $(KernelPath)/loongarch/syscall.c
-LA_SOURCE_OBJ = $(TARGET)/loongarch/entry.o $(TARGET)/loongarch/boot.o $(TARGET)/loongarch/trap_entry.o $(TARGET)/loongarch/trap.o $(TARGET)/loongarch/syscall.o
+LA_SOURCE_FILE = $(KernelPath)/loongarch/entry.S $(KernelPath)/loongarch/boot.c $(KernelPath)/loongarch/trap_entry.S $(KernelPath)/loongarch/trap.c $(KernelPath)/loongarch/syscall.c $(KernelPath)/loongarch/userret.S $(KernelPath)/loongarch/userret.c
+LA_SOURCE_OBJ = $(TARGET)/loongarch/entry.o $(TARGET)/loongarch/boot.o $(TARGET)/loongarch/trap_entry.o $(TARGET)/loongarch/trap.o $(TARGET)/loongarch/syscall.o $(TARGET)/loongarch/userret.o $(TARGET)/loongarch/userret_c.o
 LA_CFLAGS = -Wall -Werror -O2 -ffreestanding -fno-common -nostdlib -fno-stack-protector -fno-pie -I.
 LA_LDFLAGS = -z max-page-size=4096
 
@@ -142,6 +142,9 @@ $(TARGET)/loongarch/%.o: $(KernelPath)/loongarch/%.S $(LA_SOURCE_HDR) | $(TARGET
 	$(LA_CC) $(LA_CFLAGS) -c -o $@ $<
 
 $(TARGET)/loongarch/%.o: $(KernelPath)/loongarch/%.c $(LA_SOURCE_HDR) | $(TARGET)
+	$(LA_CC) $(LA_CFLAGS) -c -o $@ $<
+
+$(TARGET)/loongarch/userret_c.o: $(KernelPath)/loongarch/userret.c $(LA_SOURCE_HDR) | $(TARGET)
 	$(LA_CC) $(LA_CFLAGS) -c -o $@ $<
 
 # 生成 kernel-qemu.elf

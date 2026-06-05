@@ -46,6 +46,8 @@ struct la_trap_frame {
     uint64_t estat;
 };
 
+void la_user_return(struct la_trap_frame *tf);
+
 static inline uint64_t la_estat_ecode(uint64_t estat)
 {
     return (estat >> LA_ESTAT_ECODE_SHIFT) & LA_ESTAT_ECODE_MASK;

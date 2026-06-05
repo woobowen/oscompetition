@@ -2,4 +2,5 @@ loongarch boot start
 la_entry: qemu virt early console online
 la_boot_main: arch scaffold active
 la_trap: full trapframe syscall return scaffold staged
+la_userret: era prmd gpr restore scaffold staged
 la_boot_main: next userret virtio-pci ext4

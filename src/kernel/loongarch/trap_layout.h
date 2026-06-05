@@ -2,10 +2,15 @@
 #define SEAOS_LOONGARCH_TRAP_LAYOUT_H
 
 #define LA_CSR_ECFG 0x4
+#define LA_CSR_PRMD 0x1
 #define LA_CSR_ESTAT 0x5
 #define LA_CSR_ERA 0x6
 #define LA_CSR_BADV 0x7
 #define LA_CSR_EENTRY 0xc
+
+#define LA_PRMD_PPLV_MASK 0x3
+#define LA_PRMD_PIE 0x4
+#define LA_USER_PLV 0x3
 
 #define LA_TF_GPR_BASE 0
 #define LA_TF_GPR_ZERO 0

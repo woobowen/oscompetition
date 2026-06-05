@@ -15,6 +15,11 @@ SECTIONS
     *(.text.trap)
   }
 
+  . = ALIGN(0x1000);
+  .text.userret : {
+    *(.text.userret)
+  }
+
   .rodata : {
     . = ALIGN(16);
     *(.rodata .rodata.*)
