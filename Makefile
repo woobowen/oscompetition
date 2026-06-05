@@ -30,15 +30,15 @@ BIN2C_SRC = tools/bin2c.c
 BIN2C = $(TARGET)/tools/bin2c
 LA_ELFGEN_SRC = tools/la_elfgen.c
 LA_EARLY_BOOT_HDR = $(KernelPath)/loongarch/early_boot.h
-LA_SOURCE_HDR = $(LA_EARLY_BOOT_HDR) $(KernelPath)/loongarch/trap.h $(KernelPath)/loongarch/trap_layout.h
+LA_SOURCE_HDR = $(LA_EARLY_BOOT_HDR) $(KernelPath)/loongarch/proc.h $(KernelPath)/loongarch/trap.h $(KernelPath)/loongarch/trap_layout.h
 LA_ELFGEN = $(TARGET)/tools/la_elfgen
 LA_TOOLPREFIX ?= loongarch64-linux-gnu-
 LA_CC = $(LA_TOOLPREFIX)gcc
 LA_LD = $(LA_TOOLPREFIX)ld
 LA_BUILD_MODE ?= $(if $(shell command -v $(LA_CC) >/dev/null 2>&1 && command -v $(LA_LD) >/dev/null 2>&1 && echo yes),source,stub)
 LA_KERNEL_LD = $(KernelPath)/loongarch/kernel.ld
-LA_SOURCE_FILE = $(KernelPath)/loongarch/entry.S $(KernelPath)/loongarch/boot.c $(KernelPath)/loongarch/trap_entry.S $(KernelPath)/loongarch/trap.c $(KernelPath)/loongarch/syscall.c $(KernelPath)/loongarch/userret.S $(KernelPath)/loongarch/userret.c
-LA_SOURCE_OBJ = $(TARGET)/loongarch/entry.o $(TARGET)/loongarch/boot.o $(TARGET)/loongarch/trap_entry.o $(TARGET)/loongarch/trap.o $(TARGET)/loongarch/syscall.o $(TARGET)/loongarch/userret.o $(TARGET)/loongarch/userret_c.o
+LA_SOURCE_FILE = $(KernelPath)/loongarch/entry.S $(KernelPath)/loongarch/boot.c $(KernelPath)/loongarch/trap_entry.S $(KernelPath)/loongarch/trap.c $(KernelPath)/loongarch/syscall.c $(KernelPath)/loongarch/userret.S $(KernelPath)/loongarch/userret.c $(KernelPath)/loongarch/proc.c
+LA_SOURCE_OBJ = $(TARGET)/loongarch/entry.o $(TARGET)/loongarch/boot.o $(TARGET)/loongarch/trap_entry.o $(TARGET)/loongarch/trap.o $(TARGET)/loongarch/syscall.o $(TARGET)/loongarch/userret.o $(TARGET)/loongarch/userret_c.o $(TARGET)/loongarch/proc.o
 LA_CFLAGS = -Wall -Werror -O2 -ffreestanding -fno-common -nostdlib -fno-stack-protector -fno-pie -I.
 LA_LDFLAGS = -z max-page-size=4096
 
