@@ -30,6 +30,7 @@ BIN2C_SRC = tools/bin2c.c
 BIN2C = $(TARGET)/tools/bin2c
 LA_ELFGEN_SRC = tools/la_elfgen.c
 LA_EARLY_BOOT_HDR = $(KernelPath)/loongarch/early_boot.h
+LA_SOURCE_HDR = $(LA_EARLY_BOOT_HDR) $(KernelPath)/loongarch/trap.h $(KernelPath)/loongarch/trap_layout.h
 LA_ELFGEN = $(TARGET)/tools/la_elfgen
 LA_TOOLPREFIX ?= loongarch64-linux-gnu-
 LA_CC = $(LA_TOOLPREFIX)gcc
@@ -137,10 +138,10 @@ $(LA_ELFGEN): $(LA_ELFGEN_SRC) $(LA_EARLY_BOOT_HDR) | $(TARGET)
 	$(HOSTCC) $(HOSTCFLAGS) -I. -o $@ $<
 
 # LoongArch 源码构建路径（有 loongarch64-linux-gnu-* 工具链时启用）
-$(TARGET)/loongarch/%.o: $(KernelPath)/loongarch/%.S $(LA_EARLY_BOOT_HDR) | $(TARGET)
+$(TARGET)/loongarch/%.o: $(KernelPath)/loongarch/%.S $(LA_SOURCE_HDR) | $(TARGET)
 	$(LA_CC) $(LA_CFLAGS) -c -o $@ $<
 
-$(TARGET)/loongarch/%.o: $(KernelPath)/loongarch/%.c $(LA_EARLY_BOOT_HDR) | $(TARGET)
+$(TARGET)/loongarch/%.o: $(KernelPath)/loongarch/%.c $(LA_SOURCE_HDR) | $(TARGET)
 	$(LA_CC) $(LA_CFLAGS) -c -o $@ $<
 
 # 生成 kernel-qemu.elf

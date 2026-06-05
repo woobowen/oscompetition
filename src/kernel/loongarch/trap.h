@@ -3,8 +3,11 @@
 
 #include <stdint.h>
 
+#include "trap_layout.h"
+
 #define LA_ESTAT_ECODE_SHIFT 16
 #define LA_ESTAT_ECODE_MASK 0x3fULL
+#define LA_SYSCALL_INSN_SIZE 4ULL
 
 enum la_exception_code {
     LA_ECODE_INT = 0x0,

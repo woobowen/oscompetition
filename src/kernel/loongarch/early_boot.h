@@ -11,7 +11,7 @@
     "loongarch boot start\n" \
     "la_entry: qemu virt early console online\n" \
     "la_boot_main: arch scaffold active\n" \
-    "la_trap: eentry syscall scaffold staged\n" \
+    "la_trap: full trapframe syscall return scaffold staged\n" \
     "la_boot_main: next userret virtio-pci ext4\n"
 
 void la_uart_putc(char c);
