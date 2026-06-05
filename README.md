@@ -109,6 +109,7 @@ A、B 两条线可以并行推进：A 负责 RISC-V 得分主线，B 负责 Loon
 - `kernel-la` 已是合法 LoongArch ELF
 - QEMU LoongArch 已不再报 `could not load kernel 'kernel-la': Failed to load ELF`
 - 串口可见 `loongarch boot start`
+- 已建立 `src/kernel/loongarch/` 作为 B 线独立架构目录
 - 当前仓库主体仍是 RISC-V 架构实现
 
 具体任务：
@@ -117,12 +118,10 @@ A、B 两条线可以并行推进：A 负责 RISC-V 得分主线，B 负责 Loon
 2. [x] 实现最小 LoongArch 入口，让 `qemu-system-loongarch64 -kernel kernel-la ...` 不再报 `Failed to load ELF`。
 3. [x] 打通最小串口输出，能看到自定义启动日志 `loongarch boot start`。
 4. [x] 梳理后续要进入测试还缺的模块清单：trap、syscall 入口、用户态返回、virtio PCI 块设备、EXT4、initcode/test 扫描等。
-5. [ ] 逐步接入 LoongArch trap、syscall、用户态返回、virtio PCI、EXT4 和测试入口。
+5. [~] 逐步接入 LoongArch trap、syscall、用户态返回、virtio PCI、EXT4 和测试入口。当前已建立早期架构脚手架，尚未接入真正 trap/syscall/设备。
 
 验收标准：
 
-- 必须：`kernel-la` 不再是 RISC-V ELF 复制品
-- 必须：QEMU LoongArch 不再报 `Failed to load ELF`
 - 目标：`os_serial_out_la.txt` 能看到 LoongArch 早期启动日志
 - 加分：进入更完整的内核初始化阶段，但不强制进入测试脚本
 

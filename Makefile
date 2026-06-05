@@ -29,6 +29,7 @@ HOSTCFLAGS ?= -O2 -Wall -Werror
 BIN2C_SRC = tools/bin2c.c
 BIN2C = $(TARGET)/tools/bin2c
 LA_ELFGEN_SRC = tools/la_elfgen.c
+LA_EARLY_BOOT_HDR = $(KernelPath)/loongarch/early_boot.h
 LA_ELFGEN = $(TARGET)/tools/la_elfgen
 
 # 收集内核源文件 (.c .S，包括子目录)
@@ -54,10 +55,13 @@ USER_TEST_ELF = $(USER_TEST_C:$(UserPath)/%.c=$(TARGET)/user/%.elf)
 
 # QEMU 模拟器配置
 QEMU     = qemu-system-riscv64
+QEMU_LA  = qemu-system-loongarch64
 QEMUOPTS = -machine virt -bios default -kernel $(ELFKernel)
 QEMUOPTS += -m 128M -smp $(CPUNUM) -nographic -serial mon:stdio -d guest_errors,cpu_reset -D qemu.log
 QEMUOPTS += -drive file=$(DISKIMG),if=none,format=raw,id=x0
 QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+LA_SERIAL_LOG = os_serial_out_la.txt
+LA_QEMU_TIMEOUT = 8s
 
 # 调试配置
 GDBPORT = $(shell expr `id -u` % 5000 + 25000)
@@ -119,8 +123,8 @@ $(BIN2C): $(BIN2C_SRC) | $(TARGET)
 	$(HOSTCC) $(HOSTCFLAGS) -o $@ $<
 
 # 构建主机端的 LoongArch 最小 ELF 生成工具
-$(LA_ELFGEN): $(LA_ELFGEN_SRC) | $(TARGET)
-	$(HOSTCC) $(HOSTCFLAGS) -o $@ $<
+$(LA_ELFGEN): $(LA_ELFGEN_SRC) $(LA_EARLY_BOOT_HDR) | $(TARGET)
+	$(HOSTCC) $(HOSTCFLAGS) -I. -o $@ $<
 
 # 生成 kernel-qemu.elf
 $(ELFKernel): $(KernelOBJ) $(ELFUser)
@@ -148,7 +152,7 @@ all: build build-la
 build: $(TARGET) $(ELFUser) $(USER_TEST_ELF) $(ELFKernel) $(DISKIMG)
 	@echo "===== make success! ====="
 
-# LoongArch B 线：当前只生成可被 QEMU 加载并打印早期日志的最小 ELF
+# LoongArch B 线：当前生成可被 QEMU 加载并进入早期架构脚手架的最小 ELF
 .PHONY: build-la
 build-la: $(TARGET) $(ELFKernelLA)
 	@echo "===== make build-la success! ====="
@@ -160,7 +164,15 @@ run: build
 
 .PHONY: run-la
 run-la: build-la $(DISKIMG)
-	qemu-system-loongarch64 -kernel $(ELFKernelLA) -m 1G -nographic -smp $(CPUNUM) -drive file=$(DISKIMG),if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0 -no-reboot -device virtio-net-pci,netdev=net0 -netdev user,id=net0 -rtc base=utc
+	$(QEMU_LA) -kernel $(ELFKernelLA) -m 1G -nographic -smp $(CPUNUM) -drive file=$(DISKIMG),if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0 -no-reboot -device virtio-net-pci,netdev=net0 -netdev user,id=net0 -rtc base=utc
+
+.PHONY: check-la
+check-la: all
+	timeout $(LA_QEMU_TIMEOUT) $(QEMU_LA) -kernel kernel-la -m 1G -display none -serial file:$(LA_SERIAL_LOG) -smp $(CPUNUM) || test $$? -eq 124
+	@cat $(LA_SERIAL_LOG)
+	@grep -q "loongarch boot start" $(LA_SERIAL_LOG)
+	@grep -q "la_boot_main: arch scaffold active" $(LA_SERIAL_LOG)
+	@echo "===== make check-la success! ====="
 
 # 调试目标
 .PHONY: debug

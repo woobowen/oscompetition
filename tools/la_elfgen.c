@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "src/kernel/loongarch/early_boot.h"
+
 /* Host-side generator for the first LoongArch boot stub; no LA toolchain needed. */
 #define EM_LOONGARCH 258
 
@@ -16,11 +18,7 @@
 #define PF_X 1
 #define PF_R 4
 
-#define LA_KERNEL_ENTRY 0x200000ULL
-#define LA_TEXT_OFFSET 0x1000ULL
-#define LA_UART_BASE 0x1fe001e0U
-
-#define MAX_CODE_WORDS 256
+#define MAX_CODE_WORDS 1024
 
 static void die_errno(const char *what, const char *path)
 {
@@ -99,9 +97,7 @@ static void append_insn(uint32_t *code, size_t *words, uint32_t insn)
 
 static size_t build_boot_stub(uint32_t *code)
 {
-    static const char msg[] =
-        "loongarch boot start\n"
-        "kernel-la: minimal early UART alive\n";
+    static const char msg[] = LA_EARLY_BOOT_LOG;
     size_t words = 0;
     const unsigned uart = 4;
     const unsigned ch = 5;
