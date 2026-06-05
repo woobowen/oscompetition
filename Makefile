@@ -31,10 +31,20 @@ BIN2C = $(TARGET)/tools/bin2c
 LA_ELFGEN_SRC = tools/la_elfgen.c
 LA_EARLY_BOOT_HDR = $(KernelPath)/loongarch/early_boot.h
 LA_ELFGEN = $(TARGET)/tools/la_elfgen
+LA_TOOLPREFIX ?= loongarch64-linux-gnu-
+LA_CC = $(LA_TOOLPREFIX)gcc
+LA_LD = $(LA_TOOLPREFIX)ld
+LA_BUILD_MODE ?= $(if $(shell command -v $(LA_CC) >/dev/null 2>&1 && command -v $(LA_LD) >/dev/null 2>&1 && echo yes),source,stub)
+LA_KERNEL_LD = $(KernelPath)/loongarch/kernel.ld
+LA_SOURCE_FILE = $(KernelPath)/loongarch/entry.S $(KernelPath)/loongarch/boot.c
+LA_SOURCE_OBJ = $(TARGET)/loongarch/entry.o $(TARGET)/loongarch/boot.o
+LA_CFLAGS = -Wall -Werror -O2 -ffreestanding -fno-common -nostdlib -fno-stack-protector -fno-pie -I.
+LA_LDFLAGS = -z max-page-size=4096
 
 # 收集内核源文件 (.c .S，包括子目录)
 KernelSourceFile = $(wildcard $(KernelPath)/*.c) $(wildcard $(KernelPath)/*.S)
 KernelSourceFile += $(wildcard $(KernelPath)/*/*.c) $(wildcard $(KernelPath)/*/*.S)
+KernelSourceFile := $(filter-out $(KernelPath)/loongarch/%, $(KernelSourceFile))
 
 # 内核目标文件
 KernelOBJ = $(patsubst $(KernelPath)/%.S, $(TARGET)/kernel/%.o, $(filter %.S, $(KernelSourceFile)))
@@ -126,13 +136,28 @@ $(BIN2C): $(BIN2C_SRC) | $(TARGET)
 $(LA_ELFGEN): $(LA_ELFGEN_SRC) $(LA_EARLY_BOOT_HDR) | $(TARGET)
 	$(HOSTCC) $(HOSTCFLAGS) -I. -o $@ $<
 
+# LoongArch 源码构建路径（有 loongarch64-linux-gnu-* 工具链时启用）
+$(TARGET)/loongarch/%.o: $(KernelPath)/loongarch/%.S $(LA_EARLY_BOOT_HDR) | $(TARGET)
+	$(LA_CC) $(LA_CFLAGS) -c -o $@ $<
+
+$(TARGET)/loongarch/%.o: $(KernelPath)/loongarch/%.c $(LA_EARLY_BOOT_HDR) | $(TARGET)
+	$(LA_CC) $(LA_CFLAGS) -c -o $@ $<
+
 # 生成 kernel-qemu.elf
 $(ELFKernel): $(KernelOBJ) $(ELFUser)
 	$(LD) $(LDFLAGS) -T $(KERNEL_LD) $(KernelOBJ) -o $@
 
+ifeq ($(LA_BUILD_MODE),source)
+# 生成 LoongArch 源码启动 ELF
+$(ELFKernelLA): $(LA_SOURCE_OBJ) $(LA_KERNEL_LD) | $(TARGET)
+	$(LA_LD) $(LA_LDFLAGS) -T $(LA_KERNEL_LD) $(LA_SOURCE_OBJ) -o $@
+else ifeq ($(LA_BUILD_MODE),stub)
 # 生成 LoongArch 最小启动 ELF
 $(ELFKernelLA): $(LA_ELFGEN) | $(TARGET)
 	$(LA_ELFGEN) $@
+else
+$(error unsupported LA_BUILD_MODE=$(LA_BUILD_MODE), use source or stub)
+endif
 
 # 生成磁盘映像（包含所有普通用户程序）
 $(DISKIMG): $(USER_TEST_ELF)
@@ -155,7 +180,7 @@ build: $(TARGET) $(ELFUser) $(USER_TEST_ELF) $(ELFKernel) $(DISKIMG)
 # LoongArch B 线：当前生成可被 QEMU 加载并进入早期架构脚手架的最小 ELF
 .PHONY: build-la
 build-la: $(TARGET) $(ELFKernelLA)
-	@echo "===== make build-la success! ====="
+	@echo "===== make build-la success ($(LA_BUILD_MODE))! ====="
 
 # 运行目标
 .PHONY: run
