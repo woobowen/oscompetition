@@ -59,12 +59,13 @@ RISC-V 目前阻塞在用户态程序启动后的 Linux 兼容 syscall 缺失：
 
 ## 三、LoongArch 当前状态
 
-LoongArch 仍未实装：
+LoongArch 已有最小启动主线：
 
-- `kernel-la` 目前不是 LoongArch 原生内核构建链产物
-- 评测侧仍会出现：`qemu-system-loongarch64: could not load kernel 'kernel-la': Failed to load ELF`
+- `make build-la` 生成 `target/loongarch/kernel-la.elf`
+- `make all` 生成的根目录 `kernel-la` 是合法 LoongArch ELF，不再复制 RISC-V ELF
+- `qemu-system-loongarch64 -kernel kernel-la ...` 可加载并打印 `loongarch boot start`
 
-本轮工作优先级是先把 RISC-V 流程跑通，LoongArch 作为后续独立工作项。
+当前 LoongArch 还只是早期 UART stub，尚未接入通用内核、trap、syscall、文件系统和测试入口。
 
 ---
 
@@ -103,19 +104,20 @@ A、B 两条线可以并行推进：A 负责 RISC-V 得分主线，B 负责 Loon
 
 目标：把 LoongArch 从“QEMU 无法加载 kernel-la”推进到“能加载、能进入早期内核、能看到明确启动日志”。不强求进入测试脚本，但最好可以像现在的risc-v一样能够进入测试脚本。
 
-当前起点：
+当前状态：
 
-- `kernel-la` 还不是合法 LoongArch 内核
-- QEMU 当前报 `could not load kernel 'kernel-la': Failed to load ELF`
+- `kernel-la` 已是合法 LoongArch ELF
+- QEMU LoongArch 已不再报 `could not load kernel 'kernel-la': Failed to load ELF`
+- 串口可见 `loongarch boot start`
 - 当前仓库主体仍是 RISC-V 架构实现
 
 具体任务：
 
-1. 建立 LoongArch 独立最小构建路径，生成真正的 LoongArch ELF，而不是复制 RISC-V ELF。
-2. 实现最小 LoongArch 入口和链接脚本，让 `qemu-system-loongarch64 -kernel kernel-la ...` 不再报 `Failed to load ELF`。
-3. 打通最小串口输出，至少能在 `os_serial_out_la.txt` 中看到自定义启动日志，例如 `loongarch boot start`。
-4. 梳理后续要进入测试还缺的模块清单：trap、syscall 入口、用户态返回、virtio 块设备、EXT4、initcode/test 扫描等。
-5. 尽量把 LoongArch 代码放在独立架构目录中，避免破坏 RISC-V 当前可运行路径。
+1. [x] 建立 LoongArch 独立最小构建路径，生成真正的 LoongArch ELF，而不是复制 RISC-V ELF。
+2. [x] 实现最小 LoongArch 入口，让 `qemu-system-loongarch64 -kernel kernel-la ...` 不再报 `Failed to load ELF`。
+3. [x] 打通最小串口输出，能看到自定义启动日志 `loongarch boot start`。
+4. [x] 梳理后续要进入测试还缺的模块清单：trap、syscall 入口、用户态返回、virtio PCI 块设备、EXT4、initcode/test 扫描等。
+5. [ ] 逐步接入 LoongArch trap、syscall、用户态返回、virtio PCI、EXT4 和测试入口。
 
 验收标准：
 

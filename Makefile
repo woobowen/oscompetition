@@ -19,6 +19,7 @@ USER_LD   = $(LoaderPath)/user.ld
 
 # 定义目标文件路径
 ELFKernel  = $(TARGET)/kernel/kernel-qemu.elf
+ELFKernelLA = $(TARGET)/loongarch/kernel-la.elf
 ELFUser    = $(UserPath)/initcode.h
 DISKIMG    = $(TARGET)/mkfs/disk.img
 
@@ -27,6 +28,8 @@ HOSTCC ?= gcc
 HOSTCFLAGS ?= -O2 -Wall -Werror
 BIN2C_SRC = tools/bin2c.c
 BIN2C = $(TARGET)/tools/bin2c
+LA_ELFGEN_SRC = tools/la_elfgen.c
+LA_ELFGEN = $(TARGET)/tools/la_elfgen
 
 # 收集内核源文件 (.c .S，包括子目录)
 KernelSourceFile = $(wildcard $(KernelPath)/*.c) $(wildcard $(KernelPath)/*.S)
@@ -69,7 +72,6 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
 # 创建输出目录
 .PHONY: $(TARGET)
 $(TARGET):
-ifeq ($(wildcard $(TARGET)),)
 	@mkdir -p $(TARGET)/kernel
 	@mkdir -p $(TARGET)/kernel/arch
 	@mkdir -p $(TARGET)/kernel/boot
@@ -80,10 +82,10 @@ ifeq ($(wildcard $(TARGET)),)
 	@mkdir -p $(TARGET)/kernel/proc
 	@mkdir -p $(TARGET)/kernel/syscall
 	@mkdir -p $(TARGET)/kernel/fs
+	@mkdir -p $(TARGET)/loongarch
 	@mkdir -p $(TARGET)/user
 	@mkdir -p $(TARGET)/mkfs
 	@mkdir -p $(TARGET)/tools
-endif
 
 # 内核编译规则
 $(TARGET)/kernel/%.o: $(KernelPath)/%.S
@@ -116,9 +118,17 @@ $(ELFUser): $(USER_INIT_OBJ) $(BIN2C)
 $(BIN2C): $(BIN2C_SRC) | $(TARGET)
 	$(HOSTCC) $(HOSTCFLAGS) -o $@ $<
 
+# 构建主机端的 LoongArch 最小 ELF 生成工具
+$(LA_ELFGEN): $(LA_ELFGEN_SRC) | $(TARGET)
+	$(HOSTCC) $(HOSTCFLAGS) -o $@ $<
+
 # 生成 kernel-qemu.elf
 $(ELFKernel): $(KernelOBJ) $(ELFUser)
 	$(LD) $(LDFLAGS) -T $(KERNEL_LD) $(KernelOBJ) -o $@
+
+# 生成 LoongArch 最小启动 ELF
+$(ELFKernelLA): $(LA_ELFGEN) | $(TARGET)
+	$(LA_ELFGEN) $@
 
 # 生成磁盘映像（包含所有普通用户程序）
 $(DISKIMG): $(USER_TEST_ELF)
@@ -127,9 +137,9 @@ $(DISKIMG): $(USER_TEST_ELF)
 
 # 新增 all 目标以兼容评测系统调用 `make all`
 .PHONY: all
-all: build
+all: build build-la
 	@cp $(ELFKernel) kernel-rv
-	@cp $(ELFKernel) kernel-la
+	@cp $(ELFKernelLA) kernel-la
 	@echo "===== make all: kernel-rv generated ====="
 	@echo "===== make all: kernel-la generated ====="
 
@@ -138,10 +148,19 @@ all: build
 build: $(TARGET) $(ELFUser) $(USER_TEST_ELF) $(ELFKernel) $(DISKIMG)
 	@echo "===== make success! ====="
 
+# LoongArch B 线：当前只生成可被 QEMU 加载并打印早期日志的最小 ELF
+.PHONY: build-la
+build-la: $(TARGET) $(ELFKernelLA)
+	@echo "===== make build-la success! ====="
+
 # 运行目标
 .PHONY: run
 run: build
 	$(QEMU) $(QEMUOPTS)
+
+.PHONY: run-la
+run-la: build-la $(DISKIMG)
+	qemu-system-loongarch64 -kernel $(ELFKernelLA) -m 1G -nographic -smp $(CPUNUM) -drive file=$(DISKIMG),if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0 -no-reboot -device virtio-net-pci,netdev=net0 -netdev user,id=net0 -rtc base=utc
 
 # 调试目标
 .PHONY: debug
