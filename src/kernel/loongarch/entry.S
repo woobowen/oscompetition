@@ -5,6 +5,13 @@
 .type _entry, @function
 _entry:
         la.local $sp, la_boot_stack_top
+
+        # General exceptions use CSR.EENTRY when CSR.ECFG.VS is zero.
+        move    $t0, $zero
+        csrwr   $t0, 0x4
+        la.local $t0, la_exception_entry
+        csrwr   $t0, 0xc
+
         bl la_boot_main
 
 1:

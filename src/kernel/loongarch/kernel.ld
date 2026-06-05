@@ -10,6 +10,11 @@ SECTIONS
     *(.text .text.*)
   }
 
+  . = ALIGN(0x1000);
+  .text.trap : {
+    *(.text.trap)
+  }
+
   .rodata : {
     . = ALIGN(16);
     *(.rodata .rodata.*)

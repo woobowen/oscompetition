@@ -110,7 +110,7 @@ A、B 两条线可以并行推进：A 负责 RISC-V 得分主线，B 负责 Loon
 - QEMU LoongArch 已不再报 `could not load kernel 'kernel-la': Failed to load ELF`
 - 串口可见 `loongarch boot start`
 - 已建立 `src/kernel/loongarch/` 作为 B 线独立架构目录
-- 已补 LoongArch `entry.S`、`boot.c`、`kernel.ld` 源码构建路径；本机无 LoongArch 工具链时仍使用 stub fallback
+- 已补 LoongArch `entry.S`、`boot.c`、`trap_entry.S`、`trap.c`、`syscall.c`、`kernel.ld` 源码构建路径；本机无 LoongArch 工具链时仍使用 stub fallback
 - 当前仓库主体仍是 RISC-V 架构实现
 
 具体任务：
@@ -119,7 +119,7 @@ A、B 两条线可以并行推进：A 负责 RISC-V 得分主线，B 负责 Loon
 2. [x] 实现最小 LoongArch 入口，让 `qemu-system-loongarch64 -kernel kernel-la ...` 不再报 `Failed to load ELF`。
 3. [x] 打通最小串口输出，能看到自定义启动日志 `loongarch boot start`。
 4. [x] 梳理后续要进入测试还缺的模块清单：trap、syscall 入口、用户态返回、virtio PCI 块设备、EXT4、initcode/test 扫描等。
-5. [~] 逐步接入 LoongArch trap、syscall、用户态返回、virtio PCI、EXT4 和测试入口。当前已建立早期架构脚手架和源码启动路径，尚未接入真正 trap/syscall/设备。
+5. [~] 逐步接入 LoongArch trap、syscall、用户态返回、virtio PCI、EXT4 和测试入口。当前已建立早期架构脚手架、源码启动路径和 trap/syscall 骨架，尚未接入用户态返回/设备。
 
 验收标准：
 
