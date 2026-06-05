@@ -14,7 +14,17 @@
 
 ## 后续接入顺序
 
-1. 在有 LoongArch 工具链的环境里验证 `LA_BUILD_MODE=source make build-la check-la`。
-2. 移植上下文切换和调度器架构钩子。
-3. 支持 LoongArch QEMU 命令使用的 `virtio-blk-pci` 块设备。
-4. 块设备可读写后复用 EXT4、initcode 和测试入口扫描。
+1. 准备 LoongArch 交叉工具链，至少需要 `loongarch64-linux-gnu-gcc` 和 `loongarch64-linux-gnu-ld`。
+   检查命令：
+   ```bash
+   command -v loongarch64-linux-gnu-gcc
+   command -v loongarch64-linux-gnu-ld
+   ```
+2. 在有 LoongArch 工具链的环境里验证源码构建路径：
+   ```bash
+   LA_BUILD_MODE=source make build-la
+   LA_BUILD_MODE=source make check-la
+   ```
+3. 移植上下文切换和调度器架构钩子。
+4. 支持 LoongArch QEMU 命令使用的 `virtio-blk-pci` 块设备。
+5. 块设备可读写后复用 EXT4、initcode 和测试入口扫描。
