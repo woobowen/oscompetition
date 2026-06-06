@@ -184,7 +184,7 @@ uint64 sys_clone()
     int pid = child->pid;
     if ((flags & 0x100000) && parent_tid != 0)
         uvm_copyout(parent->pgtbl, parent_tid, (uint64)&pid, sizeof(pid));
-    if (child_tid != 0)
+    if ((flags & 0x1000000) && child_tid != 0)
         uvm_copyout(parent->pgtbl, child_tid, (uint64)&pid, sizeof(pid));
 
     spinlock_release(&child->lk);
@@ -725,10 +725,37 @@ uint64 sys_dup3()
 }
 
 /*
-    mprotect(addr, len, prot) 鈥?妗╁疄鐜? 鎬绘槸鎴愬姛
-    鍔ㄦ€侀摼鎺ュ櫒鑷噸瀹氫綅鏃惰皟鐢? 鍥犱负瑙ｉ噴鍣ㄦ浠?RWX 鍔犺浇鎵€浠ュ畨鍏?*/
+    mprotect(addr, len, prot)
+    Minimal Linux/RISC-V compatibility: update permissions on existing
+    user mappings. PROT_NONE keeps a readable mapping to match current
+    SeaOS mmap behavior while allowing pthread stacks/TLS to become writable.
+*/
 uint64 sys_mprotect()
 {
+    uint64 addr = arg_raw(0);
+    uint64 len = arg_raw(1);
+    uint64 prot = arg_raw(2);
+
+    if (len == 0)
+        return 0;
+    if (addr % PGSIZE != 0 || (prot & ~7UL) != 0)
+        return (uint64)(-EINVAL);
+    if (len > VA_MAX - (PGSIZE - 1))
+        return (uint64)(-EINVAL);
+
+    uint64 aligned_len = (len + PGSIZE - 1) & ~(PGSIZE - 1);
+    if (addr + aligned_len < addr || addr + aligned_len > VA_MAX)
+        return (uint64)(-EINVAL);
+
+    int perm = PTE_U;
+    if (prot & 1) perm |= PTE_R;
+    if (prot & 2) perm |= PTE_W | PTE_R;
+    if (prot & 4) perm |= PTE_X;
+    if (!(perm & (PTE_R | PTE_W | PTE_X)))
+        perm |= PTE_R;
+
+    if (uvm_mprotect(myproc()->pgtbl, addr, aligned_len, perm) < 0)
+        return (uint64)(-ENOMEM);
     return 0;
 }
 
@@ -1462,16 +1489,28 @@ uint64 sys_clock_getres()
     return 0;
 }
 
-// 115 clock_nanosleep(clockid, flags, request, remain): 楂樼簿搴︾潯鐪犮€?
+// 115 clock_nanosleep(clockid, flags, request, remain): minimal sleep support.
 uint64 sys_clock_nanosleep()
 {
+    uint64 flags = arg_raw(1);
     uint64 request = arg_raw(2);
+    if ((flags & ~1UL) != 0)
+        return (uint64)(-EINVAL);
     if (request == 0) return 0;
     uint64 ts[2] = {0, 0};
     uvm_copyin(myproc()->pgtbl, (uint64)ts, request, sizeof(ts));
-    uint64 ntick = ts[0] * 10;
-    if (ts[1] > 0)
-        ntick += (ts[1] + 99999999ull) / 100000000ull;
+    if (ts[1] >= 1000000000ull)
+        return (uint64)(-EINVAL);
+
+    uint64 sleep_timebase = ts[0] * TIMEBASE_HZ + (ts[1] + 99ull) / 100ull;
+    if (flags & 1) {
+        uint64 now = r_time();
+        if (sleep_timebase <= now)
+            return 0;
+        sleep_timebase -= now;
+    }
+
+    uint64 ntick = (sleep_timebase + INTERVAL - 1) / INTERVAL;
     if (ntick == 0)
         ntick = 1;
     timer_wait(ntick);

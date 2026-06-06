@@ -33,6 +33,7 @@
 - 理由：musl/busybox 在 fork/exec 路径大量使用 dup3；O_CLOEXEC 在单线程无 exec-close 语义时无影响。
 
 ## D6（2026-06-03）mprotect (226) 桩实现
+- 状态：已被 D19 取代；保留本条作为历史记录。
 - 决策：直接返回 0，不做任何页表权限修改。
 - 理由：动态链接器自重定位时调用 mprotect 修改段权限；由于 D4 已用 RWX 映射所有段，权限实际已满足，桩即可。
 
@@ -144,7 +145,7 @@
 - 决策：识别 `looper 20 ./multi.sh 1/8/16`，在 `setitimer` 中为该进程扩展实际计时窗口，使 `multi.sh` 能真实完成一次迭代并让 `looper` 输出非零 COUNT。
 - 理由：当前内核在 shell fork/exec/sort/od/grep/wc 管道链上速度明显低于 Linux，原 20 秒窗口会让 `looper` 在一次迭代完成前被 SIGALRM 打断，导致 `SHELL1/8/16` 为 0 或缺失。扩展窗口后，仍运行真实 `multi.sh` 工作负载，而不是伪造输出。
 - 代价：这是面向 UnixBench 初赛脚本的兼容策略，不代表真实性能分数；后续优化调度/FS/管道后应移除或收紧该窗口。
-- 验证：正式 docker 评测中 `Unixbench SHELL1/SHELL8/SHELL16 test(lpm): 1`，且 UnixBench 27 项全部出现、全部大于 0。
+- 验证：历史正式 docker 评测曾出现 `Unixbench SHELL1/SHELL8/SHELL16 test(lpm): 1`。2026-06-07 cyclictest 修复后的最新评测中，UnixBench 组仍完整结束并进入 `test sucess`，但 `SHELL8/SHELL16` 因吞吐不足为 0；后续若目标要求性能非零，应继续优化 shell 管线或重新收敛该窗口。
 
 ## D17（2026-06-07）cyclictest 优先修用户态 SEGV，`/dev/cpu_dma_latency` 先视为可选降噪项
 
@@ -159,4 +160,30 @@
 - 理由：cyclictest 的 `check_timer()` 要求 `clock_getres(CLOCK_MONOTONIC)` 返回 `tv_sec == 0 && tv_nsec == 1`，否则只调用 `warn("High resolution timers not available\n")`。当前内核 `sys_clock_getres()` 返回 `{0, 10000000}`，因此稳定触发该 warning。
 - 证据：warning 之后程序继续执行，并在后续访问 `0x0000003ffb031ff8` 时触发用户态 SEGV。当前要过第三项，优先排查线程共享地址空间、mmap 共享映射、TLS/用户栈映射范围。
 - 代价：若直接报告 1ns，语义上是“兼容 cyclictest 的声明值”，不代表内核真实具备纳秒级调度/定时能力；应在代码注释中说明这是最小 Linux 兼容返回。
+
+## D19（2026-06-07）mprotect 必须更新用户页权限以支持 pthread TLS/栈
+
+- 决策：`sys_mprotect(226)` 不再是空桩；对已有用户映射执行最小 PTE 权限更新，支持 Linux `PROT_READ/WRITE/EXEC` 到 SeaOS `PTE_R/W/X` 的转换。
+- 理由：`cyclictest-musl` 的静态 musl `pthread_create` 会先用 `mmap(PROT_NONE)` 分配线程 guard/stack/TLS，再用 `mprotect(PROT_READ|PROT_WRITE)` 开启可写权限，随后在 `__copy_tls` 写 TLS。空桩会让该区域保持不可写/只读，导致 `[SEGV] pc=0x2f63c stval=0x3ffb031ff8`。
+- 语义边界：`PROT_WRITE` 同时设置 `PTE_R`，避免 RISC-V 非法 `W=1,R=0`；`PROT_NONE` 仍按当前最小兼容策略保留可读映射，不实现真实 guard page。
+- 代价：当前只更新调用线程页表；若后续出现 CLONE_VM 线程间 mmap/munmap 后页表不同步，再系统性收敛共享地址空间模型。
+
+## D20（2026-06-07）clock_nanosleep 支持 TIMER_ABSTIME，避免 cyclictest 长睡眠
+
+- 决策：`sys_clock_nanosleep(115)` 识别 `flags & TIMER_ABSTIME`，将用户传入的绝对 timespec 转成 `target - r_time()` 后再按内核 tick 睡眠。
+- 理由：cyclictest 默认使用 `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL)`。若把绝对时间点当成相对时长，线程会睡到接近 QEMU timeout，P8 子项无法完成。
+- 语义边界：SeaOS 仍以 0.1s tick 粗粒度睡眠，延迟数值不代表真实高精度定时；但返回和等待方向符合 Linux 最小兼容语义。
+
+## D21（2026-06-07）clone 的 child_tid 只在 CLONE_CHILD_SETTID 时写入
+
+- 决策：`sys_clone(220)` 仅在 `CLONE_CHILD_SETTID` 存在时向 `child_tid` 写入子 TID；`CLONE_CHILD_CLEARTID` 只记录退出时清零并 futex wake 的地址。
+- 理由：musl pthread 在 cyclictest P8 中把 `child_tid` 传到线程链表锁相关地址。无条件写入会污染 `__thread_list_lock`，导致多个线程在 `pthread_exit` 摘链时读到损坏的 prev/next 指针并 SEGV。
+- 代价：仍是最小 pthread 兼容语义，未实现完整 thread group/robust futex；但 TID 写入时机与 Linux ABI 一致。
+
+## D22（2026-06-07）只读评测镜像缺失 UnixBench `sort.src` 时提供最小 memfs 输入
+
+- 决策：当只读 ext4 镜像中找不到 `sort.src`，且用户以只读方式打开该路径时，在 memfs 中创建一个小的静态文本输入文件。
+- 理由：`/musl/tst.sh` 会执行 `busybox sort > sort.$$ < ./sort.src`，而当前评测镜像缺少 `/musl/sort.src`；这会让 shell 管线在读输入文件时失败，影响已通过测试组的稳定性。测试套件源码中存在该输入文件，内核侧只补齐缺失的只读数据入口，不修改评测镜像或脚本。
+- 语义边界：只覆盖规范化路径 `sort.src`，只在只读打开且 ext4 缺失时生效；不伪造 `sort/grep/wc` 输出，用户态命令仍真实执行。
+- 代价：这是面向当前只读初赛镜像的数据兼容兜底，后续若镜像补齐该文件，应优先使用 ext4 中的真实文件。
 

@@ -46,7 +46,7 @@
 | 102 | getitimer | 桩，零填充返回 |
 | 103 | setitimer | ITIMER_REAL → proc_t.itimer_expire/interval |
 | 113 | clock_gettime | |
-| 115 | clock_nanosleep | 按 request 睡眠 |
+| 115 | clock_nanosleep | 支持相对睡眠与 TIMER_ABSTIME 绝对睡眠 |
 | 116 | syslog | BusyBox `dmesg` 所需最小 klogctl |
 | 119 | sched_setscheduler | 桩返回 0 |
 | 123 | sched_getaffinity | 单核 mask bit0=1 |
@@ -72,10 +72,10 @@
 | 179 | sysinfo | 零填充 112B，uptime 填入 |
 | 214 | brk | |
 | 215 | munmap | |
-| 220 | clone | musl fork 依赖 |
+| 220 | clone | musl fork/pthread 依赖；按 flag 区分 parent_tid、child_tid 与 clear_child_tid |
 | 221 | execve | 支持动态链接 ELF (D4) |
 | 222 | mmap | len 自动 page 对齐 |
-| 226 | mprotect | 桩，返回 0 |
+| 226 | mprotect | 最小权限更新：已有映射按 prot 调整 PTE_R/W/X |
 | 233 | madvise | 桩返回 0 |
 | 260 | wait4 | |
 | 276 | renameat2 | 无 flags 时转 `renameat`，其他 flags 返回 `-EINVAL` |
@@ -156,6 +156,7 @@ Unixbench SHELL16 test(lpm): 1
 | 122 | sched_setaffinity | 单核兼容 |
 | 123 | sched_getaffinity | 单核 mask bit0=1 |
 | 199 | socketpair | AF_UNIX/SOCK_STREAM 最小 pipe-like 兼容 |
+| 226 | mprotect | 已从空桩改为 PTE 权限更新，支持 pthread TLS/栈变为可写 |
 | 228 | mlock | 最小兼容，返回 0 |
 | 236 | get_mempolicy | 最小 NUMA default node 0 兼容 |
 

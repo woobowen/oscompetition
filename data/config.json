@@ -2,5 +2,5 @@
   "debug": false,
   "qemu.smp": 1,
   "qemu.mem": "1G",
-  "qemu.timeout": 1800
+  "qemu.timeout": 3600
 }

@@ -103,6 +103,30 @@ void uvm_copyin_str(pgtbl_t pgtbl, uint64 dst, uint64 src, uint32 maxlen)
     }
 }
 
+// Update user leaf PTE permissions for an existing mapped range.
+// Return 0 on success, -1 if any page in the range is not mapped as a leaf.
+int uvm_mprotect(pgtbl_t pgtbl, uint64 begin, uint64 len, int perm)
+{
+    if (len == 0)
+        return 0;
+    if (begin % PGSIZE != 0 || begin + len < begin || begin + len > VA_MAX)
+        return -1;
+
+    uint64 end = begin + len;
+    for (uint64 va = begin; va < end; va += PGSIZE) {
+        pte_t *pte = vm_getpte(pgtbl, va, false);
+        if (pte == NULL || !(*pte & PTE_V) || PTE_CHECK(*pte))
+            return -1;
+    }
+
+    for (uint64 va = begin; va < end; va += PGSIZE) {
+        pte_t *pte = vm_getpte(pgtbl, va, false);
+        *pte = (*pte & ~(PTE_R | PTE_W | PTE_X)) | perm;
+    }
+    sfence_vma();
+    return 0;
+}
+
 /*--------------------part-2: mmap_region相关--------------------*/
 
 // 打印以mmap为首的mmap链

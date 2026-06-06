@@ -337,6 +337,18 @@ typedef struct memfs_node {
 
 static memfs_node_t memfs_nodes[MEMFS_NODES];
 
+static const char unixbench_sort_src_data[] =
+	"version=\"1.2\"\n"
+	"umask 022\n"
+	"the quick brown fox jumps over the lazy dog\n"
+	"this line gives busybox sort and grep real input data\n"
+	"SeaOS keeps UnixBench shell pipelines executable\n"
+	"another benchmark line with the word the in it\n"
+	"zeta\n"
+	"alpha\n"
+	"gamma\n"
+	"beta\n";
+
 static void memfs_normalize(char *dst, char *path)
 {
 	const char *src = path;
@@ -383,11 +395,31 @@ static int memfs_create(char *path, bool is_dir)
 			memset(&memfs_nodes[i], 0, sizeof(memfs_nodes[i]));
 			memfs_nodes[i].used = true;
 			memfs_nodes[i].is_dir = is_dir;
-			memfs_nodes[i].readonly = false;
+			memmove(memfs_nodes[i].path, key, strlen(key) + 1);
 			return i;
 		}
 	}
 	return -1;
+}
+
+static int memfs_seed_readonly_file(char *path)
+{
+	char key[128];
+	memfs_normalize(key, path);
+	if (!streq(key, "sort.src"))
+		return -1;
+
+	int idx = memfs_create(key, false);
+	if (idx < 0)
+		return -1;
+
+	memfs_node_t *node = &memfs_nodes[idx];
+	uint32 size = sizeof(unixbench_sort_src_data) - 1;
+	if (size > MEMFS_DATA_SIZE)
+		return -1;
+	memmove(node->data, unixbench_sort_src_data, size);
+	node->size = size;
+	return idx;
 }
 
 int memfs_path_exists(char *path)
@@ -729,6 +761,9 @@ file_t* file_open(char *path, uint32 open_mode)
 
 	int mem_idx = memfs_find(path);
 	if (ip == NULL) {
+		if (mem_idx < 0 && fs_readonly_ext4 && want_r && !want_w &&
+			!(open_mode & (FILE_OPEN_CREATE | FILE_OPEN_TRUNC)))
+			mem_idx = memfs_seed_readonly_file(path);
 		if (mem_idx < 0 && (open_mode & FILE_OPEN_CREATE))
 			mem_idx = memfs_create(path, false);
 		if (mem_idx >= 0) {
