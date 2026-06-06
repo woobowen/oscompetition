@@ -30,6 +30,7 @@
 #define SYS_renameat 38          // Linux/RISC-V renameat
 #define SYS_statfs 43            // Linux/RISC-V statfs
 #define SYS_fstatfs 44           // Linux/RISC-V fstatfs
+#define SYS_ftruncate 46         // Linux/RISC-V ftruncate
 #define SYS_faccessat 48         // Linux/RISC-V faccessat
 #define SYS_unlink 35            // Linux/RISC-V unlinkat
 #define SYS_newfstatat 79        // Linux/RISC-V newfstatat (按路径 stat)
@@ -50,6 +51,7 @@
 #define SYS_gettid 178           // Linux/RISC-V gettid (单线程 = pid)
 #define SYS_clone 220            // Linux/RISC-V clone (musl fork 依赖)
 #define SYS_clock_gettime 113    // Linux/RISC-V clock_gettime
+#define SYS_mlock 228            // Linux/RISC-V mlock
 #define SYS_getrusage 165        // Linux/RISC-V getrusage (零填充桩)
 #define SYS_gettimeofday 169     // Linux/RISC-V gettimeofday
 #define SYS_pipe2 59             // Linux/RISC-V pipe2
@@ -59,8 +61,10 @@
 #define SYS_ioctl 29             // Linux/RISC-V ioctl
 #define SYS_set_robust_list 99   // Linux/RISC-V set_robust_list
 #define SYS_get_robust_list 100  // Linux/RISC-V get_robust_list
+#define SYS_futex 98             // Linux/RISC-V futex
 #define SYS_getitimer 102        // Linux/RISC-V getitimer
 #define SYS_setitimer 103        // Linux/RISC-V setitimer
+#define SYS_clock_getres 114     // Linux/RISC-V clock_getres
 #define SYS_clock_nanosleep 115  // Linux/RISC-V clock_nanosleep
 #define SYS_syslog 116           // Linux/RISC-V syslog/klogctl
 #define SYS_kill 129             // Linux/RISC-V kill
@@ -68,6 +72,10 @@
 #define SYS_madvise 233          // Linux/RISC-V madvise
 #define SYS_readlinkat 78        // Linux/RISC-V readlinkat
 #define SYS_sched_yield 124      // Linux/RISC-V sched_yield
+#define SYS_sched_setparam 118   // Linux/RISC-V sched_setparam
+#define SYS_sched_getscheduler 120 // Linux/RISC-V sched_getscheduler
+#define SYS_sched_getparam 121   // Linux/RISC-V sched_getparam
+#define SYS_sched_setaffinity 122 // Linux/RISC-V sched_setaffinity
 #define SYS_sched_getaffinity 123 // Linux/RISC-V sched_getaffinity
 #define SYS_getegid 177          // Linux/RISC-V getegid
 #define SYS_geteuid 175          // Linux/RISC-V geteuid
@@ -75,6 +83,8 @@
 #define SYS_sendfile 71          // Linux/RISC-V sendfile64
 #define SYS_renameat2 276        // Linux/RISC-V renameat2
 #define SYS_sched_setscheduler 119  // Linux/RISC-V sched_setscheduler
+#define SYS_socketpair 199       // Linux/RISC-V socketpair
+#define SYS_get_mempolicy 236    // Linux/RISC-V get_mempolicy
 
 #define SYS_schedstat 500        // SeaOS 私有: 拉取调度统计快照
 #define SYS_spawn     501        // SeaOS 私有: fork+exec+wait 串行执行程序

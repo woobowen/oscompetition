@@ -224,7 +224,10 @@ static uint32 procfs_build_content(file_t *file, char *buf, uint32 cap)
 	case PROC_PID_STATUS:
 		append_str(buf, cap, &pos, "Name:\tbusybox\nState:\tS (sleeping)\nPid:\t");
 		append_u64(buf, cap, &pos, (uint64)pid);
-		append_str(buf, cap, &pos, "\nPPid:\t1\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n");
+		append_str(buf, cap, &pos,
+			"\nPPid:\t1\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n"
+			"Cpus_allowed:\t1\nCpus_allowed_list:\t0\n"
+			"Mems_allowed:\t1\nMems_allowed_list:\t0\n");
 		break;
 	default:
 		break;
@@ -380,7 +383,7 @@ static int memfs_create(char *path, bool is_dir)
 			memset(&memfs_nodes[i], 0, sizeof(memfs_nodes[i]));
 			memfs_nodes[i].used = true;
 			memfs_nodes[i].is_dir = is_dir;
-			memmove(memfs_nodes[i].path, key, strlen(key) + 1);
+			memfs_nodes[i].readonly = false;
 			return i;
 		}
 	}

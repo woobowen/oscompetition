@@ -15,6 +15,44 @@ docker run --rm \
   zhouzhouyi/os-contest:20260510 python3 /cg/kernel.zip
 ```
 
+## 2026-06-07 最新状态：前两项保持通过，cyclictest 阻塞在用户态 SEGV
+
+本轮正式 docker 命令运行后，根目录 `os_serial_out_rv.txt` 已正常产生内容，不是空日志状态。此前看到“没有输出/文件缺失”的高风险现象，主要与评测进程尚未结束、QEMU/日志文件仍被占用、以及根目录残留 `sdcard-*.img` 可能干扰解压有关；当前复现中串口日志已落到 `os_serial_out_rv.txt`。
+
+当前 RISC-V 评测日志显示：
+
+| 测试组 | 当前结论 | 证据 |
+|---|---|---|
+| unixbench-musl | 通过 | `#### OS COMP TEST GROUP END unixbench-musl ####` 后出现 `======== test sucess ========` |
+| busybox-musl | 通过 | `#### OS COMP TEST GROUP END busybox-musl ####` 后出现 `======== test sucess ========` |
+| cyclictest-musl | 未通过子项，但评测脚本组本身继续往后跑 | 四个子项均出现 `[SEGV] ... pc=0x000000000002f63c stval=0x0000003ffb031ff8` |
+
+cyclictest 当前失败日志：
+
+```text
+====== cyclictest NO_STRESS_P1 begin ======
+ERROR: WARN: stat /dev/cpu_dma_latency failedERROR: : No such file or directory
+ERROR: WARN: ERROR: High resolution timers not available
+[SEGV] pid=364 t=15 pc=0x000000000002f63c stval=0x0000003ffb031ff8 ...
+====== cyclictest NO_STRESS_P1 end: fail ======
+```
+
+同样的 SEGV 出现在 `NO_STRESS_P8`、`STRESS_P1`、`STRESS_P8`。因此当前 cyclictest 的主阻塞不是 syscall 236/199 缺失，而是用户态地址 `0x0000003ffb031ff8` 访问失败，下一步应优先排查 `clone(CLONE_VM)` 线程页表共享、mmap 文件/共享映射、TLS/线程栈相关映射范围。
+
+两个 cyclictest warning 的判断：
+
+- `/dev/cpu_dma_latency`：`testsuits-for-oskernel/rt-tests-2.7/src/cyclictest/cyclictest.c` 中注释为 `use the /dev/cpu_dma_latency trick if it's there`，`stat` 失败后只打印 `WARN` 并 `return` 到主流程；这是 Linux PM QoS 低延迟优化接口，缺失会产生 warning，但不是当前 fail 的直接原因。
+- `High resolution timers not available`：`check_timer()` 要求 `clock_getres(CLOCK_MONOTONIC)` 返回 `{0, 1}`；当前 `sys_clock_getres()` 返回 `{0, 10000000}`，所以触发 warning。该 warning 可通过把最小兼容返回值改为 1ns 消除，但当前实际终止 cyclictest 子项的是后续 SEGV。
+
+后续测试补充观察：
+
+| 后续测试组 | 当前现象 | 说明 |
+|---|---|---|
+| netperf-musl | `unknown syscall 198`，`getaddrinfo returned -11` | 198 为 socket，属于第四项之后的网络兼容缺口，不影响本轮前三项目标判断 |
+| lmbench-musl | 已进入 `latency measurements` | 本轮未作为优先目标 |
+
+公共文件风险提示：本轮为 cyclictest 已改动/接入 `src/kernel/syscall/type.h`、`src/kernel/syscall/syscall.c`、`src/kernel/syscall/sysfunc.c`、`src/kernel/proc/type.h`、`src/kernel/proc/proc.c`、`src/kernel/mem/uvm.c`、`src/kernel/fs/fs.c` 等公共路径。后续修 SEGV 时必须继续用正式 docker 命令确认 unixbench-musl 与 busybox-musl 不回退。
+
 评测框架输出 `verdict: Accpted`；编译段显示 `make all` 成功，`kernel-rv` 和 `kernel-la` 均生成。`data/config.json` 当前设置 `"qemu.timeout": 3600`，没有超过一小时上限；docker 外层总耗时会因为镜像拷贝和收尾略大于 QEMU timeout。
 
 ## 最新评测输出摘要
@@ -85,13 +123,13 @@ testcase busybox find -name "busybox_cmd.txt" success
 
 公共文件风险说明：本轮改动涉及 `src/kernel/syscall/type.h`、`src/kernel/syscall/syscall.c`、`src/kernel/syscall/sysfunc.c`、`src/kernel/proc/type.h`、`src/kernel/fs/type.h`、`src/kernel/mem/type.h` 等公共兼容/资源文件。风险是 syscall 表、Linux ABI 输出或资源上限回归；缓解方式是保持 RISC-V ABI 号不重排、不改 LoongArch 行为，并用正式 docker 命令完整重跑确认前两个测试组无隐藏失败。
 
-## 当前后续瓶颈
+## 当前后续瓶颈（历史记录，已被 2026-06-07 最新状态取代）
 
-前两个测试组之后，当前日志显示后续测试仍有独立缺口：
+前两个测试组之后，旧日志曾显示后续测试仍有独立缺口。注意：`cyclictest-musl` 的 `unknown syscall 236/199` 已在 2026-06-07 前推进补齐，当前阻塞已变为用户态 SEGV，见本文顶部最新状态。
 
 | 后续测试组 | 当前现象 | 初步方向 |
 |---|---|---|
-| cyclictest-musl | `unknown syscall 236`、`unknown syscall 199` | 236 多半是 `membarrier`，199 是 `socketpair`；需补调度/IPC 兼容 |
+| cyclictest-musl | ~~`unknown syscall 236`、`unknown syscall 199`~~ | 已取代：当前为 `[SEGV] pc=0x2f63c stval=0x3ffb031ff8` |
 | netperf-musl | `unknown syscall 198`，`getaddrinfo returned -11` | 198 是 socket；需补最小网络 syscall/loopback 语义 |
 | lmbench-musl | `unknown syscall 72` | 72 是 `pselect6`；需补 select/poll 兼容 |
 

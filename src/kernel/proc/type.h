@@ -105,7 +105,11 @@ enum proc_state
 
 // Signal
 #define NSIG        64
+#define SIGHUP      1
+#define SIGINT      2
+#define SIGKILL     9
 #define SIGALRM     14
+#define SIGTERM     15
 #define SIGCHLD     17
 #define SA_RESTORER 0x04000000
 
@@ -185,6 +189,8 @@ typedef struct proc
     uint64 sig_restorer;          // musl 设置的 sa_restorer (调用 rt_sigreturn)
     uint64 sig_pending;           // 待投递信号位图 (bit N-1 = signal N)
     uint8  sig_delivering;        // 正在投递信号中(防嵌套)
+    uint8 shared_vm;              // CLONE_VM thread: page-table leaves are shared
+    uint64 clear_child_tid;        // CLONE_CHILD_CLEARTID futex address
     // ITIMER_REAL
     uint64 itimer_expire;         // 到期时的 CLINT 时间 (0=未激活)
     uint64 itimer_interval;       // 重复间隔 (CLINT ticks, 0=单次)
@@ -219,7 +225,7 @@ typedef struct sched_stat {
 } sched_stat_t;
 
 // 系统中最多同时存在N_PROC个进程
-#define N_PROC 256
+#define N_PROC 768
 
 
 // 关于elf文件的解析

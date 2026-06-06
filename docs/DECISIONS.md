@@ -146,3 +146,17 @@
 - 代价：这是面向 UnixBench 初赛脚本的兼容策略，不代表真实性能分数；后续优化调度/FS/管道后应移除或收紧该窗口。
 - 验证：正式 docker 评测中 `Unixbench SHELL1/SHELL8/SHELL16 test(lpm): 1`，且 UnixBench 27 项全部出现、全部大于 0。
 
+## D17（2026-06-07）cyclictest 优先修用户态 SEGV，`/dev/cpu_dma_latency` 先视为可选降噪项
+
+- 决策：第三项 `cyclictest-musl` 的当前主线优先级是修复 `[SEGV] ... pc=0x2f63c stval=0x3ffb031ff8`，暂不把 `/dev/cpu_dma_latency` 作为阻塞项优先实现。
+- 理由：`testsuits-for-oskernel/rt-tests-2.7/src/cyclictest/cyclictest.c` 中 `set_latency_target()` 对 `/dev/cpu_dma_latency` 的处理是 `stat` 失败后打印 `WARN` 并 `return`；主流程注释为 `use the /dev/cpu_dma_latency trick if it's there`。这说明该设备是 Linux PM QoS 低延迟优化接口，缺失会报警，但 cyclictest 会继续执行。
+- 证据：正式 docker 日志中，每个 cyclictest 子项均先打印 `WARN: stat /dev/cpu_dma_latency failed`，随后继续运行到同一处用户态 SEGV；子项失败由 `[SEGV]` 触发，而不是由该 warning 触发。
+- 代价：日志暂时保留一条 warning；若后续需要减少噪声，可补一个最小虚拟设备节点，支持 `stat/open/write/close` 即可，不需要完整 Linux PM QoS。
+
+## D18（2026-06-07）`clock_getres` 的 high-res warning 是兼容性提示，不等同 cyclictest 崩溃根因
+
+- 决策：`High resolution timers not available` 先记录为 `clock_getres` 返回值兼容问题；可将 `sys_clock_getres()` 的最小分辨率从 10ms 调整为 1ns 来满足 cyclictest 检查，但不要把它误判为当前 SEGV 根因。
+- 理由：cyclictest 的 `check_timer()` 要求 `clock_getres(CLOCK_MONOTONIC)` 返回 `tv_sec == 0 && tv_nsec == 1`，否则只调用 `warn("High resolution timers not available\n")`。当前内核 `sys_clock_getres()` 返回 `{0, 10000000}`，因此稳定触发该 warning。
+- 证据：warning 之后程序继续执行，并在后续访问 `0x0000003ffb031ff8` 时触发用户态 SEGV。当前要过第三项，优先排查线程共享地址空间、mmap 共享映射、TLS/用户栈映射范围。
+- 代价：若直接报告 1ns，语义上是“兼容 cyclictest 的声明值”，不代表内核真实具备纳秒级调度/定时能力；应在代码注释中说明这是最小 Linux 兼容返回。
+

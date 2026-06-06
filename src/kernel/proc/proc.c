@@ -170,6 +170,7 @@ proc_t *proc_alloc()
             p->heap_top = 0;
             p->ustack_npage = 0;
             p->mmap = NULL;
+            p->shared_vm = 0;
             p->tf = NULL;
 
             // MLFQ 初始化
@@ -219,10 +220,17 @@ proc_t *proc_alloc()
             p->ctx.sp = p->kstack + 2 * PGSIZE;
 
             // Signal 初始化
+            p->cwd = NULL;
+            for (int fd = 0; fd < N_OPEN_FILE_PER_PROC; fd++) {
+                p->open_file[fd] = NULL;
+                p->fd_cloexec[fd] = 0;
+            }
+
             memset(p->sig_handler, 0, sizeof(p->sig_handler));
             p->sig_restorer = 0;
             p->sig_pending = 0;
             p->sig_delivering = 0;
+            p->clear_child_tid = 0;
             p->itimer_expire = 0;
             p->itimer_interval = 0;
             p->ub_looper_secs = 0;
@@ -243,7 +251,10 @@ void proc_free(proc_t *p)
 {
     // 释放用户态页表相关资源
     if (p->pgtbl) {
-        uvm_destroy_pgtbl(p->pgtbl); 
+        if (p->shared_vm)
+            uvm_destroy_shared_pgtbl(p->pgtbl);
+        else
+            uvm_destroy_pgtbl(p->pgtbl);
         p->pgtbl = NULL;
     }
 
@@ -264,6 +275,7 @@ void proc_free(proc_t *p)
     p->heap_top = 0;
     p->ustack_npage = 0;
     p->mmap = NULL;
+    p->shared_vm = 0;
     p->kstack = 0;
     memset(&p->ctx, 0, sizeof(p->ctx));
 
@@ -313,6 +325,7 @@ void proc_free(proc_t *p)
     p->sig_restorer = 0;
     p->sig_pending = 0;
     p->sig_delivering = 0;
+    p->clear_child_tid = 0;
     p->itimer_expire = 0;
     p->itimer_interval = 0;
     p->ub_looper_secs = 0;
@@ -454,6 +467,7 @@ int proc_fork()
     child->heap_top = parent->heap_top;
     child->ustack_npage = parent->ustack_npage;
     child->mmap = NULL; // 子进程初始无mmap
+    child->shared_vm = 0;
     child->state = RUNNABLE;
 
     // 调度统计：进入就绪态
@@ -479,6 +493,7 @@ int proc_fork()
     child->sig_restorer = parent->sig_restorer;
     child->sig_pending = 0;
     child->sig_delivering = 0;
+    child->clear_child_tid = 0;
     child->itimer_expire = 0;
     child->itimer_interval = 0;
     child->ub_looper_secs = 0;
@@ -716,6 +731,11 @@ void proc_check_itimers(uint64 now)
 void proc_exit(int exit_code)
 {
     proc_t *p = myproc();
+    if (p->clear_child_tid != 0) {
+        uint32 zero = 0;
+        uvm_copyout(p->pgtbl, p->clear_child_tid, (uint64)&zero, sizeof(zero));
+        proc_wakeup((void *)p->clear_child_tid);
+    }
     // 关闭所有打开的文件描述符（必须在获取进程锁前完成，因为 file_close 可能 sleep）
     for (int i = 0; i < N_OPEN_FILE_PER_PROC; i++) {
         if (p->open_file[i]) {
@@ -809,6 +829,8 @@ int proc_wait4(int64 wait_pid, uint64 user_addr, int wnohang)
 void proc_sleep(void *sleep_space, spinlock_t *lock)
 {
     proc_t *p = myproc();
+    if (p == NULL || lock == NULL)
+        return;
 
     // 应对外设中断处理程序调用proc_sleep的情况
     if (lock != &p->lk) {

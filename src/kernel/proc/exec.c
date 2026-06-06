@@ -679,12 +679,14 @@ static int proc_exec_with_env(char *path, char **argv, char **envp)
     p->heap_top = new_heap_top;
     p->ustack_npage = 1;
     p->mmap = NULL;
+    p->shared_vm = 0;
 
     // exec 时重置信号状态
     memset(p->sig_handler, 0, sizeof(p->sig_handler));
     p->sig_restorer = 0;
     p->sig_pending = 0;
     p->sig_delivering = 0;
+    p->clear_child_tid = 0;
     p->itimer_expire = 0;
     p->itimer_interval = 0;
     p->ub_looper_secs = unixbench_looper_secs(path, argv);
@@ -854,6 +856,8 @@ int proc_exec_target(int pid, char *path, char **argv)
     p->heap_top = new_heap_top;
     p->ustack_npage = 1;
     p->mmap = NULL;
+    p->shared_vm = 0;
+    p->clear_child_tid = 0;
     p->ub_looper_secs = unixbench_looper_secs(path, argv);
     int i;
     for(i = 0; i < sizeof(p->name) - 1 && path[i] != '\0'; i++){

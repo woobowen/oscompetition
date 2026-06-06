@@ -135,7 +135,45 @@ Unixbench SHELL16 test(lpm): 1
 - ~~glibc 脚本通用崩溃~~ → 已修复（epc ordering）
 - ~~管道命令超时~~ → 已修复（评测 timeout 配置）
 - ~~procfs 未实现：`/proc/mounts`、`/proc/self/` 等均不可访问~~ → 已修复到 BusyBox 所需最小面。
-- 后续测试当前缺口：
-  - `cyclictest-musl`：`unknown syscall 236`、`unknown syscall 199`
+- 后续测试当前缺口（历史记录，2026-06-07 已更新）：
+  - ~~`cyclictest-musl`：`unknown syscall 236`、`unknown syscall 199`~~ → 已推进补齐，当前阻塞为用户态 SEGV
   - `netperf-musl`：`unknown syscall 198`
   - `lmbench-musl`：`unknown syscall 72`
+
+## 2026-06-07 状态更新：cyclictest 相关 syscall 已推进，当前阻塞改为 SEGV
+
+本轮围绕第三项 `cyclictest-musl` 已接入/补充的 Linux/RISC-V ABI 面包括：
+
+| 号 | 名 | 当前语义 |
+|---|---|---|
+| 46 | ftruncate | 最小兼容：有效 fd 返回 0 |
+| 98 | futex | 最小 WAIT/WAKE 语义，用于 musl pthread/clone 线程等待 |
+| 114 | clock_getres | 当前返回 `{0, 10000000}`；会触发 cyclictest high-res warning，后续可改为 `{0, 1}` 降噪 |
+| 118 | sched_setparam | 最小兼容 |
+| 119 | sched_setscheduler | 最小兼容，返回 0 |
+| 120 | sched_getscheduler | 最小兼容 |
+| 121 | sched_getparam | 最小兼容 |
+| 122 | sched_setaffinity | 单核兼容 |
+| 123 | sched_getaffinity | 单核 mask bit0=1 |
+| 199 | socketpair | AF_UNIX/SOCK_STREAM 最小 pipe-like 兼容 |
+| 228 | mlock | 最小兼容，返回 0 |
+| 236 | get_mempolicy | 最小 NUMA default node 0 兼容 |
+
+当前正式 docker 日志确认：
+
+```text
+#### OS COMP TEST GROUP END unixbench-musl ####
+======== test sucess ========
+#### OS COMP TEST GROUP END busybox-musl ####
+======== test sucess ========
+#### OS COMP TEST GROUP START cyclictest-musl ####
+...
+[SEGV] pid=364 t=15 pc=0x000000000002f63c stval=0x0000003ffb031ff8
+```
+
+因此旧记录中的 `cyclictest-musl: unknown syscall 236/199` 已不是当前阻塞。新的当前缺口是 cyclictest 用户态 SEGV，重点排查：
+
+- `clone(CLONE_VM)` 后父子/线程页表共享是否覆盖 mmap、用户栈、TLS 和动态链接器映射；
+- 文件/共享 `mmap` 的映射长度和边界是否覆盖 cyclictest 运行期访问；
+- `clear_child_tid` + futex wake、线程退出路径是否破坏共享地址空间；
+- `clock_getres` 可从 10ms 调整为 1ns 以消除 high-res warning，但这不是 SEGV 根因。

@@ -1,5 +1,8 @@
 {
     "C_Cpp.errorSquiggles": "disabled",
+    "files.encoding": "utf8",
+    "files.autoGuessEncoding": true,
+    "terminal.integrated.defaultProfile.windows": "PowerShell",
     "search.exclude": {
         "**/.git": true
     },

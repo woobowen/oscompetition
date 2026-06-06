@@ -460,6 +460,31 @@ void uvm_destroy_pgtbl(pgtbl_t pgtbl)
     destroy_pgtbl(pgtbl, 3);
 }
 
+static void destroy_shared_pgtbl_walk(pgtbl_t pgtbl, uint32 level)
+{
+    if (pgtbl == NULL) return;
+
+    int entries = PGSIZE / sizeof(pte_t);
+    for (int i = 0; i < entries; i++) {
+        pte_t pte = pgtbl[i];
+        if (!(pte & PTE_V)) continue;
+
+        int flags = PTE_FLAGS(pte);
+        if (level == 1 || (flags & (PTE_R | PTE_W | PTE_X)))
+            continue;
+
+        destroy_shared_pgtbl_walk((pgtbl_t)PTE_TO_PA(pte), level - 1);
+    }
+    pmem_free((uint64)pgtbl, true);
+}
+
+void uvm_destroy_shared_pgtbl(pgtbl_t pgtbl)
+{
+    vm_unmappages(pgtbl, TRAPFRAME, PGSIZE, true);
+    vm_unmappages(pgtbl, TRAMPOLINE, PGSIZE, false);
+    destroy_shared_pgtbl_walk(pgtbl, 3);
+}
+
 // 连续虚拟空间的复制
 // 在uvm_copy_pgtbl中使用
 static void copy_range(pgtbl_t old, pgtbl_t new, uint64 begin, uint64 end)
@@ -495,6 +520,18 @@ static void copy_range_sparse(pgtbl_t old, pgtbl_t new, uint64 begin, uint64 end
         uint64 page = (uint64)pmem_alloc(false);
         memmove((char *)page, (const char *)pa, PGSIZE);
         vm_mappages(new, va, page, PGSIZE, flags);
+    }
+}
+
+static void share_range_sparse(pgtbl_t old, pgtbl_t new, uint64 begin, uint64 end)
+{
+    for (uint64 va = begin; va < end; va += PGSIZE) {
+        pte_t *pte = vm_getpte(old, va, false);
+        if (!pte || !(*pte & PTE_V))
+            continue;
+        uint64 pa = (uint64)PTE_TO_PA(*pte);
+        int flags = (int)PTE_FLAGS(*pte);
+        vm_mappages(new, va, pa, PGSIZE, flags);
     }
 }
 
@@ -535,5 +572,34 @@ void uvm_copy_pgtbl(pgtbl_t old, pgtbl_t new, uint64 heap_top, uint64 ustack_npa
         if (end > begin) {
             copy_range(old, new, begin, end);
         }
+    }
+}
+
+void uvm_share_pgtbl(pgtbl_t old, pgtbl_t new, uint64 heap_top, uint64 ustack_npage, mmap_region_t *mmap)
+{
+    if (heap_top > PGSIZE) {
+        uint64 begin = PGSIZE;
+        uint64 end = ((heap_top + PGSIZE - 1) / PGSIZE) * PGSIZE;
+        if (end > begin)
+            share_range_sparse(old, new, begin, end);
+    }
+
+    uint64 interp_begin = ((heap_top + PGSIZE - 1) / PGSIZE) * PGSIZE;
+    if (interp_begin < MMAP_BEGIN)
+        share_range_sparse(old, new, interp_begin, MMAP_BEGIN);
+
+    mmap_region_t *m = mmap;
+    while (m != NULL) {
+        uint64 begin = m->begin;
+        uint64 end = m->begin + (uint64)m->npages * PGSIZE;
+        if (end > begin)
+            share_range_sparse(old, new, begin, end);
+        m = m->next;
+    }
+
+    if (ustack_npage > 0) {
+        uint64 begin = TRAPFRAME - ustack_npage * PGSIZE;
+        if (TRAPFRAME > begin)
+            share_range_sparse(old, new, begin, TRAPFRAME);
     }
 }

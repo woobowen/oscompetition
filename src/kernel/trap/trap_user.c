@@ -91,8 +91,16 @@ void trap_user_handler()
         for (int sig = 1; sig <= NSIG; sig++) {
             if (!(p->sig_pending & (1UL << (sig - 1))))
                 continue;
-            if (p->sig_handler[sig] <= 1)
+            if (p->sig_handler[sig] == 1) {
+                p->sig_pending &= ~(1UL << (sig - 1));
                 continue;
+            }
+            if (p->sig_handler[sig] == 0) {
+                if (sig == SIGINT || sig == SIGTERM || sig == SIGKILL || sig == SIGHUP)
+                    proc_exit(128 + sig);
+                p->sig_pending &= ~(1UL << (sig - 1));
+                continue;
+            }
 
             p->sig_pending &= ~(1UL << (sig - 1));
             p->sig_delivering = 1;

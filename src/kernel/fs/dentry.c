@@ -370,6 +370,9 @@ static inode_t* __path_to_inode(char *path, char *name, bool find_parent_inode)
 			ip = inode_get(ROOT_INODE); // 退回根目录
 	}
 
+	if (ip == NULL)
+		return NULL;
+
 	inode_lock(ip); 
 
 	// 2. 循环解析路径分量
@@ -402,6 +405,9 @@ static inode_t* __path_to_inode(char *path, char *name, bool find_parent_inode)
 		inode_unlock(ip); // 释放当前目录锁
 		next_ip = inode_get(next_inode_num);
 		inode_put(ip); // 释放当前目录 inode
+
+		if (next_ip == NULL)
+			return NULL;
 
 		ip = next_ip;
 		inode_lock(ip); // 锁定下一级 inode
@@ -760,6 +766,8 @@ uint32 path_rename(char *old_path, char *new_path)
 uint32 path_unlink(char *path)
 {
 	if (path == NULL)
+        return (uint32)-1;
+	if (ext4_is_active())
         return (uint32)-1;
 
 	char name[MAXLEN_FILENAME];

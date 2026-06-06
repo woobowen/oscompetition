@@ -73,6 +73,7 @@ void trap_kernel_handler()
     uint64 sstatus = r_sstatus(); // 与特权模式和中断相关的状态信息
     uint64 scause = r_scause();   // 引发trap的原因
     uint64 stval = r_stval();     // 发生trap时保存的附加信息 (不同trap类型不一样)
+    uint64 *regs = (uint64 *)(kernel_trap_stack[mycpuid()] + PGSIZE - 256);
 
     // 确认trap来自S-mode且此时trap处于关闭状态
     assert(sstatus & SSTATUS_SPP, "trap_kernel_handler: not from s-mode");
@@ -108,6 +109,18 @@ void trap_kernel_handler()
         default: // 例外处理
             printf("\nunexpected exception: %s\n", exception_info[trap_id]);
             printf("trap_id = %d, sepc = %p, stval = %p\n", trap_id, sepc, stval);
+            printf("trap_regs: ra=%p sp=%p s0=%p a0=%p a1=%p a2=%p\n",
+                   regs[0], kernel_trap_saved_sp[mycpuid()], regs[7],
+                   regs[9], regs[10], regs[11]);
+            uint64 fp = regs[7];
+            for (int i = 0; i < 6 && fp != 0; i++) {
+                uint64 saved_ra = *((uint64 *)(fp - 8));
+                uint64 saved_fp = *((uint64 *)(fp - 16));
+                printf("bt%d: ra=%p fp=%p\n", i, saved_ra, saved_fp);
+                if (saved_fp <= fp)
+                    break;
+                fp = saved_fp;
+            }
             panic("trap_kernel_handler");
         }
     }

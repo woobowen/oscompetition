@@ -453,7 +453,7 @@ typedef struct dentry {
 #define FILE_LSEEK_SUB   2     // file->offset -= lseek_offset
 
 #define PIPE_SIZE 4096
-#define N_PIPE 128
+#define N_PIPE 256
 typedef struct pipe {
     spinlock_t lk;
     char data[PIPE_SIZE];

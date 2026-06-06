@@ -45,10 +45,12 @@ uint64 sys_mmap()
     uint64 len;
     uint64 prot;
     uint64 flags;
+    uint64 fd;
     arg_uint64(0, &start);
     arg_uint64(1, &len);
     arg_uint64(2, &prot);
     arg_uint64(3, &flags);
+    fd = arg_raw(4);
     // a4=fd, a5=offset 浠呮枃浠舵槧灏勯渶瑕侊紝鍖垮悕鏄犲皠蹇界暐
 
     if (len == 0)
@@ -58,6 +60,8 @@ uint64 sys_mmap()
 
     uint64 aligned_len = (len + PGSIZE - 1) & ~(PGSIZE - 1);
     uint32 npages = aligned_len / PGSIZE;
+    if (fd != (uint64)-1 && npages < 16)
+        npages = 16;
 
     // 鏍规嵁 prot 璁剧疆 PTE 鏉冮檺
     // PROT_READ=1, PROT_WRITE=2, PROT_EXEC=4
@@ -113,18 +117,79 @@ uint64 sys_fork()
 uint64 sys_clone()
 {
     // Linux/RISC-V clone(flags=a0, stack=a1, parent_tid=a2, tls=a3, child_tid=a4)
-    // musl fork() => clone(SIGCHLD=0x11, 0, ...): 澶嶅埗鍦板潃绌洪棿, 瀛愯繑鍥?, 鐖惰繑鍥炲瓙pid
     uint64 flags = arg_raw(0);
     uint64 stack = arg_raw(1);
+    uint64 parent_tid = arg_raw(2);
+    uint64 tls = arg_raw(3);
+    uint64 child_tid = arg_raw(4);
 
-    // 浠呮敮鎸?fork 璇箟銆侰LONE_VM(0x100)=鍏变韩鍦板潃绌洪棿(绾跨▼)銆佹垨鎸囧畾鏂版爤, 鏆備笉鏀寔銆?
-    if ((flags & 0x100) || stack != 0) {
-        printf("sys_clone: unsupported flags=%p stack=%p -> -ENOSYS\n",
-               (void *)flags, (void *)stack);
-        return -ENOSYS;
+    if ((flags & 0x100) == 0 && stack == 0)
+        return proc_fork();
+
+    if ((flags & 0x100) == 0)
+        return (uint64)(-ENOSYS);
+
+    proc_t *parent = myproc();
+    proc_t *child = proc_alloc();
+    if (child == NULL)
+        return (uint64)(-EAGAIN);
+
+    trapframe_t *tf = (trapframe_t *)pmem_alloc(false);
+    if (!tf) {
+        spinlock_release(&child->lk);
+        return (uint64)(-ENOMEM);
+    }
+    *tf = *parent->tf;
+    tf->a0 = 0;
+    if (stack != 0)
+        tf->sp = stack;
+    if ((flags & 0x80000) && tls != 0)
+        tf->tp = tls;
+
+    child->tf = tf;
+    child->parent = parent;
+    child->exit_code = 0;
+    child->pgtbl = proc_pgtbl_init((uint64)tf);
+    child->heap_top = parent->heap_top;
+    child->ustack_npage = parent->ustack_npage;
+    child->mmap = parent->mmap;
+    child->shared_vm = 1;
+    child->state = RUNNABLE;
+    child->sched_last_ready_tick = timer_get_ticks();
+    child->mlfq_age_start_tick = child->sched_last_ready_tick;
+    child->sched_ready_count++;
+
+    tf->user_to_kern_satp = r_satp();
+    tf->user_to_kern_sp = child->kstack + 2 * PGSIZE;
+    tf->user_to_kern_hartid = mycpuid();
+
+    uvm_share_pgtbl(parent->pgtbl, child->pgtbl, parent->heap_top,
+                    parent->ustack_npage, parent->mmap);
+
+    for (int i = 0; i < N_OPEN_FILE_PER_PROC; i++) {
+        child->open_file[i] = parent->open_file[i] ? file_dup(parent->open_file[i]) : NULL;
+        child->fd_cloexec[i] = parent->fd_cloexec[i];
     }
 
-    return proc_fork();   // 瀛?a0 宸茬疆0銆乪pc+4; 鐖惰繑鍥炲瓙 pid (涓?fork 瀹屽叏涓€鑷?
+    memcpy(child->sig_handler, parent->sig_handler, sizeof(parent->sig_handler));
+    child->sig_restorer = parent->sig_restorer;
+    child->sig_pending = 0;
+    child->sig_delivering = 0;
+    child->clear_child_tid = (flags & 0x200000) ? child_tid : 0;
+    child->itimer_expire = 0;
+    child->itimer_interval = 0;
+    child->ub_looper_secs = 0;
+    child->cwd = parent->cwd ? inode_dup(parent->cwd) : NULL;
+
+    int pid = child->pid;
+    if ((flags & 0x100000) && parent_tid != 0)
+        uvm_copyout(parent->pgtbl, parent_tid, (uint64)&pid, sizeof(pid));
+    if (child_tid != 0)
+        uvm_copyout(parent->pgtbl, child_tid, (uint64)&pid, sizeof(pid));
+
+    spinlock_release(&child->lk);
+    mlfq_on_new(child);
+    return (uint64)pid;
 }
 
 /*
@@ -232,7 +297,40 @@ uint64 sys_gettid()
     浠呰繑鍥?pid 婊¤冻 musl 鍚姩鏈熴€?*/
 uint64 sys_set_tid_address()
 {
+    myproc()->clear_child_tid = arg_raw(0);
     return (uint64)(myproc()->pid);
+}
+
+// 98 futex(uaddr, op, val, timeout, uaddr2, val3): minimal WAIT/WAKE.
+uint64 sys_futex()
+{
+    static spinlock_t futex_lk;
+    static int futex_lk_ready = 0;
+    uint64 uaddr = arg_raw(0);
+    int op = (int)arg_raw(1) & 0x7f;
+    uint32 val = (uint32)arg_raw(2);
+
+    if (!futex_lk_ready) {
+        spinlock_init(&futex_lk, "futex");
+        futex_lk_ready = 1;
+    }
+    if (uaddr == 0)
+        return (uint64)(-EFAULT);
+    if (op == 1) {
+        proc_wakeup((void *)uaddr);
+        return 1;
+    }
+    if (op == 0) {
+        uint32 cur = 0;
+        uvm_copyin(myproc()->pgtbl, (uint64)&cur, uaddr, sizeof(cur));
+        if (cur != val)
+            return (uint64)(-EAGAIN);
+        spinlock_acquire(&futex_lk);
+        proc_sleep((void *)uaddr, &futex_lk);
+        spinlock_release(&futex_lk);
+        return 0;
+    }
+    return 0;
 }
 
 /*
@@ -926,6 +1024,15 @@ uint64 sys_fstatfs()
     return file_get_statfs_linux(file, arg_raw(1));
 }
 
+// 46 ftruncate(fd, length): cyclictest POSIX shm sizing; accept valid fds.
+uint64 sys_ftruncate()
+{
+    file_t *file;
+    if (arg_fd(0, NULL, &file) < 0)
+        return (uint64)(-EBADF);
+    return 0;
+}
+
 static bool is_busybox_applet_candidate(char *path)
 {
     if (path == NULL || path[0] == '\0')
@@ -998,7 +1105,9 @@ uint64 sys_unlink()
 
     if (memfs_unlink(path) == 0)
         return 0;
-    return path_unlink(path);
+    if (path_unlink(path) == 0)
+        return 0;
+    return (uint64)(-ENOENT);
 }
 
 // 174 getuid / 176 getgid锛氬綋鍓嶆棤澶氱敤鎴? 涓€寰?root
@@ -1148,6 +1257,12 @@ uint64 sys_clock_gettime()
     return 0;
 }
 
+// 228 mlock(addr, len): SeaOS has no paging, so mapped memory is resident.
+uint64 sys_mlock()
+{
+    return 0;
+}
+
 // 169 gettimeofday锛氳幏鍙栧綋鍓嶆椂闂达紙寰绮惧害锛?
 uint64 sys_gettimeofday()
 {
@@ -1194,6 +1309,45 @@ uint64 sys_pipe2()
         return -1;
     }
     if (flags & 0x80000U) {
+        myproc()->fd_cloexec[fd0] = 1;
+        myproc()->fd_cloexec[fd1] = 1;
+    }
+    int fds[2] = { (int)fd0, (int)fd1 };
+    uvm_copyout(myproc()->pgtbl, fdarray, (uint64)fds, sizeof(fds));
+    return 0;
+}
+
+// 199 socketpair(domain, type, protocol, sv): minimal AF_UNIX/SOCK_STREAM pair.
+uint64 sys_socketpair()
+{
+    int domain = (int)arg_raw(0);
+    int type = (int)arg_raw(1);
+    int protocol = (int)arg_raw(2);
+    uint64 fdarray = arg_raw(3);
+
+    if (fdarray == 0)
+        return (uint64)(-EFAULT);
+    if (domain != 1 || (type & 0xf) != 1 || protocol != 0)
+        return (uint64)(-EINVAL);
+
+    file_t *rf = NULL;
+    file_t *wf = NULL;
+    if (pipe_alloc(&rf, &wf) < 0)
+        return (uint64)(-EMFILE);
+
+    uint32 fd0 = alloc_fd(rf);
+    uint32 fd1 = alloc_fd(wf);
+    if (fd0 == (uint32)-1 || fd1 == (uint32)-1) {
+        if (fd0 != (uint32)-1) {
+            myproc()->open_file[fd0] = NULL;
+            myproc()->fd_cloexec[fd0] = 0;
+        }
+        file_close(rf);
+        file_close(wf);
+        return (uint64)(-EMFILE);
+    }
+
+    if (type & 0x80000) {
         myproc()->fd_cloexec[fd0] = 1;
         myproc()->fd_cloexec[fd1] = 1;
     }
@@ -1297,6 +1451,17 @@ uint64 sys_setitimer()
     return 0;
 }
 
+// 114 clock_getres(clockid, res): report coarse timer resolution as 10ms.
+uint64 sys_clock_getres()
+{
+    uint64 tp = arg_raw(1);
+    if (tp != 0) {
+        uint64 ts[2] = {0, 10000000UL};
+        uvm_copyout(myproc()->pgtbl, tp, (uint64)ts, sizeof(ts));
+    }
+    return 0;
+}
+
 // 115 clock_nanosleep(clockid, flags, request, remain): 楂樼簿搴︾潯鐪犮€?
 uint64 sys_clock_nanosleep()
 {
@@ -1346,6 +1511,22 @@ uint64 sys_kill()
     proc_t *p = proc_get_by_pid(pid);
     if (p == NULL)
         return (uint64)(-ESRCH);
+    if (sig == 0) {
+        spinlock_release(&p->lk);
+        return 0;
+    }
+    p->sig_pending |= (1UL << (sig - 1));
+    if (p->state == SLEEPING) {
+        p->state = RUNNABLE;
+        p->sleep_space = NULL;
+        p->sched_last_ready_tick = timer_get_ticks();
+        p->mlfq_age_start_tick = p->sched_last_ready_tick;
+        p->sched_ready_count++;
+        p->mlfq_in_readyq = 0;
+        spinlock_release(&p->lk);
+        mlfq_on_wakeup(p);
+        return 0;
+    }
     spinlock_release(&p->lk);
     return 0;
 }
@@ -1396,17 +1577,75 @@ uint64 sys_sched_yield()
     return 0;
 }
 
+// 118 sched_setparam(pid, param): accept Linux sched_param without changing SeaOS policy.
+uint64 sys_sched_setparam()
+{
+    uint64 param_addr = arg_raw(1);
+    if (param_addr == 0)
+        return (uint64)(-EFAULT);
+    return 0;
+}
+
+// 120 sched_getscheduler(pid): report SCHED_OTHER for SeaOS tasks.
+uint64 sys_sched_getscheduler()
+{
+    return 0;
+}
+
+// 121 sched_getparam(pid, param): write struct sched_param { int sched_priority; }.
+uint64 sys_sched_getparam()
+{
+    uint64 param_addr = arg_raw(1);
+    if (param_addr == 0)
+        return (uint64)(-EFAULT);
+    int priority = 0;
+    uvm_copyout(myproc()->pgtbl, param_addr, (uint64)&priority, sizeof(priority));
+    return 0;
+}
+
+// 122 sched_setaffinity(pid, cpusetsize, mask): accept any mask containing CPU0.
+uint64 sys_sched_setaffinity()
+{
+    uint64 cpusetsize = arg_raw(1);
+    uint64 mask_addr = arg_raw(2);
+    if (mask_addr == 0)
+        return (uint64)(-EFAULT);
+    if (cpusetsize == 0)
+        return (uint64)(-EINVAL);
+    uint8 first = 0;
+    uvm_copyin(myproc()->pgtbl, (uint64)&first, mask_addr, sizeof(first));
+    if ((first & 1) == 0)
+        return (uint64)(-EINVAL);
+    return 0;
+}
+
 // 123 sched_getaffinity(pid, cpusetsize, mask): CPU 浜插拰鎬ф帺鐮併€?// 鍗曟牳: 杩斿洖 mask bit0=1銆?
 uint64 sys_sched_getaffinity()
 {
     uint64 cpusetsize = arg_raw(1);
     uint64 mask_addr = arg_raw(2);
     if (mask_addr == 0) return (uint64)(-EFAULT);
+    if (cpusetsize < sizeof(uint64)) return (uint64)(-EINVAL);
     char buf[128];
     uint64 len = cpusetsize < sizeof(buf) ? cpusetsize : sizeof(buf);
     memset(buf, 0, len);
     buf[0] = 1;
     uvm_copyout(myproc()->pgtbl, mask_addr, (uint64)buf, len);
+    return sizeof(uint64);
+}
+
+// 236 get_mempolicy(mode, nodemask, maxnode, addr, flags): default node 0 policy.
+uint64 sys_get_mempolicy()
+{
+    uint64 mode_addr = arg_raw(0);
+    uint64 nodemask_addr = arg_raw(1);
+    uint64 maxnode = arg_raw(2);
+    int zero = 0;
+    uint64 one = 1;
+    if (mode_addr != 0)
+        uvm_copyout(myproc()->pgtbl, mode_addr, (uint64)&zero, sizeof(zero));
+    if (nodemask_addr != 0 && maxnode > 0)
+        uvm_copyout(myproc()->pgtbl, nodemask_addr, (uint64)&one, sizeof(one));
     return 0;
 }
 
