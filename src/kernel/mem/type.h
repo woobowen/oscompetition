@@ -48,7 +48,7 @@ extern char ALLOC_BEGIN[];
 extern char ALLOC_END[];
 
 // 可分配回收的区域中内核持有前KERN_PAGES个页面
-#define KERN_PAGES 1024
+#define KERN_PAGES 4096
 
 /*---------------------------------- 关于虚拟内存 ---------------------------------------*/
 

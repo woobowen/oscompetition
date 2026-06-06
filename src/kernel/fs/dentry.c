@@ -693,6 +693,70 @@ uint32 path_link(char *old_path, char *new_path)
 	解除文件硬链接
 	成功返回0, 失败返回-1
 */
+uint32 path_rename(char *old_path, char *new_path)
+{
+	if (old_path == NULL || new_path == NULL)
+		return (uint32)-1;
+
+	char old_name[MAXLEN_FILENAME], new_name[MAXLEN_FILENAME];
+	inode_t *old_parent = path_to_parent_inode(old_path, old_name);
+	inode_t *new_parent = path_to_parent_inode(new_path, new_name);
+	if (old_parent == NULL || new_parent == NULL) {
+		if (old_parent) inode_put(old_parent);
+		if (new_parent) inode_put(new_parent);
+		return (uint32)-1;
+	}
+
+	if (old_parent->inode_num == new_parent->inode_num) {
+		inode_lock(old_parent);
+		uint32 inum = dentry_search(old_parent, old_name);
+		if (inum == INVALID_INODE_NUM || dentry_search(old_parent, new_name) != INVALID_INODE_NUM) {
+			inode_unlock(old_parent);
+			inode_put(old_parent);
+			inode_put(new_parent);
+			return (uint32)-1;
+		}
+		if (dentry_create(old_parent, inum, new_name) == (uint32)-1 ||
+			dentry_delete(old_parent, old_name) == INVALID_INODE_NUM) {
+			inode_unlock(old_parent);
+			inode_put(old_parent);
+			inode_put(new_parent);
+			return (uint32)-1;
+		}
+		inode_unlock(old_parent);
+		inode_put(old_parent);
+		inode_put(new_parent);
+		return 0;
+	}
+
+	inode_lock(old_parent);
+	uint32 inum = dentry_search(old_parent, old_name);
+	if (inum == INVALID_INODE_NUM) {
+		inode_unlock(old_parent);
+		inode_put(old_parent);
+		inode_put(new_parent);
+		return (uint32)-1;
+	}
+	inode_unlock(old_parent);
+
+	inode_lock(new_parent);
+	if (dentry_search(new_parent, new_name) != INVALID_INODE_NUM ||
+		dentry_create(new_parent, inum, new_name) == (uint32)-1) {
+		inode_unlock(new_parent);
+		inode_put(old_parent);
+		inode_put(new_parent);
+		return (uint32)-1;
+	}
+	inode_unlock(new_parent);
+
+	inode_lock(old_parent);
+	uint32 deleted = dentry_delete(old_parent, old_name);
+	inode_unlock(old_parent);
+	inode_put(old_parent);
+	inode_put(new_parent);
+	return deleted == INVALID_INODE_NUM ? (uint32)-1 : 0;
+}
+
 uint32 path_unlink(char *path)
 {
 	if (path == NULL)

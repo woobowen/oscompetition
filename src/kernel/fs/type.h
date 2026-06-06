@@ -389,6 +389,7 @@ typedef struct ext4_info {
 #define INODE_MAJOR_ZERO      5              // 特殊设备文件 (/dev/zero, 可读)
 #define INODE_MAJOR_NULL      6              // 特殊设备文件 (/dev/null, 可读可写)
 #define INODE_MAJOR_GPT0      7              // 特殊设备文件 (/dev/gpt0, 可写)
+#define INODE_MAJOR_RTC       8              // virtual RTC (/dev/rtc, /dev/rtc0)
 #define INODE_MINOR_DEFAULT   1              // 默认的次设备号 (所有文件都使用它)
 
 /* index字段相关 */
@@ -444,13 +445,15 @@ typedef struct dentry {
 #define FILE_OPEN_CREATE 0x01  // 打开文件时, 若文件不存在则创建新的
 #define FILE_OPEN_READ   0x02  // 打开文件时, 要求文件可读
 #define FILE_OPEN_WRITE  0x04  // 打开文件时, 要求文件可写
+#define FILE_OPEN_APPEND 0x08  // append writes at end
+#define FILE_OPEN_TRUNC  0x10  // truncate existing file on open
 
 #define FILE_LSEEK_SET   0     // file->offset = lseek_offset
 #define FILE_LSEEK_ADD   1     // file->offset += lseek_offset
 #define FILE_LSEEK_SUB   2     // file->offset -= lseek_offset
 
-#define PIPE_SIZE 512
-#define N_PIPE 16
+#define PIPE_SIZE 4096
+#define N_PIPE 128
 typedef struct pipe {
     spinlock_t lk;
     char data[PIPE_SIZE];
@@ -465,6 +468,11 @@ typedef struct file {
     inode_t *ip;        // 对应的inode
     bool is_device;     // 是否为虚拟设备文件(不依赖磁盘inode)
     uint16 dev_major;   // 虚拟设备主设备号
+    bool is_proc;        // in-memory /proc node
+    uint16 proc_kind;    // proc node type
+    int proc_pid;        // pid for /proc/<pid> nodes
+    bool is_mem;         // small writable in-memory overlay node
+    int mem_index;       // mem overlay table index
     bool readable;      // 是否可读
     bool writbale;      // 是否可写
     uint32 offset;      // 读/写指针的偏移量
@@ -473,7 +481,7 @@ typedef struct file {
     struct pipe *pipe;  // 管道对象(is_pipe 时有效)
 } file_t;
 
-#define N_FILE 128      // file_table中file的数量
+#define N_FILE 1024      // file_table中file的数量
 
 typedef struct file_stat {
     uint16 type;        // inode_disk->type

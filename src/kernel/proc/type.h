@@ -106,6 +106,7 @@ enum proc_state
 // Signal
 #define NSIG        64
 #define SIGALRM     14
+#define SIGCHLD     17
 #define SA_RESTORER 0x04000000
 
 #define PROC_NAME_LEN 16
@@ -177,6 +178,7 @@ typedef struct proc
 
     inode_t *cwd;          // 工作目录
     file_t *open_file[N_OPEN_FILE_PER_PROC]; // 打开文件表
+    uint8 fd_cloexec[N_OPEN_FILE_PER_PROC];
 
     // Signal
     uint64 sig_handler[NSIG + 1]; // 信号处理器地址 (1..64), 0=SIG_DFL, 1=SIG_IGN
@@ -186,6 +188,7 @@ typedef struct proc
     // ITIMER_REAL
     uint64 itimer_expire;         // 到期时的 CLINT 时间 (0=未激活)
     uint64 itimer_interval;       // 重复间隔 (CLINT ticks, 0=单次)
+    uint32 ub_looper_secs;
 
 } proc_t;
 
@@ -216,7 +219,7 @@ typedef struct sched_stat {
 } sched_stat_t;
 
 // 系统中最多同时存在N_PROC个进程
-#define N_PROC 32
+#define N_PROC 256
 
 
 // 关于elf文件的解析

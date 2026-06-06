@@ -17,16 +17,24 @@
 #define SYS_close 57             // Linux/RISC-V close
 #define SYS_read 63              // Linux/RISC-V read
 #define SYS_write 64             // Linux/RISC-V write
+#define SYS_readv 65             // Linux/RISC-V readv
 #define SYS_lseek 62             // Linux/RISC-V lseek
 #define SYS_dup 23               // Linux/RISC-V dup
 #define SYS_fstat 80             // Linux/RISC-V fstat
+#define SYS_sync 81              // Linux/RISC-V sync
 #define SYS_get_dentries 61      // Linux/RISC-V getdents64
 #define SYS_mkdir 34             // Linux/RISC-V mkdirat
 #define SYS_chdir 49             // Linux/RISC-V chdir
-#define SYS_print_cwd 17         // SeaOS print_cwd
+#define SYS_getcwd 17            // Linux/RISC-V getcwd
 #define SYS_link 37              // Linux/RISC-V linkat
+#define SYS_renameat 38          // Linux/RISC-V renameat
+#define SYS_statfs 43            // Linux/RISC-V statfs
+#define SYS_fstatfs 44           // Linux/RISC-V fstatfs
+#define SYS_faccessat 48         // Linux/RISC-V faccessat
 #define SYS_unlink 35            // Linux/RISC-V unlinkat
 #define SYS_newfstatat 79        // Linux/RISC-V newfstatat (按路径 stat)
+#define SYS_utimensat 88         // Linux/RISC-V utimensat
+#define SYS_rt_sigsuspend 133    // Linux/RISC-V rt_sigsuspend
 #define SYS_rt_sigprocmask 135   // 信号屏蔽 (暂桩)
 #define SYS_rt_sigreturn 139     // Linux/RISC-V rt_sigreturn
 #define SYS_setgid 144           // 暂桩返回 0
@@ -54,6 +62,8 @@
 #define SYS_getitimer 102        // Linux/RISC-V getitimer
 #define SYS_setitimer 103        // Linux/RISC-V setitimer
 #define SYS_clock_nanosleep 115  // Linux/RISC-V clock_nanosleep
+#define SYS_syslog 116           // Linux/RISC-V syslog/klogctl
+#define SYS_kill 129             // Linux/RISC-V kill
 #define SYS_sysinfo 179          // Linux/RISC-V sysinfo
 #define SYS_madvise 233          // Linux/RISC-V madvise
 #define SYS_readlinkat 78        // Linux/RISC-V readlinkat
@@ -63,6 +73,7 @@
 #define SYS_geteuid 175          // Linux/RISC-V geteuid
 #define SYS_ppoll 73             // Linux/RISC-V ppoll
 #define SYS_sendfile 71          // Linux/RISC-V sendfile64
+#define SYS_renameat2 276        // Linux/RISC-V renameat2
 #define SYS_sched_setscheduler 119  // Linux/RISC-V sched_setscheduler
 
 #define SYS_schedstat 500        // SeaOS 私有: 拉取调度统计快照

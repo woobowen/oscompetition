@@ -154,17 +154,8 @@ void timer_interrupt_handler()
     if (p && p->state == RUNNING)
         p->sched_cpu_ticks++;
 
-    // ITIMER_REAL 到期检查：若定时器已到期则标记 SIGALRM 待投递
-    if (p && p->state == RUNNING && p->itimer_expire != 0) {
-        uint64 now = r_time();
-        if (now >= p->itimer_expire) {
-            p->sig_pending |= (1UL << (SIGALRM - 1));
-            if (p->itimer_interval != 0)
-                p->itimer_expire = now + p->itimer_interval;
-            else
-                p->itimer_expire = 0;
-        }
-    }
+    if (mycpu()->noff == 0)
+        proc_check_itimers(r_time());
 
     // 调度下一次 SBI 定时器中断并清除待决位
     timer_init_sbi();

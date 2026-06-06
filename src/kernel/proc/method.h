@@ -14,6 +14,7 @@ void proc_exit(int exit_state);                     // 进程退出
 void proc_yield();                                  // 进程放弃CPU
 void proc_sleep(void *sleep_space, spinlock_t *lk); // 进程睡眠
 void proc_wakeup(void *sleep_space);                // 进程唤醒
+void proc_check_itimers(uint64 now);                // ITIMER_REAL wall-clock expiry
 void proc_sched();                                  // 进程切换到调度器
 void proc_scheduler();                              // 调度器选择合适的进程执行
 
@@ -41,6 +42,7 @@ int proc_on_tick(void);                              // 用户态时钟中断: �
 // exec.c: 重置进程以执行ELF文件
 
 int proc_exec(char *path, char **argv);             // 准备新进程
+int proc_exec_env(char *path, char **argv, char **envp);
 /* 查找pid对应的进程并返回（返回时持有该进程锁），找不到返回NULL */
 proc_t *proc_get_by_pid(int pid);
 /* 在当前上下文对指定pid的进程执行exec（替换其地址空间）。

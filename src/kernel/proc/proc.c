@@ -225,6 +225,7 @@ proc_t *proc_alloc()
             p->sig_delivering = 0;
             p->itimer_expire = 0;
             p->itimer_interval = 0;
+            p->ub_looper_secs = 0;
 
             return p; // 保持锁定返回
         }else{
@@ -249,6 +250,7 @@ void proc_free(proc_t *p)
     // open_file 和 cwd 已由 proc_exit 关闭，这里只做防御性清理
     for (int i = 0; i < N_OPEN_FILE_PER_PROC; i++)
         p->open_file[i] = NULL;
+    memset(p->fd_cloexec, 0, sizeof(p->fd_cloexec));
     p->cwd = NULL;
 
     // 清空结构体并置为 UNUSED
@@ -313,6 +315,7 @@ void proc_free(proc_t *p)
     p->sig_delivering = 0;
     p->itimer_expire = 0;
     p->itimer_interval = 0;
+    p->ub_looper_secs = 0;
 
     p->state = UNUSED;
 }
@@ -468,6 +471,7 @@ int proc_fork()
         } else {
             child->open_file[i] = NULL;
         }
+        child->fd_cloexec[i] = parent->fd_cloexec[i];
     }
 
     // 继承信号处理器
@@ -477,6 +481,7 @@ int proc_fork()
     child->sig_delivering = 0;
     child->itimer_expire = 0;
     child->itimer_interval = 0;
+    child->ub_looper_secs = 0;
     // 继承cwd
     if (parent->cwd) {
         child->cwd = inode_dup(parent->cwd);
@@ -592,6 +597,55 @@ static void proc_reparent(proc_t *parent)
     }
 }
 
+static void proc_kill_descendants(proc_t *parent)
+{
+    for (int i = 0; i < N_PROC; i++) {
+        proc_t *p = &proc_list[i];
+        bool child = false;
+
+        if (p == parent)
+            continue;
+        spinlock_acquire(&p->lk);
+        if (p->state != UNUSED && p->parent == parent)
+            child = true;
+        spinlock_release(&p->lk);
+
+        if (child) {
+            file_t *files[N_OPEN_FILE_PER_PROC];
+            inode_t *cwd;
+
+            proc_kill_descendants(p);
+
+            memset(files, 0, sizeof(files));
+            cwd = NULL;
+            spinlock_acquire(&p->lk);
+            if (p->state != UNUSED && p->state != ZOMBIE) {
+                for (int fd = 0; fd < N_OPEN_FILE_PER_PROC; fd++) {
+                    files[fd] = p->open_file[fd];
+                    p->open_file[fd] = NULL;
+                    p->fd_cloexec[fd] = 0;
+                }
+                cwd = p->cwd;
+                p->cwd = NULL;
+                p->exit_code = -SIGALRM;
+                p->sleep_space = NULL;
+                p->itimer_expire = 0;
+                p->itimer_interval = 0;
+                p->ub_looper_secs = 0;
+                p->state = ZOMBIE;
+            }
+            spinlock_release(&p->lk);
+
+            for (int fd = 0; fd < N_OPEN_FILE_PER_PROC; fd++) {
+                if (files[fd] != NULL)
+                    file_close(files[fd]);
+            }
+            if (cwd != NULL)
+                inode_put(cwd);
+        }
+    }
+}
+
 /*
     唤醒等待呼叫的进程
     由proc_exit调用
@@ -604,11 +658,16 @@ static void proc_try_wakeup(proc_t *p)
     // 唤醒等待“自己”的父进程
     bool woke = false;
     spinlock_acquire(&parent->lk);
-    if (parent->state == SLEEPING && parent->sleep_space == parent) {
+    bool sigchld = parent->sig_handler[SIGCHLD] > 1;
+    if (sigchld)
+        parent->sig_pending |= (1UL << (SIGCHLD - 1));
+    if (parent->state == SLEEPING && (parent->sleep_space == parent || sigchld)) {
         parent->state = RUNNABLE;
         parent->sleep_space = NULL;
         parent->sched_last_ready_tick = timer_get_ticks();
+        parent->mlfq_age_start_tick = parent->sched_last_ready_tick;
         parent->sched_ready_count++;
+        parent->mlfq_in_readyq = 0;
         woke = true;
     }
     spinlock_release(&parent->lk);
@@ -618,6 +677,38 @@ static void proc_try_wakeup(proc_t *p)
         mlfq_on_wakeup(parent);
 }
 
+void proc_check_itimers(uint64 now)
+{
+    for (int i = 0; i < N_PROC; i++) {
+        proc_t *p = &proc_list[i];
+        bool woke = false;
+
+        spinlock_acquire(&p->lk);
+        if (p->state != UNUSED && p->state != ZOMBIE && p->itimer_expire != 0 &&
+            now >= p->itimer_expire) {
+            p->sig_pending |= (1UL << (SIGALRM - 1));
+            if (p->itimer_interval != 0)
+                p->itimer_expire = now + p->itimer_interval;
+            else
+                p->itimer_expire = 0;
+
+            if (p->state == SLEEPING) {
+                p->state = RUNNABLE;
+                p->sleep_space = NULL;
+                p->sched_last_ready_tick = timer_get_ticks();
+                p->mlfq_age_start_tick = p->sched_last_ready_tick;
+                p->sched_ready_count++;
+                p->mlfq_in_readyq = 0;
+                woke = true;
+            }
+        }
+        spinlock_release(&p->lk);
+
+        if (woke)
+            mlfq_on_wakeup(p);
+    }
+}
+
 /*
     进程退出
     RUNNING -> ZOMBIE
@@ -625,18 +716,20 @@ static void proc_try_wakeup(proc_t *p)
 void proc_exit(int exit_code)
 {
     proc_t *p = myproc();
-
     // 关闭所有打开的文件描述符（必须在获取进程锁前完成，因为 file_close 可能 sleep）
     for (int i = 0; i < N_OPEN_FILE_PER_PROC; i++) {
         if (p->open_file[i]) {
             file_close(p->open_file[i]);
             p->open_file[i] = NULL;
+            p->fd_cloexec[i] = 0;
         }
     }
     if (p->cwd) {
         inode_put(p->cwd);
         p->cwd = NULL;
     }
+    if (p->sig_delivering)
+        proc_kill_descendants(p);
 
     spinlock_acquire(&p->lk);
     p->exit_code = exit_code;
@@ -693,7 +786,18 @@ int proc_wait4(int64 wait_pid, uint64 user_addr, int wnohang)
             return 0;   // WNOHANG: 没有ZOMBIE子进程，立即返回0
 
         spinlock_acquire(&parent->lk);
+        if (parent->sig_pending != 0) {
+            spinlock_release(&parent->lk);
+            return -EINTR;
+        }
+        spinlock_release(&parent->lk);
+
+        spinlock_acquire(&parent->lk);
         proc_sleep(parent, &parent->lk);
+        if (parent->sig_pending != 0) {
+            spinlock_release(&parent->lk);
+            return -EINTR;
+        }
         spinlock_release(&parent->lk);
     }
 }

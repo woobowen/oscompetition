@@ -119,9 +119,8 @@ void* pmem_alloc(bool in_kernel)
     spinlock_release(&ar->lk);
 
     // 分配失败，则panic锁死
-    if (!page) {
-        panic("pmem_alloc: out of memory");
-    }
+    if (!page)
+        return NULL;
 
     // 清零后返回
     memset(page, 0, PGSIZE);

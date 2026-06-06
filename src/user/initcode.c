@@ -9,8 +9,6 @@ __asm__(".section .text\n"
 	"  call main\n"
 	"1: j 1b\n");
 
-#define MAX_TESTS 32
-
 static int local_strlen(const char *str)
 {
 	int len = 0;
@@ -63,31 +61,43 @@ static void build_argv0(char *dst, const char *name)
 	dst[pos] = 0;
 }
 
-static int load_test_entries(const char *dir, char paths[][MAXLEN_STR + 1], char argv0s[][MAXLEN_STR + 1], int start, int max_tests)
-{
-	if (start >= max_tests)
-		return 0;
+static void run_one(char *path, char **argv);
 
+static int run_test_entries(const char *dir)
+{
 	uint32 fd = syscall(SYS_open, dir, OPEN_READ);
 	if ((int)fd < 0)
 		return 0;
 
 	int count = 0;
-	dentry_t de[32];
-	while (start + count < max_tests) {
-		uint32 read_len = syscall(SYS_get_dentries, fd, de, sizeof(de));
+	char de_buf[1024];
+	while (1) {
+		uint32 read_len = syscall(SYS_get_dentries, fd, de_buf, sizeof(de_buf));
 		if ((int)read_len <= 0)
 			break;
 
-		for (uint32 i = 0; i < read_len / sizeof(dentry_t) && start + count < max_tests; i++) {
-			if (!is_testcode_name(de[i].name))
+		for (uint32 off = 0; off + 19 <= read_len; ) {
+			uint16 reclen = *(uint16 *)(de_buf + off + 16);
+			char *name = de_buf + off + 19;
+			if (reclen < 20 || off + reclen > read_len)
+				break;
+			if (!is_testcode_name(name)) {
+				off += reclen;
 				continue;
-			build_path(paths[start + count], dir, de[i].name);
-			build_argv0(argv0s[start + count], de[i].name);
+			}
+			char path[MAXLEN_STR + 1];
+			char argv0[MAXLEN_STR + 1];
+			char *argv[2];
+			build_path(path, dir, name);
+			build_argv0(argv0, name);
+			argv[0] = argv0;
+			argv[1] = 0;
+			run_one(path, argv);
 			count++;
+			off += reclen;
 		}
 
-		if (read_len < sizeof(de))
+		if (read_len < sizeof(de_buf))
 			break;
 	}
 
@@ -139,7 +149,7 @@ static void run_one(char *path, char **argv)
 	}
 
 	int ret = -1;
-	if ((int)syscall(SYS_wait, &ret) < 0) {
+	if ((int)syscall(SYS_wait, pid, &ret, 0, 0) < 0) {
 		syscall(SYS_write, 1, str_1, sizeof(str_1));
 		return;
 	}
@@ -157,26 +167,17 @@ int main()
 	char no_test[] = "initcode: no *_testcode.sh found\n";
 	syscall(SYS_write, 1, banner, sizeof(banner) - 1);
 
-	char test_paths[MAX_TESTS][MAXLEN_STR + 1];
-	char argv0s[MAX_TESTS][MAXLEN_STR + 1];
-	char *argv[MAX_TESTS][2];
 	int count = 0;
 
-	count += load_test_entries("/musl", test_paths, argv0s, count, MAX_TESTS);
-	count += load_test_entries("/glibc", test_paths, argv0s, count, MAX_TESTS);
+	count += run_test_entries("/musl");
+	count += run_test_entries("/glibc");
 
 	if (count == 0)
-		count += load_test_entries("/", test_paths, argv0s, count, MAX_TESTS);
+		count += run_test_entries("/");
 
 	if (count == 0) {
 		syscall(SYS_write, 1, no_test, sizeof(no_test) - 1);
 		while (1) ;
-	}
-
-	for (int i = 0; i < count; i++) {
-		argv[i][0] = argv0s[i];
-		argv[i][1] = 0;
-		run_one(test_paths[i], argv[i]);
 	}
 
 	syscall(SYS_shutdown);

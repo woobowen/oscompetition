@@ -61,6 +61,7 @@ uint32 inode_to_path(inode_t *ip, char *path, uint32 len);
 inode_t* path_create_inode(char *path, uint16 type, uint16 major, uint16 minor);
 uint32 path_link(char *old_path, char *new_path);
 uint32 path_unlink(char *path);
+uint32 path_rename(char *old_path, char *new_path);
 
 /* fs.c: 文件系统 */
 
@@ -79,6 +80,13 @@ uint32 file_lseek(file_t *file, uint32 lseek_offset, uint32 lseek_flag);
 file_t* file_dup(file_t* file);
 uint32 file_get_stat(file_t* file, uint64 user_dst);
 uint32 file_get_stat_linux(file_t* file, uint64 user_dst);
+uint32 file_get_dents_linux(file_t *file, uint64 user_dst, uint32 len);
+uint32 file_get_statfs_linux(file_t *file, uint64 user_dst);
+int procfs_path_exists(char *path);
+int memfs_path_exists(char *path);
+int memfs_mkdir(char *path);
+int memfs_unlink(char *path);
+int memfs_rename(char *old_path, char *new_path);
 void fs_init();
 
 /* device.c: 设备文件 */

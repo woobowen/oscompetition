@@ -42,3 +42,4 @@ qemu.log
 
 # test
 testsuits-for-oskernel/
+autotest-for-oskernel/

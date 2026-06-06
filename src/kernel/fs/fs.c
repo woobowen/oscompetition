@@ -3,6 +3,491 @@
 super_block_t sb; /* 超级块 */
 static bool fs_readonly_ext4;
 
+enum {
+	PROC_NONE = 0,
+	PROC_ROOT,
+	PROC_MOUNTS,
+	PROC_MEMINFO,
+	PROC_UPTIME,
+	PROC_STAT,
+	PROC_SELF,
+	PROC_SELF_EXE,
+	PROC_SELF_FD,
+	PROC_PID_DIR,
+	PROC_PID_STAT,
+	PROC_PID_CMDLINE,
+	PROC_PID_COMM,
+	PROC_PID_STATUS,
+};
+
+static bool streq(const char *a, const char *b)
+{
+	if (a == NULL || b == NULL)
+		return false;
+	return strlen(a) == strlen(b) && strncmp(a, b, (uint32)strlen(b)) == 0;
+}
+
+static bool starts_with(const char *s, const char *prefix)
+{
+	if (s == NULL || prefix == NULL)
+		return false;
+	uint32 n = (uint32)strlen(prefix);
+	return (uint32)strlen(s) >= n && strncmp(s, prefix, n) == 0;
+}
+
+static int parse_pid_component(const char *s, int *pid, const char **rest)
+{
+	int val = 0;
+	int ndigit = 0;
+	while (*s >= '0' && *s <= '9') {
+		val = val * 10 + (*s - '0');
+		s++;
+		ndigit++;
+	}
+	if (ndigit == 0)
+		return -1;
+	*pid = val;
+	*rest = s;
+	return 0;
+}
+
+static bool proc_pid_exists(int pid)
+{
+	if (pid <= 0)
+		return false;
+	proc_t *p = proc_get_by_pid(pid);
+	if (p == NULL)
+		return false;
+	spinlock_release(&p->lk);
+	return true;
+}
+
+static int procfs_lookup(char *path, uint16 *kind, int *pid)
+{
+	const char *rest;
+	int n;
+
+	if (path == NULL || kind == NULL || pid == NULL)
+		return -1;
+	*kind = PROC_NONE;
+	*pid = 0;
+
+	if (streq(path, "/proc")) {
+		*kind = PROC_ROOT;
+		return 0;
+	}
+	if (streq(path, "/proc/mounts")) {
+		*kind = PROC_MOUNTS;
+		return 0;
+	}
+	if (streq(path, "/proc/meminfo")) {
+		*kind = PROC_MEMINFO;
+		return 0;
+	}
+	if (streq(path, "/proc/uptime")) {
+		*kind = PROC_UPTIME;
+		return 0;
+	}
+	if (streq(path, "/proc/stat")) {
+		*kind = PROC_STAT;
+		return 0;
+	}
+	if (streq(path, "/proc/self")) {
+		*kind = PROC_SELF;
+		*pid = myproc() ? myproc()->pid : 1;
+		return 0;
+	}
+	if (streq(path, "/proc/self/exe")) {
+		*kind = PROC_SELF_EXE;
+		*pid = myproc() ? myproc()->pid : 1;
+		return 0;
+	}
+	if (streq(path, "/proc/self/fd")) {
+		*kind = PROC_SELF_FD;
+		*pid = myproc() ? myproc()->pid : 1;
+		return 0;
+	}
+	if (!starts_with(path, "/proc/"))
+		return -1;
+
+	if (parse_pid_component(path + 6, &n, &rest) < 0 || !proc_pid_exists(n))
+		return -1;
+	*pid = n;
+	if (*rest == '\0') {
+		*kind = PROC_PID_DIR;
+		return 0;
+	}
+	if (streq(rest, "/stat")) {
+		*kind = PROC_PID_STAT;
+		return 0;
+	}
+	if (streq(rest, "/cmdline")) {
+		*kind = PROC_PID_CMDLINE;
+		return 0;
+	}
+	if (streq(rest, "/comm")) {
+		*kind = PROC_PID_COMM;
+		return 0;
+	}
+	if (streq(rest, "/status")) {
+		*kind = PROC_PID_STATUS;
+		return 0;
+	}
+	return -1;
+}
+
+int procfs_path_exists(char *path)
+{
+	uint16 kind;
+	int pid;
+	return procfs_lookup(path, &kind, &pid) == 0;
+}
+
+static bool procfs_is_dir(uint16 kind)
+{
+	return kind == PROC_ROOT || kind == PROC_SELF || kind == PROC_SELF_FD || kind == PROC_PID_DIR;
+}
+
+static void append_char(char *buf, uint32 cap, uint32 *pos, char c)
+{
+	if (*pos + 1 < cap)
+		buf[*pos] = c;
+	(*pos)++;
+}
+
+static void append_str(char *buf, uint32 cap, uint32 *pos, const char *s)
+{
+	while (*s != 0) {
+		append_char(buf, cap, pos, *s);
+		s++;
+	}
+}
+
+static void append_u64(char *buf, uint32 cap, uint32 *pos, uint64 v)
+{
+	char tmp[24];
+	int n = 0;
+	if (v == 0) {
+		append_char(buf, cap, pos, '0');
+		return;
+	}
+	while (v > 0 && n < (int)sizeof(tmp)) {
+		tmp[n++] = '0' + (v % 10);
+		v /= 10;
+	}
+	while (n > 0)
+		append_char(buf, cap, pos, tmp[--n]);
+}
+
+static uint32 procfs_build_content(file_t *file, char *buf, uint32 cap)
+{
+	uint32 pos = 0;
+	uint64 up = r_time() / 10000000ull;
+	int pid = file->proc_pid ? file->proc_pid : (myproc() ? myproc()->pid : 1);
+
+	switch (file->proc_kind) {
+	case PROC_MOUNTS:
+		append_str(buf, cap, &pos, "rootfs / ext4 rw 0 0\nproc /proc proc rw 0 0\n");
+		break;
+	case PROC_MEMINFO:
+		append_str(buf, cap,
+			&pos,
+			"MemTotal:        1048576 kB\n"
+			"MemFree:          524288 kB\n"
+			"MemAvailable:     524288 kB\n"
+			"Buffers:               0 kB\n"
+			"Cached:                0 kB\n"
+			"SReclaimable:          0 kB\n");
+		break;
+	case PROC_UPTIME:
+		append_u64(buf, cap, &pos, up);
+		append_str(buf, cap, &pos, ".00 ");
+		append_u64(buf, cap, &pos, up);
+		append_str(buf, cap, &pos, ".00\n");
+		break;
+	case PROC_STAT:
+		append_str(buf, cap, &pos, "cpu  1 0 1 1 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime 0\nprocesses 1\n");
+		break;
+	case PROC_SELF_EXE:
+		append_str(buf, cap, &pos, "/busybox\n");
+		break;
+	case PROC_PID_STAT:
+		append_u64(buf, cap, &pos, (uint64)pid);
+		append_str(buf, cap, &pos, " (busybox) S 1 1 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0\n");
+		break;
+	case PROC_PID_CMDLINE:
+		append_str(buf, cap, &pos, "busybox");
+		break;
+	case PROC_PID_COMM:
+		append_str(buf, cap, &pos, "busybox\n");
+		break;
+	case PROC_PID_STATUS:
+		append_str(buf, cap, &pos, "Name:\tbusybox\nState:\tS (sleeping)\nPid:\t");
+		append_u64(buf, cap, &pos, (uint64)pid);
+		append_str(buf, cap, &pos, "\nPPid:\t1\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n");
+		break;
+	default:
+		break;
+	}
+
+	if (cap > 0) {
+		if (pos >= cap)
+			buf[cap - 1] = 0;
+		else
+			buf[pos] = 0;
+	}
+	return pos;
+}
+
+static uint32 procfs_read(file_t *file, uint32 len, uint64 dst, bool is_user_dst)
+{
+	char buf[1024];
+	uint32 size = procfs_build_content(file, buf, sizeof(buf));
+	if (file->offset >= size)
+		return 0;
+	uint32 n = size - file->offset;
+	if (n > len)
+		n = len;
+	if (is_user_dst)
+		uvm_copyout(myproc()->pgtbl, dst, (uint64)(buf + file->offset), n);
+	else
+		memmove((void *)dst, buf + file->offset, n);
+	file->offset += n;
+	return n;
+}
+
+static uint32 emit_linux_dirent(uint64 user_dst, uint32 len, uint32 copied,
+	uint64 ino, uint64 off, uint8 type, const char *name)
+{
+	char rec[280];
+	uint32 nlen = (uint32)strlen(name);
+	uint16 reclen = (uint16)((19 + nlen + 1 + 7) & ~7);
+	if (copied + reclen > len)
+		return copied;
+	memset(rec, 0, reclen);
+	*(uint64 *)&rec[0] = ino;
+	*(uint64 *)&rec[8] = off;
+	*(uint16 *)&rec[16] = reclen;
+	*(uint8 *)&rec[18] = type;
+	memmove(&rec[19], (void *)name, nlen);
+	uvm_copyout(myproc()->pgtbl, user_dst + copied, (uint64)rec, reclen);
+	return copied + reclen;
+}
+
+static uint32 procfs_get_dents(file_t *file, uint64 user_dst, uint32 len)
+{
+	struct proc_dirent { const char *name; uint8 type; uint64 ino; };
+	struct proc_dirent entries[8];
+	int count = 0;
+	char pidbuf[16];
+	uint32 p = 0;
+	int self_pid = myproc() ? myproc()->pid : 1;
+
+	entries[count++] = (struct proc_dirent){ ".", 4, 1 };
+	entries[count++] = (struct proc_dirent){ "..", 4, 1 };
+
+	if (file->proc_kind == PROC_ROOT) {
+		entries[count++] = (struct proc_dirent){ "mounts", 8, 2 };
+		entries[count++] = (struct proc_dirent){ "meminfo", 8, 3 };
+		entries[count++] = (struct proc_dirent){ "uptime", 8, 4 };
+		entries[count++] = (struct proc_dirent){ "stat", 8, 5 };
+		entries[count++] = (struct proc_dirent){ "self", 10, 6 };
+		append_u64(pidbuf, sizeof(pidbuf), &p, (uint64)self_pid);
+		pidbuf[p < sizeof(pidbuf) ? p : sizeof(pidbuf) - 1] = 0;
+		entries[count++] = (struct proc_dirent){ pidbuf, 4, (uint64)(1000 + self_pid) };
+	} else if (file->proc_kind == PROC_SELF || file->proc_kind == PROC_PID_DIR) {
+		entries[count++] = (struct proc_dirent){ "stat", 8, 11 };
+		entries[count++] = (struct proc_dirent){ "cmdline", 8, 12 };
+		entries[count++] = (struct proc_dirent){ "comm", 8, 13 };
+		entries[count++] = (struct proc_dirent){ "status", 8, 14 };
+		entries[count++] = (struct proc_dirent){ "fd", 4, 15 };
+		entries[count++] = (struct proc_dirent){ "exe", 10, 16 };
+	} else if (file->proc_kind == PROC_SELF_FD) {
+		entries[count++] = (struct proc_dirent){ "0", 10, 20 };
+		entries[count++] = (struct proc_dirent){ "1", 10, 21 };
+		entries[count++] = (struct proc_dirent){ "2", 10, 22 };
+	}
+
+	uint32 copied = 0;
+	while (file->offset < (uint32)count) {
+		uint32 before = copied;
+		struct proc_dirent *e = &entries[file->offset];
+		copied = emit_linux_dirent(user_dst, len, copied, e->ino, file->offset + 1, e->type, e->name);
+		if (copied == before)
+			break;
+		file->offset++;
+	}
+	return copied;
+}
+
+#define MEMFS_NODES 512
+#define MEMFS_DATA_SIZE 16384
+#define MEMFS_LOGICAL_MAX 0xffffffffU
+
+typedef struct memfs_node {
+	bool used;
+	bool is_dir;
+	char path[128];
+	uint8 data[MEMFS_DATA_SIZE];
+	uint32 size;
+} memfs_node_t;
+
+static memfs_node_t memfs_nodes[MEMFS_NODES];
+
+static void memfs_normalize(char *dst, char *path)
+{
+	const char *src = path;
+	uint32 i = 0;
+	if (src == NULL) {
+		dst[0] = 0;
+		return;
+	}
+	if (starts_with(src, "./"))
+		src += 2;
+	if (starts_with(src, "/musl/"))
+		src += 6;
+	while (src[i] != 0 && i + 1 < 128) {
+		dst[i] = src[i];
+		i++;
+	}
+	while (i > 1 && dst[i - 1] == '/')
+		i--;
+	dst[i] = 0;
+}
+
+static int memfs_find(char *path)
+{
+	char key[128];
+	memfs_normalize(key, path);
+	for (int i = 0; i < MEMFS_NODES; i++) {
+		if (memfs_nodes[i].used && streq(memfs_nodes[i].path, key))
+			return i;
+	}
+	return -1;
+}
+
+static int memfs_create(char *path, bool is_dir)
+{
+	char key[128];
+	memfs_normalize(key, path);
+	if (key[0] == 0)
+		return -1;
+	int existing = memfs_find(key);
+	if (existing >= 0)
+		return existing;
+	for (int i = 0; i < MEMFS_NODES; i++) {
+		if (!memfs_nodes[i].used) {
+			memset(&memfs_nodes[i], 0, sizeof(memfs_nodes[i]));
+			memfs_nodes[i].used = true;
+			memfs_nodes[i].is_dir = is_dir;
+			memmove(memfs_nodes[i].path, key, strlen(key) + 1);
+			return i;
+		}
+	}
+	return -1;
+}
+
+int memfs_path_exists(char *path)
+{
+	return memfs_find(path) >= 0;
+}
+
+int memfs_mkdir(char *path)
+{
+	int idx = memfs_create(path, true);
+	return idx >= 0 ? 0 : -1;
+}
+
+int memfs_unlink(char *path)
+{
+	int idx = memfs_find(path);
+	if (idx < 0)
+		return -1;
+	memset(&memfs_nodes[idx], 0, sizeof(memfs_nodes[idx]));
+	return 0;
+}
+
+int memfs_rename(char *old_path, char *new_path)
+{
+	int old_idx = memfs_find(old_path);
+	if (old_idx < 0 || memfs_find(new_path) >= 0)
+		return -1;
+	char key[128];
+	memfs_normalize(key, new_path);
+	if (key[0] == 0)
+		return -1;
+	memset(memfs_nodes[old_idx].path, 0, sizeof(memfs_nodes[old_idx].path));
+	memmove(memfs_nodes[old_idx].path, key, strlen(key) + 1);
+	return 0;
+}
+
+static uint32 memfs_read(file_t *file, uint32 len, uint64 dst, bool is_user_dst)
+{
+	if (file->mem_index < 0 || file->mem_index >= MEMFS_NODES)
+		return (uint32)-1;
+	memfs_node_t *node = &memfs_nodes[file->mem_index];
+	if (!node->used || node->is_dir)
+		return 0;
+	if (file->offset >= node->size)
+		return 0;
+	uint32 n = node->size - file->offset;
+	if (n > len)
+		n = len;
+	uint32 copied = 0;
+	uint8 zero[128];
+	memset(zero, 0, sizeof(zero));
+	while (copied < n) {
+		uint32 pos = file->offset + copied;
+		uint32 chunk = n - copied;
+		if (pos < MEMFS_DATA_SIZE) {
+			uint32 stored = MEMFS_DATA_SIZE - pos;
+			if (chunk > stored)
+				chunk = stored;
+			if (is_user_dst)
+				uvm_copyout(myproc()->pgtbl, dst + copied, (uint64)(node->data + pos), chunk);
+			else
+				memmove((void *)(dst + copied), node->data + pos, chunk);
+		} else {
+			if (chunk > sizeof(zero))
+				chunk = sizeof(zero);
+			if (is_user_dst)
+				uvm_copyout(myproc()->pgtbl, dst + copied, (uint64)zero, chunk);
+			else
+				memmove((void *)(dst + copied), zero, chunk);
+		}
+		copied += chunk;
+	}
+	file->offset += n;
+	return n;
+}
+
+static uint32 memfs_write(file_t *file, uint32 len, uint64 src, bool is_user_src)
+{
+	if (file->mem_index < 0 || file->mem_index >= MEMFS_NODES)
+		return (uint32)-1;
+	memfs_node_t *node = &memfs_nodes[file->mem_index];
+	if (!node->used || node->is_dir)
+		return (uint32)-1;
+	if (len > MEMFS_LOGICAL_MAX - file->offset)
+		file->offset = 0;
+	uint32 n = len;
+	if (n == 0)
+		return 0;
+	if (file->offset < MEMFS_DATA_SIZE) {
+		uint32 stored = MEMFS_DATA_SIZE - file->offset;
+		if (stored > n)
+			stored = n;
+		if (is_user_src)
+			uvm_copyin(myproc()->pgtbl, (uint64)(node->data + file->offset), src, stored);
+		else
+			memmove(node->data + file->offset, (void *)src, stored);
+	}
+	file->offset += n;
+	if (file->offset > node->size)
+		node->size = file->offset;
+	return n;
+}
+
 file_t file_table[N_FILE]; // 文件资源池
 spinlock_t lk_file_table; // 保护它的锁
 
@@ -17,6 +502,11 @@ void file_init()
 		file_table[i].ip = NULL;
 	file_table[i].is_device = false;
 	file_table[i].dev_major = 0;
+	file_table[i].is_proc = false;
+	file_table[i].proc_kind = PROC_NONE;
+	file_table[i].proc_pid = 0;
+	file_table[i].is_mem = false;
+	file_table[i].mem_index = -1;
         file_table[i].readable = false;
         file_table[i].writbale = false;
         file_table[i].offset = 0;
@@ -163,6 +653,11 @@ file_t* file_alloc()
             file_table[i].ip = NULL;
 		file_table[i].is_device = false;
 		file_table[i].dev_major = 0;
+		file_table[i].is_proc = false;
+		file_table[i].proc_kind = PROC_NONE;
+		file_table[i].proc_pid = 0;
+            file_table[i].is_mem = false;
+            file_table[i].mem_index = -1;
             file_table[i].readable = false;
             file_table[i].writbale = false;
             file_table[i].offset = 0;
@@ -191,6 +686,23 @@ file_t* file_open(char *path, uint32 open_mode)
 	// 必须至少读/写之一
     if (!want_r && !want_w)   return NULL;
 
+	uint16 proc_kind = PROC_NONE;
+	int proc_pid = 0;
+	if (procfs_lookup(path, &proc_kind, &proc_pid) == 0) {
+		if (want_w)
+			return NULL;
+		file_t *pf = file_alloc();
+		if (pf == NULL)
+			return NULL;
+		pf->is_proc = true;
+		pf->proc_kind = proc_kind;
+		pf->proc_pid = proc_pid;
+		pf->readable = want_r;
+		pf->writbale = false;
+		pf->offset = 0;
+		return pf;
+	}
+
 	uint16 dev_major = 0;
 	if (device_path_lookup(path, &dev_major)) {
 		if (!device_open_check(dev_major, open_mode))
@@ -212,7 +724,34 @@ file_t* file_open(char *path, uint32 open_mode)
 	// 1. 先按路径找 inode
 	inode_t *ip = path_to_inode(path);
 
+	int mem_idx = memfs_find(path);
+	if (ip == NULL) {
+		if (mem_idx < 0 && (open_mode & FILE_OPEN_CREATE))
+			mem_idx = memfs_create(path, false);
+		if (mem_idx >= 0) {
+			file_t *mf = file_alloc();
+			if (mf == NULL)
+				return NULL;
+			memfs_node_t *node = &memfs_nodes[mem_idx];
+			if (node->is_dir && want_w) {
+				file_close(mf);
+				return NULL;
+			}
+			if (!node->is_dir && (open_mode & FILE_OPEN_TRUNC))
+				node->size = 0;
+			mf->is_mem = true;
+			mf->mem_index = mem_idx;
+			mf->readable = want_r;
+			mf->writbale = want_w;
+			mf->offset = (open_mode & FILE_OPEN_APPEND) ? node->size : 0;
+			return mf;
+		}
+	}
+
 	// 2. 不存在且允许创建：创建 DATA 文件
+	if (ip == NULL && fs_readonly_ext4 && (open_mode & FILE_OPEN_CREATE)) {
+		return NULL;
+	}
 	if (ip == NULL && (open_mode & FILE_OPEN_CREATE)) {
         ip = path_create_inode(path, INODE_TYPE_DATA, 
 			INODE_MAJOR_DEFAULT, INODE_MINOR_DEFAULT);
@@ -282,6 +821,11 @@ void file_close(file_t *file)
     file->ip = NULL;
 	file->is_device = false;
 	file->dev_major = 0;
+	file->is_proc = false;
+	file->proc_kind = PROC_NONE;
+	file->proc_pid = 0;
+	file->is_mem = false;
+	file->mem_index = -1;
     file->readable = false;
     file->writbale = false;
     file->offset = 0;
@@ -309,6 +853,12 @@ uint32 file_read(file_t* file, uint32 len, uint64 dst, bool is_user_dst)
 
 	if (file->is_pipe)
 		return pipe_read(file->pipe, dst, len, is_user_dst);
+
+	if (file->is_proc)
+		return procfs_read(file, len, dst, is_user_dst);
+
+	if (file->is_mem)
+		return memfs_read(file, len, dst, is_user_dst);
 
 	if (file->is_device)
 		return device_read_data(file->dev_major, len, dst, is_user_dst);
@@ -369,6 +919,12 @@ uint32 file_write(file_t* file, uint32 len, uint64 src, bool is_user_src)
 	if (file->is_pipe)
 		return pipe_write(file->pipe, src, len, is_user_src);
 
+	if (file->is_proc)
+		return (uint32)-1;
+
+	if (file->is_mem)
+		return memfs_write(file, len, src, is_user_src);
+
 	if (file->is_device)
 		return device_write_data(file->dev_major, len, src, is_user_src);
 
@@ -423,22 +979,35 @@ uint32 file_lseek(file_t *file, uint32 lseek_offset, uint32 lseek_flag)
 	if (file == NULL)
         return 0;
 
+	int32 off = (int32)lseek_offset;
+	uint32 size = 0;
+	if (file->is_mem && file->mem_index >= 0 && file->mem_index < MEMFS_NODES) {
+		size = memfs_nodes[file->mem_index].size;
+	} else if (file->ip != NULL) {
+		inode_lock(file->ip);
+		size = file->ip->disk_info.size;
+		inode_unlock(file->ip);
+	}
+
 	// 根据 lseek_flag 计算新的 offset
 	switch (lseek_flag) {
 	case FILE_LSEEK_SET:
 		// 从文件开头开始计算
-		file->offset = lseek_offset;
+		file->offset = off < 0 ? 0 : (uint32)off;
 		break;
 	case FILE_LSEEK_ADD:
 		// 从当前位置开始计算
-		file->offset += lseek_offset;
+		if (off < 0 && file->offset < (uint32)(-off))
+			file->offset = 0;
+		else
+			file->offset = (uint32)(file->offset + off);
 		break;
 	case FILE_LSEEK_SUB:
 		// 从当前位置向前计算
-		if (file->offset >= lseek_offset)
-			file->offset -= lseek_offset;
+		if (off < 0 && size < (uint32)(-off))
+			file->offset = 0;
 		else
-			file->offset = 0; 
+			file->offset = (uint32)(size + off);
 		break;
 	default:
 		// 非法 flag：不做处理
@@ -474,6 +1043,27 @@ uint32 file_get_stat(file_t* file, uint64 user_dst)
 	// 填充file_stat结构体
 	file_stat_t st;
 	memset(&st, 0, sizeof(st));
+
+	if (file->is_proc) {
+		st.type = procfs_is_dir(file->proc_kind) ? INODE_TYPE_DIR : INODE_TYPE_DATA;
+		st.nlink = 1;
+		st.size = 0;
+		st.inode_num = 0xF000 + file->proc_kind;
+		st.offset = file->offset;
+		uvm_copyout(myproc()->pgtbl, user_dst, (uint64)&st, sizeof(st));
+		return 0;
+	}
+
+	if (file->is_mem) {
+		memfs_node_t *node = &memfs_nodes[file->mem_index];
+		st.type = node->is_dir ? INODE_TYPE_DIR : INODE_TYPE_DATA;
+		st.nlink = 1;
+		st.size = node->size;
+		st.inode_num = 0xE000 + file->mem_index;
+		st.offset = file->offset;
+		uvm_copyout(myproc()->pgtbl, user_dst, (uint64)&st, sizeof(st));
+		return 0;
+	}
 
 	if (file->is_device) {
 		st.type = INODE_TYPE_DIVICE;
@@ -524,7 +1114,22 @@ uint32 file_get_stat_linux(file_t* file, uint64 user_dst)
 	memset(&st, 0, sizeof(st));
 	st.st_blksize = 512;
 
-	if (file->is_device) {
+	if (file->is_proc) {
+		char tmp[1024];
+		uint32 size = procfs_build_content(file, tmp, sizeof(tmp));
+		st.st_mode = (procfs_is_dir(file->proc_kind) ? 0040000 : 0100000) | 0555;
+		st.st_nlink = 1;
+		st.st_ino = 0xF000 + file->proc_kind + (uint32)file->proc_pid;
+		st.st_size = procfs_is_dir(file->proc_kind) ? 0 : size;
+		st.st_blocks = (st.st_size + 511) / 512;
+	} else if (file->is_mem) {
+		memfs_node_t *node = &memfs_nodes[file->mem_index];
+		st.st_mode = (node->is_dir ? 0040000 : 0100000) | 0777;
+		st.st_nlink = 1;
+		st.st_ino = 0xE000 + file->mem_index;
+		st.st_size = node->size;
+		st.st_blocks = (st.st_size + 511) / 512;
+	} else if (file->is_device) {
 		st.st_mode  = 0020000 | 0666;   // S_IFCHR
 		st.st_nlink = 1;
 		st.st_ino   = 1;
@@ -548,6 +1153,88 @@ uint32 file_get_stat_linux(file_t* file, uint64 user_dst)
 		st.st_ino    = inum;
 		st.st_blocks = (size + 511) / 512;
 	}
+	uvm_copyout(myproc()->pgtbl, user_dst, (uint64)&st, sizeof(st));
+	return 0;
+}
+
+uint32 file_get_dents_linux(file_t *file, uint64 user_dst, uint32 len)
+{
+	if (file == NULL || user_dst == 0)
+		return (uint32)-1;
+	if (file->is_proc)
+		return procfs_get_dents(file, user_dst, len);
+	if (file->ip == NULL)
+		return (uint32)-1;
+
+	inode_t *ip = file->ip;
+	inode_lock(ip);
+	if (ip->disk_info.type != INODE_TYPE_DIR) {
+		inode_unlock(ip);
+		return (uint32)-1;
+	}
+
+	uint32 copied = 0;
+	while (1) {
+		dentry_t de;
+		memset(&de, 0, sizeof(de));
+		uint32 got = dentry_transmit(ip, file->offset, (uint64)&de, sizeof(de), false);
+		if (got == 0)
+			break;
+		file->offset += sizeof(dentry_t);
+		if (de.name[0] == 0)
+			continue;
+		if (streq(de.name, ".") || streq(de.name, ".."))
+			continue;
+		uint8 dtype = 8;
+		inode_t *child = inode_get(de.inode_num);
+		if (child != NULL) {
+			if (child->disk_info.type == INODE_TYPE_DIR)
+				dtype = 4;
+			else if (child->disk_info.type == INODE_TYPE_DIVICE)
+				dtype = 2;
+			inode_put(child);
+		}
+		if (dtype == 4)
+			continue;
+		uint32 before = copied;
+		copied = emit_linux_dirent(user_dst, len, copied, de.inode_num, file->offset, dtype, de.name);
+		if (copied == before) {
+			file->offset -= sizeof(dentry_t);
+			break;
+		}
+	}
+	inode_unlock(ip);
+	return copied;
+}
+
+uint32 file_get_statfs_linux(file_t *file, uint64 user_dst)
+{
+	struct {
+		uint64 f_type;
+		uint64 f_bsize;
+		uint64 f_blocks;
+		uint64 f_bfree;
+		uint64 f_bavail;
+		uint64 f_files;
+		uint64 f_ffree;
+		int f_fsid[2];
+		uint64 f_namelen;
+		uint64 f_frsize;
+		uint64 f_flags;
+		uint64 f_spare[4];
+	} st;
+	if (file == NULL || user_dst == 0)
+		return (uint32)-1;
+	memset(&st, 0, sizeof(st));
+	st.f_type = file->is_proc ? 0x9FA0 : 0xEF53;
+	st.f_bsize = 4096;
+	st.f_blocks = sb.total_blocks ? sb.total_blocks : 262144;
+	st.f_bfree = st.f_blocks / 2;
+	st.f_bavail = st.f_bfree;
+	st.f_files = sb.total_inodes ? sb.total_inodes : 1024;
+	st.f_ffree = st.f_files / 2;
+	st.f_namelen = MAXLEN_FILENAME - 1;
+	st.f_frsize = 4096;
 	uvm_copyout(myproc()->pgtbl, user_dst, (uint64)&st, sizeof(st));
 	return 0;
 }

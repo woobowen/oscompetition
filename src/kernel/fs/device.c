@@ -45,6 +45,11 @@ bool device_path_lookup(const char *path, uint16 *major)
 		*major = INODE_MAJOR_GPT0;
 		return true;
 	}
+	if (device_path_eq(path, "/dev/rtc") || device_path_eq(path, "/dev/rtc0") ||
+		device_path_eq(path, "/dev/misc/rtc")) {
+		*major = INODE_MAJOR_RTC;
+		return true;
+	}
 
 	return false;
 }
@@ -141,6 +146,20 @@ static uint32 device_gpt0_write(uint32 len, uint64 src, bool is_user_src)
 	return len;
 }
 
+static uint32 device_rtc_read(uint32 len, uint64 dst, bool is_user_dst)
+{
+	(void)dst;
+	(void)is_user_dst;
+	return len > 0 ? 0 : 0;
+}
+
+static uint32 device_rtc_write(uint32 len, uint64 src, bool is_user_src)
+{
+	(void)src;
+	(void)is_user_src;
+	return len;
+}
+
 /* 注册设备 */
 static void device_register(uint32 index, char* name,
 	uint32(*read)(uint32, uint64, bool),
@@ -168,6 +187,7 @@ void device_init()
     device_register(INODE_MAJOR_ZERO,   "zero",   device_zero_read,  NULL);
     device_register(INODE_MAJOR_NULL,   "null",   device_null_read,  device_null_write);
     device_register(INODE_MAJOR_GPT0,   "gpt0",   NULL,              device_gpt0_write);
+    device_register(INODE_MAJOR_RTC,    "rtc",    device_rtc_read,   device_rtc_write);
 
 	// EXT4 评测盘为只读，不在磁盘上创建 /dev 节点。
 	// /dev/* 路径由 file_open 的虚拟设备映射直接处理。
@@ -193,6 +213,9 @@ void device_init()
         {"/dev/zero",   INODE_MAJOR_ZERO},
         {"/dev/null",   INODE_MAJOR_NULL},
         {"/dev/gpt0",   INODE_MAJOR_GPT0},
+        {"/dev/rtc",    INODE_MAJOR_RTC},
+        {"/dev/rtc0",   INODE_MAJOR_RTC},
+        {"/dev/misc/rtc", INODE_MAJOR_RTC},
     };
 
 	for (int i = 0; i < (int)(sizeof(devs) / sizeof(devs[0])); i++) {
