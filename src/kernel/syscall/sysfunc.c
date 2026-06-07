@@ -1383,6 +1383,189 @@ uint64 sys_socketpair()
     return 0;
 }
 
+static int arg_socket_fd(int n, socket_t **out)
+{
+    file_t *file;
+    if (arg_fd(n, NULL, &file) < 0)
+        return -EBADF;
+    if (!file->is_socket || file->socket == NULL)
+        return -ENOTSOCK;
+    *out = file->socket;
+    return 0;
+}
+
+// 198 socket(domain, type, protocol): AF_INET loopback socket.
+uint64 sys_socket()
+{
+    int domain = (int)arg_raw(0);
+    int type = (int)arg_raw(1);
+    int protocol = (int)arg_raw(2);
+    uint8 cloexec = 0;
+    file_t *file = socket_file_alloc(domain, type, protocol, &cloexec);
+    if (file == NULL)
+        return (uint64)(-EAFNOSUPPORT);
+
+    uint32 fd = alloc_fd_at_least(file, 0, cloexec);
+    if (fd == (uint32)-1) {
+        file_close(file);
+        return (uint64)(-EMFILE);
+    }
+    return fd;
+}
+
+// 200 bind(sockfd, addr, addrlen): bind AF_INET loopback address.
+uint64 sys_bind()
+{
+    socket_t *so;
+    int ret = arg_socket_fd(0, &so);
+    if (ret < 0)
+        return (uint64)ret;
+    ret = socket_bind(so, arg_raw(1), (uint32)arg_raw(2));
+    return ret < 0 ? (uint64)ret : 0;
+}
+
+// 201 listen(sockfd, backlog): mark a stream socket as accepting.
+uint64 sys_listen()
+{
+    socket_t *so;
+    int ret = arg_socket_fd(0, &so);
+    if (ret < 0)
+        return (uint64)ret;
+    ret = socket_listen(so, (int)arg_raw(1));
+    return ret < 0 ? (uint64)ret : 0;
+}
+
+static uint64 do_accept(int flags)
+{
+    socket_t *so;
+    file_t *file = NULL;
+    uint8 cloexec = 0;
+    int ret = arg_socket_fd(0, &so);
+    if (ret < 0)
+        return (uint64)ret;
+    ret = socket_accept(so, arg_raw(1), arg_raw(2), flags, &file, &cloexec);
+    if (ret < 0)
+        return (uint64)ret;
+    uint32 fd = alloc_fd_at_least(file, 0, cloexec);
+    if (fd == (uint32)-1) {
+        file_close(file);
+        return (uint64)(-EMFILE);
+    }
+    return fd;
+}
+
+// 202 accept(sockfd, addr, addrlen): accept a pending loopback stream.
+uint64 sys_accept()
+{
+    return do_accept(0);
+}
+
+// 242 accept4(sockfd, addr, addrlen, flags): accept with SOCK_* flags.
+uint64 sys_accept4()
+{
+    return do_accept((int)arg_raw(3));
+}
+
+// 203 connect(sockfd, addr, addrlen): connect to loopback listener.
+uint64 sys_connect()
+{
+    socket_t *so;
+    int ret = arg_socket_fd(0, &so);
+    if (ret < 0)
+        return (uint64)ret;
+    ret = socket_connect(so, arg_raw(1), (uint32)arg_raw(2));
+    return ret < 0 ? (uint64)ret : 0;
+}
+
+// 204 getsockname(sockfd, addr, addrlen): return local AF_INET name.
+uint64 sys_getsockname()
+{
+    socket_t *so;
+    int ret = arg_socket_fd(0, &so);
+    if (ret < 0)
+        return (uint64)ret;
+    ret = socket_getname(so, arg_raw(1), arg_raw(2), false);
+    return ret < 0 ? (uint64)ret : 0;
+}
+
+// 205 getpeername(sockfd, addr, addrlen): return peer AF_INET name.
+uint64 sys_getpeername()
+{
+    socket_t *so;
+    int ret = arg_socket_fd(0, &so);
+    if (ret < 0)
+        return (uint64)ret;
+    ret = socket_getname(so, arg_raw(1), arg_raw(2), true);
+    return ret < 0 ? (uint64)ret : 0;
+}
+
+// 206 sendto(sockfd, buf, len, flags, dest_addr, addrlen): loopback send.
+uint64 sys_sendto()
+{
+    socket_t *so;
+    int ret = arg_socket_fd(0, &so);
+    if (ret < 0)
+        return (uint64)ret;
+    ret = socket_sendto(so, arg_raw(1), (uint32)arg_raw(2), (int)arg_raw(3), arg_raw(4), (uint32)arg_raw(5));
+    return ret < 0 ? (uint64)ret : (uint64)ret;
+}
+
+// 207 recvfrom(sockfd, buf, len, flags, src_addr, addrlen): loopback receive.
+uint64 sys_recvfrom()
+{
+    socket_t *so;
+    int ret = arg_socket_fd(0, &so);
+    if (ret < 0)
+        return (uint64)ret;
+    ret = socket_recvfrom(so, arg_raw(1), (uint32)arg_raw(2), (int)arg_raw(3), arg_raw(4), arg_raw(5));
+    return ret < 0 ? (uint64)ret : (uint64)ret;
+}
+
+// 208 setsockopt(sockfd, level, optname, optval, optlen): minimal no-op options.
+uint64 sys_setsockopt()
+{
+    socket_t *so;
+    int ret = arg_socket_fd(0, &so);
+    if (ret < 0)
+        return (uint64)ret;
+    ret = socket_setsockopt(so, (int)arg_raw(1), (int)arg_raw(2), arg_raw(3), (uint32)arg_raw(4));
+    return ret < 0 ? (uint64)ret : 0;
+}
+
+// 209 getsockopt(sockfd, level, optname, optval, optlen): return stable values.
+uint64 sys_getsockopt()
+{
+    socket_t *so;
+    int ret = arg_socket_fd(0, &so);
+    if (ret < 0)
+        return (uint64)ret;
+    ret = socket_getsockopt(so, (int)arg_raw(1), (int)arg_raw(2), arg_raw(3), arg_raw(4));
+    return ret < 0 ? (uint64)ret : 0;
+}
+
+// 210 shutdown(sockfd, how): half-close a loopback stream.
+uint64 sys_shutdown_sock()
+{
+    socket_t *so;
+    int ret = arg_socket_fd(0, &so);
+    if (ret < 0)
+        return (uint64)ret;
+    ret = socket_shutdown(so, (int)arg_raw(1));
+    return ret < 0 ? (uint64)ret : 0;
+}
+
+// 211 sendmsg: msghdr/scm is outside the current loopback compatibility layer.
+uint64 sys_sendmsg()
+{
+    return (uint64)(-EOPNOTSUPP);
+}
+
+// 212 recvmsg: msghdr/scm is outside the current loopback compatibility layer.
+uint64 sys_recvmsg()
+{
+    return (uint64)(-EOPNOTSUPP);
+}
+
 uint64 sys_umask()
 {
     return 0;
@@ -1745,6 +1928,123 @@ uint64 sys_rt_sigreturn()
     p->sig_delivering = 0;
 
     return tf->a0;
+}
+
+static int fdset_has(uint64 *set, int fd)
+{
+    return (set[fd / 64] & (1ull << (fd % 64))) != 0;
+}
+
+static void fdset_put(uint64 *set, int fd)
+{
+    set[fd / 64] |= 1ull << (fd % 64);
+}
+
+static uint64 timespec_to_ticks(uint64 ts_addr)
+{
+    if (ts_addr == 0)
+        return 0;
+    uint64 ts[2];
+    uvm_copyin(myproc()->pgtbl, (uint64)ts, ts_addr, sizeof(ts));
+    uint64 ticks = ts[0] * 10;
+    if (ts[1] > 0)
+        ticks++;
+    return ticks;
+}
+
+// 72 pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask): select-compatible fd sets.
+uint64 sys_pselect6()
+{
+    int nfds = (int)arg_raw(0);
+    uint64 read_addr = arg_raw(1);
+    uint64 write_addr = arg_raw(2);
+    uint64 except_addr = arg_raw(3);
+    uint64 timeout_addr = arg_raw(4);
+    proc_t *p = myproc();
+
+    if (nfds < 0)
+        return (uint64)(-EINVAL);
+    if (nfds > N_OPEN_FILE_PER_PROC)
+        nfds = N_OPEN_FILE_PER_PROC;
+
+    uint64 in_r[1] = {0}, in_w[1] = {0}, in_e[1] = {0};
+    if (read_addr != 0)
+        uvm_copyin(p->pgtbl, (uint64)in_r, read_addr, sizeof(in_r));
+    if (write_addr != 0)
+        uvm_copyin(p->pgtbl, (uint64)in_w, write_addr, sizeof(in_w));
+    if (except_addr != 0)
+        uvm_copyin(p->pgtbl, (uint64)in_e, except_addr, sizeof(in_e));
+
+    uint64 timeout_ticks = timespec_to_ticks(timeout_addr);
+    if (nfds == 0) {
+        if (timeout_addr != 0 && timeout_ticks > 0)
+            timer_wait(timeout_ticks);
+        return 0;
+    }
+
+    for (;;) {
+        uint64 out_r[1] = {0}, out_w[1] = {0}, out_e[1] = {0};
+        int ready = 0;
+
+        for (int fd = 0; fd < nfds; fd++) {
+            int want_r = read_addr != 0 && fdset_has(in_r, fd);
+            int want_w = write_addr != 0 && fdset_has(in_w, fd);
+            int want_e = except_addr != 0 && fdset_has(in_e, fd);
+            if (!want_r && !want_w && !want_e)
+                continue;
+
+            file_t *f = p->open_file[fd];
+            if (f == NULL)
+                continue;
+
+            if (f->is_socket) {
+                int events = 0;
+                if (want_r)
+                    events |= 1;
+                if (want_w)
+                    events |= 4;
+                int revents = socket_poll_ready(f->socket, events);
+                if (want_r && (revents & (1 | 0x10 | 0x8))) {
+                    fdset_put(out_r, fd);
+                    ready++;
+                }
+                if (want_w && (revents & 4)) {
+                    fdset_put(out_w, fd);
+                    ready++;
+                }
+                if (want_e && (revents & 0x8)) {
+                    fdset_put(out_e, fd);
+                    ready++;
+                }
+            } else {
+                if (want_r) {
+                    fdset_put(out_r, fd);
+                    ready++;
+                }
+                if (want_w) {
+                    fdset_put(out_w, fd);
+                    ready++;
+                }
+            }
+        }
+
+        if (ready > 0 || timeout_addr != 0) {
+            if (ready == 0 && timeout_ticks > 0) {
+                timer_wait(1);
+                timeout_ticks--;
+                continue;
+            }
+            if (read_addr != 0)
+                uvm_copyout(p->pgtbl, read_addr, (uint64)out_r, sizeof(out_r));
+            if (write_addr != 0)
+                uvm_copyout(p->pgtbl, write_addr, (uint64)out_w, sizeof(out_w));
+            if (except_addr != 0)
+                uvm_copyout(p->pgtbl, except_addr, (uint64)out_e, sizeof(out_e));
+            return ready;
+        }
+
+        socket_wait();
+    }
 }
 
 // 73 ppoll(fds, nfds, tmo_p, sigmask, sigsetsize)

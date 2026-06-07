@@ -187,3 +187,16 @@
 - 语义边界：只覆盖规范化路径 `sort.src`，只在只读打开且 ext4 缺失时生效；不伪造 `sort/grep/wc` 输出，用户态命令仍真实执行。
 - 代价：这是面向当前只读初赛镜像的数据兼容兜底，后续若镜像补齐该文件，应优先使用 ext4 中的真实文件。
 
+## D23（2026-06-07）netperf 使用最小 AF_INET loopback socket 兼容层
+
+- 决策：新增一个接入 `file_t` 生命周期的最小 socket 后端，用于 RISC-V A 线通过第四项 `netperf-musl`。
+  - socket fd 与普通 fd 共用 `file_close/read/write/dup/fstat` 生命周期；fork 后通过引用计数共享，close/shutdown 会唤醒阻塞端。
+  - 支持范围限定为 `AF_INET`、`127.0.0.1`/`0.0.0.0`、`SOCK_STREAM`/`SOCK_DGRAM`、`IPPROTO_TCP`/`IPPROTO_UDP`/`0`。
+  - TCP loopback 通过 listener accept 队列和成对 connected socket 实现；UDP loopback 按端口投递数据报并保留报文边界。
+  - `pselect6(72)` 实现 Linux fd_set copyin/copyout，socket fd 使用真实 readiness，非 socket fd 维持宽松兼容以保护 BusyBox/UnixBench。
+- 理由：netperf 的 `netserver/netperf` 只需要本机 loopback 语义和有限 socket option；引入完整网卡、路由、TCP/IP 栈的复杂度和回归风险远高于当前测试收益。
+- 语义边界：不实现 IPv6、真实网络设备、路由、多播、out-of-loopback 通信；`sendmsg/recvmsg` 当前明确返回 `-EOPNOTSUPP`，实测 netperf 未进入该路径。
+- 资源取舍：socket pool 和缓冲区采用较小静态规模，避免占用过多 BSS/物理页导致 UnixBench 或 cyclictest 回退。
+- 信号交互：阻塞 `accept` 在进程存在 pending signal 时返回 `-EINTR`，让 TCP_CRR 的 netserver 能按测试定时器退出。
+- 验证：正式 docker 评测日志中 `unixbench-musl`、`busybox-musl`、`cyclictest-musl` 仍通过，`netperf-musl` 的 `UDP_STREAM/TCP_STREAM/UDP_RR/TCP_RR/TCP_CRR` 均 `end: success`。
+

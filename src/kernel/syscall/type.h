@@ -79,11 +79,27 @@
 #define SYS_sched_getaffinity 123 // Linux/RISC-V sched_getaffinity
 #define SYS_getegid 177          // Linux/RISC-V getegid
 #define SYS_geteuid 175          // Linux/RISC-V geteuid
+#define SYS_pselect6 72          // Linux/RISC-V pselect6
 #define SYS_ppoll 73             // Linux/RISC-V ppoll
 #define SYS_sendfile 71          // Linux/RISC-V sendfile64
 #define SYS_renameat2 276        // Linux/RISC-V renameat2
 #define SYS_sched_setscheduler 119  // Linux/RISC-V sched_setscheduler
+#define SYS_socket 198           // Linux/RISC-V socket
 #define SYS_socketpair 199       // Linux/RISC-V socketpair
+#define SYS_bind 200             // Linux/RISC-V bind
+#define SYS_listen 201           // Linux/RISC-V listen
+#define SYS_accept 202           // Linux/RISC-V accept
+#define SYS_connect 203          // Linux/RISC-V connect
+#define SYS_getsockname 204      // Linux/RISC-V getsockname
+#define SYS_getpeername 205      // Linux/RISC-V getpeername
+#define SYS_sendto 206           // Linux/RISC-V sendto
+#define SYS_recvfrom 207         // Linux/RISC-V recvfrom
+#define SYS_setsockopt 208       // Linux/RISC-V setsockopt
+#define SYS_getsockopt 209       // Linux/RISC-V getsockopt
+#define SYS_shutdown_sock 210    // Linux/RISC-V shutdown
+#define SYS_sendmsg 211          // Linux/RISC-V sendmsg
+#define SYS_recvmsg 212          // Linux/RISC-V recvmsg
+#define SYS_accept4 242          // Linux/RISC-V accept4
 #define SYS_get_mempolicy 236    // Linux/RISC-V get_mempolicy
 
 #define SYS_schedstat 500        // SeaOS 私有: 拉取调度统计快照

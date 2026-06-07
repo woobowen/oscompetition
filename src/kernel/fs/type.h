@@ -464,6 +464,8 @@ typedef struct pipe {
     int used;          // 槽位占用
 } pipe_t;
 
+typedef struct socket socket_t;
+
 typedef struct file {
     inode_t *ip;        // 对应的inode
     bool is_device;     // 是否为虚拟设备文件(不依赖磁盘inode)
@@ -479,6 +481,8 @@ typedef struct file {
     uint32 ref;         // 引用数 (lk_file_table保护)
     bool is_pipe;       // 是否为管道
     struct pipe *pipe;  // 管道对象(is_pipe 时有效)
+    bool is_socket;     // loopback socket backend
+    socket_t *socket;   // socket object(is_socket 时有效)
 } file_t;
 
 #define N_FILE 1024      // file_table中file的数量

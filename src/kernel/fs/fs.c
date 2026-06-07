@@ -546,6 +546,10 @@ void file_init()
         file_table[i].writbale = false;
         file_table[i].offset = 0;
         file_table[i].ref = 0;
+	file_table[i].is_pipe = false;
+	file_table[i].pipe = NULL;
+	file_table[i].is_socket = false;
+	file_table[i].socket = NULL;
 	}
 	spinlock_release(&lk_file_table);
 }
@@ -698,6 +702,8 @@ file_t* file_alloc()
             file_table[i].offset = 0;
             file_table[i].is_pipe = false;
             file_table[i].pipe = NULL;
+            file_table[i].is_socket = false;
+            file_table[i].socket = NULL;
             spinlock_release(&lk_file_table);
             return &file_table[i]; // 返回分配的file
 		}
@@ -855,6 +861,8 @@ void file_close(file_t *file)
 	ip = file->ip;
 	bool was_pipe = file->is_pipe;
 	pipe_t *pi = file->pipe;
+	bool was_socket = file->is_socket;
+	socket_t *so = file->socket;
 	bool was_writable = file->writbale;
     file->ip = NULL;
 	file->is_device = false;
@@ -869,11 +877,15 @@ void file_close(file_t *file)
     file->offset = 0;
 	file->is_pipe = false;
 	file->pipe = NULL;
+	file->is_socket = false;
+	file->socket = NULL;
 
 	spinlock_release(&lk_file_table);
 
 	if (was_pipe && pi != NULL)
 		pipe_close(pi, was_writable);
+	if (was_socket && so != NULL)
+		socket_file_close(so);
 
 	if (ip != NULL)
 		inode_put(ip); // 释放inode
@@ -891,6 +903,9 @@ uint32 file_read(file_t* file, uint32 len, uint64 dst, bool is_user_dst)
 
 	if (file->is_pipe)
 		return pipe_read(file->pipe, dst, len, is_user_dst);
+
+	if (file->is_socket)
+		return socket_file_read(file->socket, dst, len, is_user_dst);
 
 	if (file->is_proc)
 		return procfs_read(file, len, dst, is_user_dst);
@@ -956,6 +971,9 @@ uint32 file_write(file_t* file, uint32 len, uint64 src, bool is_user_src)
 
 	if (file->is_pipe)
 		return pipe_write(file->pipe, src, len, is_user_src);
+
+	if (file->is_socket)
+		return socket_file_write(file->socket, src, len, is_user_src);
 
 	if (file->is_proc)
 		return (uint32)-1;
@@ -1113,6 +1131,16 @@ uint32 file_get_stat(file_t* file, uint64 user_dst)
 		return 0;
 	}
 
+	if (file->is_socket) {
+		st.type = INODE_TYPE_DATA;
+		st.nlink = 1;
+		st.size = 0;
+		st.inode_num = 0xD000;
+		st.offset = 0;
+		uvm_copyout(myproc()->pgtbl, user_dst, (uint64)&st, sizeof(st));
+		return 0;
+	}
+
 	if (file->ip == NULL)
 		return (uint32)-1;
 
@@ -1171,6 +1199,10 @@ uint32 file_get_stat_linux(file_t* file, uint64 user_dst)
 		st.st_mode  = 0020000 | 0666;   // S_IFCHR
 		st.st_nlink = 1;
 		st.st_ino   = 1;
+	} else if (file->is_socket) {
+		st.st_mode  = 0140000 | 0777;   // S_IFSOCK
+		st.st_nlink = 1;
+		st.st_ino   = 0xD000;
 	} else {
 		if (file->ip == NULL) return (uint32)-1;
 		inode_t *ip = file->ip;
@@ -1341,6 +1373,8 @@ void fs_init()
 
 	// 初始化设备表
 	device_init();
+	// 初始化 socket 池
+	socket_init();
 	// 初始化文件表
 	file_init();
 }

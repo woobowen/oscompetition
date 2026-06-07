@@ -4,7 +4,7 @@
 > 返回值约定：成功返回结果（uint64）；失败返回 (uint64)(-EXXX)，见 docs/DECISIONS.md D1/D2。
 > 分发表上限 SYS_MAX_NUM=502（src/kernel/syscall/type.h）。
 
-## 已实现（共 75 个分发表入口，含 3 个 SeaOS 私有入口）
+## 已实现（共 101 个分发表入口，含 3 个 SeaOS 私有入口）
 | 号 | 名 | 备注 |
 |---|---|---|
 | 4 | fork | SeaOS |
@@ -19,6 +19,7 @@
 | 38 | renameat | 同文件系统重命名；支持目录重命名 |
 | 43 | statfs | 最小 Linux `struct statfs` |
 | 44 | fstatfs | 最小 Linux `struct statfs` |
+| 46 | ftruncate | 最小兼容：有效 fd 返回 0 |
 | 48 | faccessat | 路径存在性/可读可执行检查 |
 | 49 | chdir | |
 | 56 | open(at) | |
@@ -31,6 +32,7 @@
 | 65 | readv | |
 | 66 | writev | |
 | 71 | sendfile | |
+| 72 | pselect6 | Linux fd_set copyin/copyout；socket 使用真实 readiness |
 | 73 | ppoll | |
 | 78 | readlinkat | `/proc/self/exe` 返回当前程序路径 |
 | 79 | newfstatat | 按路径 stat |
@@ -40,15 +42,21 @@
 | 93 | exit | |
 | 94 | exit_group | 单线程下等价 exit |
 | 96 | set_tid_address | 返回 pid（D3 最小实现） |
+| 98 | futex | 最小 WAIT/WAKE 语义 |
 | 99 | set_robust_list | 桩返回 0 |
 | 100 | get_robust_list | 桩返回 0 |
 | 101 | nanosleep(兼容) | |
 | 102 | getitimer | 桩，零填充返回 |
 | 103 | setitimer | ITIMER_REAL → proc_t.itimer_expire/interval |
 | 113 | clock_gettime | |
+| 114 | clock_getres | 最小兼容分辨率返回 |
 | 115 | clock_nanosleep | 支持相对睡眠与 TIMER_ABSTIME 绝对睡眠 |
 | 116 | syslog | BusyBox `dmesg` 所需最小 klogctl |
+| 118 | sched_setparam | 最小兼容 |
 | 119 | sched_setscheduler | 桩返回 0 |
+| 120 | sched_getscheduler | 最小兼容 |
+| 121 | sched_getparam | 最小兼容 |
+| 122 | sched_setaffinity | 单核兼容 |
 | 123 | sched_getaffinity | 单核 mask bit0=1 |
 | 124 | sched_yield | 调用 proc_yield |
 | 129 | kill | 最小 pid/signal 校验；有效目标返回成功 |
@@ -70,13 +78,31 @@
 | 177 | getegid | 返回 0 |
 | 178 | gettid | 单线程 = pid |
 | 179 | sysinfo | 零填充 112B，uptime 填入 |
+| 198 | socket | AF_INET loopback，支持 STREAM/DGRAM |
+| 199 | socketpair | AF_UNIX/SOCK_STREAM 最小 pipe-like 兼容 |
+| 200 | bind | loopback/any IPv4，端口 0 自动分配 |
+| 201 | listen | TCP listener，维护 accept 队列 |
+| 202 | accept | 阻塞等待 TCP 连接；信号待处理时返回 `-EINTR` |
+| 203 | connect | TCP 建立本机 socket pair；UDP 记录默认 peer |
+| 204 | getsockname | 返回本地 IPv4 sockaddr |
+| 205 | getpeername | 返回 peer IPv4 sockaddr |
+| 206 | sendto | stream 写 peer RX ring；UDP 投递数据报 |
+| 207 | recvfrom | stream/UDP 接收，支持 EOF 与源地址返回 |
+| 208 | setsockopt | netperf 所需 option no-op 兼容 |
+| 209 | getsockopt | 返回稳定 SNDBUF/RCVBUF/TCP_MAXSEG 等值 |
+| 210 | shutdown | socket 半关闭，唤醒阻塞端 |
+| 211 | sendmsg | 明确返回 `-EOPNOTSUPP` |
+| 212 | recvmsg | 明确返回 `-EOPNOTSUPP` |
 | 214 | brk | |
 | 215 | munmap | |
 | 220 | clone | musl fork/pthread 依赖；按 flag 区分 parent_tid、child_tid 与 clear_child_tid |
 | 221 | execve | 支持动态链接 ELF (D4) |
 | 222 | mmap | len 自动 page 对齐 |
 | 226 | mprotect | 最小权限更新：已有映射按 prot 调整 PTE_R/W/X |
+| 228 | mlock | 最小兼容，返回 0 |
 | 233 | madvise | 桩返回 0 |
+| 236 | get_mempolicy | 最小 NUMA default node 0 兼容 |
+| 242 | accept4 | accept + `SOCK_CLOEXEC` |
 | 260 | wait4 | |
 | 276 | renameat2 | 无 flags 时转 `renameat`，其他 flags 返回 `-EINVAL` |
 | 500/501/502 | schedstat/spawn/shutdown | SeaOS 私有 |
@@ -137,10 +163,10 @@ Unixbench SHELL16 test(lpm): 1
 - ~~procfs 未实现：`/proc/mounts`、`/proc/self/` 等均不可访问~~ → 已修复到 BusyBox 所需最小面。
 - 后续测试当前缺口（历史记录，2026-06-07 已更新）：
   - ~~`cyclictest-musl`：`unknown syscall 236`、`unknown syscall 199`~~ → 已推进补齐，当前阻塞为用户态 SEGV
-  - `netperf-musl`：`unknown syscall 198`
-  - `lmbench-musl`：`unknown syscall 72`
+  - ~~`netperf-musl`：`unknown syscall 198`~~ → 已通过，见下方 2026-06-07 netperf 状态更新
+  - ~~`lmbench-musl`：`unknown syscall 72`~~ → `pselect6(72)` 已补齐；第五组 lmbench 后续状态另记
 
-## 2026-06-07 状态更新：cyclictest 相关 syscall 已推进，当前阻塞改为 SEGV
+## 2026-06-07 历史记录：cyclictest 相关 syscall 已推进，阻塞曾改为 SEGV
 
 本轮围绕第三项 `cyclictest-musl` 已接入/补充的 Linux/RISC-V ABI 面包括：
 
@@ -172,9 +198,52 @@ Unixbench SHELL16 test(lpm): 1
 [SEGV] pid=364 t=15 pc=0x000000000002f63c stval=0x0000003ffb031ff8
 ```
 
-因此旧记录中的 `cyclictest-musl: unknown syscall 236/199` 已不是当前阻塞。新的当前缺口是 cyclictest 用户态 SEGV，重点排查：
+因此旧记录中的 `cyclictest-musl: unknown syscall 236/199` 已不是当前阻塞。当时新的缺口是 cyclictest 用户态 SEGV，后续已通过 `mprotect`、`clock_nanosleep(TIMER_ABSTIME)`、`clone child_tid` 等修复收敛；保留下列排查方向作为历史定位记录：
 
 - `clone(CLONE_VM)` 后父子/线程页表共享是否覆盖 mmap、用户栈、TLS 和动态链接器映射；
 - 文件/共享 `mmap` 的映射长度和边界是否覆盖 cyclictest 运行期访问；
 - `clear_child_tid` + futex wake、线程退出路径是否破坏共享地址空间；
 - `clock_getres` 可从 10ms 调整为 1ns 以消除 high-res warning，但这不是 SEGV 根因。
+
+## 2026-06-07 状态更新：netperf-musl 已通过
+
+本轮为第四项 `netperf-musl` 接入最小 AF_INET loopback socket 兼容层，并补齐 netperf 直接使用的 Linux/RISC-V syscall 面：
+
+| 号 | 名 | 当前语义 |
+|---|---|---|
+| 72 | pselect6 | Linux fd_set copyin/copyout；socket 使用真实 readiness，非 socket fd 维持宽松兼容 |
+| 198 | socket | 支持 `AF_INET`、`SOCK_STREAM`、`SOCK_DGRAM`，协议 `0/TCP/UDP` |
+| 200 | bind | 支持 `127.0.0.1`、`0.0.0.0`，端口 0 自动分配 |
+| 201 | listen | TCP listener 维护 accept 队列 |
+| 202/242 | accept/accept4 | 阻塞等待连接，`accept4` 支持 `SOCK_CLOEXEC`；信号待处理时返回 `-EINTR` |
+| 203 | connect | TCP 创建本机成对 connected socket；UDP 记录默认 peer |
+| 204/205 | getsockname/getpeername | 返回本地/对端 IPv4 sockaddr |
+| 206/207 | sendto/recvfrom | TCP 字节流与 UDP 数据报 loopback |
+| 208/209 | setsockopt/getsockopt | netperf 所需 option no-op 或稳定整数返回 |
+| 210 | shutdown | 支持 socket 半关闭和阻塞端唤醒 |
+| 211/212 | sendmsg/recvmsg | 当前明确返回 `-EOPNOTSUPP`，实测 netperf 未进入该路径 |
+
+正式 docker 串口日志确认前四项均到组尾：
+
+```text
+#### OS COMP TEST GROUP END unixbench-musl ####
+======== test sucess ========
+#### OS COMP TEST GROUP END busybox-musl ####
+======== test sucess ========
+#### OS COMP TEST GROUP END cyclictest-musl ####
+======== test sucess ========
+====== netperf UDP_STREAM end: success ======
+====== netperf TCP_STREAM end: success ======
+====== netperf UDP_RR end: success ======
+====== netperf TCP_RR end: success ======
+====== netperf TCP_CRR end: success ======
+#### OS COMP TEST GROUP END netperf-musl ####
+======== test sucess ========
+```
+
+语义边界：
+
+- 只实现本机 loopback，不实现真实网卡、路由、IPv6、多播或 out-of-loopback 通信。
+- socket pool 和缓冲区保持较小静态规模，避免回退 UnixBench/cyclictest 中的物理页压力。
+- `SO_SNDBUF/SO_RCVBUF` 返回至少 `32000`，`TCP_MAXSEG` 返回 `1460`；其他 netperf 所需 option 多为 no-op。
+- 第五项 `lmbench-musl` 不属于本轮通过标准；若继续暴露缺口，单独记录和收敛。
