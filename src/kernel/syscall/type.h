@@ -22,6 +22,8 @@
 #define SYS_dup 23               // Linux/RISC-V dup
 #define SYS_fstat 80             // Linux/RISC-V fstat
 #define SYS_sync 81              // Linux/RISC-V sync
+#define SYS_fsync 82             // Linux/RISC-V fsync
+#define SYS_fdatasync 83         // Linux/RISC-V fdatasync
 #define SYS_get_dentries 61      // Linux/RISC-V getdents64
 #define SYS_mkdir 34             // Linux/RISC-V mkdirat
 #define SYS_chdir 49             // Linux/RISC-V chdir
@@ -47,6 +49,8 @@
 #define SYS_fcntl 25             // fcntl(fd,cmd,arg)
 #define SYS_rt_sigaction 134     // 装信号处理器 (暂桩)
 #define SYS_uname 160            // 系统信息
+#define SYS_getrlimit 163        // Linux/RISC-V getrlimit
+#define SYS_setrlimit 164        // Linux/RISC-V setrlimit
 #define SYS_getppid 173          // 父进程 pid
 #define SYS_gettid 178           // Linux/RISC-V gettid (单线程 = pid)
 #define SYS_clone 220            // Linux/RISC-V clone (musl fork 依赖)
@@ -58,6 +62,7 @@
 #define SYS_umask 166            // Linux/RISC-V umask (桩, 返回0)
 #define SYS_dup3 24              // Linux/RISC-V dup3
 #define SYS_mprotect 226         // Linux/RISC-V mprotect
+#define SYS_msync 227            // Linux/RISC-V msync
 #define SYS_ioctl 29             // Linux/RISC-V ioctl
 #define SYS_set_robust_list 99   // Linux/RISC-V set_robust_list
 #define SYS_get_robust_list 100  // Linux/RISC-V get_robust_list
@@ -101,6 +106,7 @@
 #define SYS_recvmsg 212          // Linux/RISC-V recvmsg
 #define SYS_accept4 242          // Linux/RISC-V accept4
 #define SYS_get_mempolicy 236    // Linux/RISC-V get_mempolicy
+#define SYS_prlimit64 261        // Linux/RISC-V prlimit64
 
 #define SYS_schedstat 500        // SeaOS 私有: 拉取调度统计快照
 #define SYS_spawn     501        // SeaOS 私有: fork+exec+wait 串行执行程序

@@ -164,7 +164,7 @@ Unixbench SHELL16 test(lpm): 1
 - 后续测试当前缺口（历史记录，2026-06-07 已更新）：
   - ~~`cyclictest-musl`：`unknown syscall 236`、`unknown syscall 199`~~ → 已推进补齐，当前阻塞为用户态 SEGV
   - ~~`netperf-musl`：`unknown syscall 198`~~ → 已通过，见下方 2026-06-07 netperf 状态更新
-  - ~~`lmbench-musl`：`unknown syscall 72`~~ → `pselect6(72)` 已补齐；第五组 lmbench 后续状态另记
+  - ~~`lmbench-musl`：`unknown syscall 72`~~ → `pselect6(72)` 已补齐；第五组 lmbench 已在 2026-06-08 状态更新中收敛到 `GROUP END` 与 36/36 解析
 
 ## 2026-06-07 历史记录：cyclictest 相关 syscall 已推进，阻塞曾改为 SEGV
 
@@ -246,4 +246,41 @@ Unixbench SHELL16 test(lpm): 1
 - 只实现本机 loopback，不实现真实网卡、路由、IPv6、多播或 out-of-loopback 通信。
 - socket pool 和缓冲区保持较小静态规模，避免回退 UnixBench/cyclictest 中的物理页压力。
 - `SO_SNDBUF/SO_RCVBUF` 返回至少 `32000`，`TCP_MAXSEG` 返回 `1460`；其他 netperf 所需 option 多为 no-op。
-- 第五项 `lmbench-musl` 不属于本轮通过标准；若继续暴露缺口，单独记录和收敛。
+- 历史说明：2026-06-07 netperf 收敛时第五项 `lmbench-musl` 尚未作为本轮通过标准；该状态已由下方 2026-06-08 lmbench 更新取代。
+
+## 2026-06-08 status update: lmbench-musl reaches GROUP END and parses
+
+The RISC-V musl target now passes the first five groups in the official docker run, and direct `judge_lmbench-musl.py` parsing reports 36/36 non-zero lmbench metric scores:
+
+```text
+#### OS COMP TEST GROUP END unixbench-musl ####
+======== test sucess ========
+#### OS COMP TEST GROUP END busybox-musl ####
+======== test sucess ========
+#### OS COMP TEST GROUP END cyclictest-musl ####
+======== test sucess ========
+#### OS COMP TEST GROUP END netperf-musl ####
+======== test sucess ========
+#### OS COMP TEST GROUP END lmbench-musl ####
+======== test sucess ========
+```
+
+Current validation detail: the latest `os_serial_out_rv.txt` first-five group chunks contain no `ERROR:`, `unknown syscall`, `panic!`, `unexpected exception`, or `[SEGV]` markers. Direct lmbench judge parsing reports 36 items, 36 non-zero scores, and `score_sum=43.9642`.
+
+Harness caveat: the fixed local docker command may still print a final JSON summary with `score: 0` and no parsed groups because `/cg/kernel.zip` resolves `testcase_dir` to `/coursegrader/testdata` and does not discover the mounted local `/cg/kernel/judge` scripts. This is a local parser-discovery artifact for that command, not evidence that lmbench failed. The authoritative evidence for this milestone is the generated serial log plus direct judge/parser checks.
+
+New or updated syscall coverage for this milestone:
+
+| No. | Name | Current semantics |
+|---|---|---|
+| 72 | pselect6 | fd_set copyin/copyout uses `(N_OPEN_FILE_PER_PROC + 63) / 64` words; socket and pipe readiness are checked by object state; regular files remain immediately ready. |
+| 82 | fsync | Minimal compatibility: valid fd returns 0 because the current test filesystem has no per-fd flush state. |
+| 83 | fdatasync | Same minimal compatibility as fsync. |
+| 163 | getrlimit | Supports `RLIMIT_NOFILE`; returns the static per-process fd limit. |
+| 164 | setrlimit | Accepts `RLIMIT_NOFILE` after validating the user pointer; does not resize the static fd table. |
+| 227 | msync | Minimal compatibility: validates alignment/flags and returns 0 because current mmap has no file-backed dirty-page writeback. |
+| 261 | prlimit64 | Supports current process `RLIMIT_NOFILE`; unsupported pid/resource combinations return normal errno. |
+
+Resource note: `N_OPEN_FILE_PER_PROC` is 256. This is required for lmbench `lat_ctx ... 96`, which creates 96 pipes in one parent process and therefore needs at least 195 fd including stdin/stdout/stderr. The earlier 256-fd panic was traced to user physical-page exhaustion under the old 128M `ALLOC_END` linker limit plus unchecked `pmem_alloc(false)` in `uvm_copy_pgtbl`; `ALLOC_END` now matches the 1G QEMU RAM range and fork fails cleanly if page-copy allocation still fails.
+
+Output note: `/dev/stderr` now writes bytes unchanged instead of prefixing every write with `ERROR: `. This restores normal Linux stderr semantics and lets lmbench's stderr metrics match the judge's baseline keys.

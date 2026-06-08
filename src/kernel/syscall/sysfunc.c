@@ -759,6 +759,22 @@ uint64 sys_mprotect()
     return 0;
 }
 
+// 227 msync(addr, length, flags): current mmap has no file-backed dirty pages.
+uint64 sys_msync()
+{
+    uint64 addr = arg_raw(0);
+    uint64 len = arg_raw(1);
+    uint64 flags = arg_raw(2);
+
+    if (len == 0)
+        return 0;
+    if (addr % PGSIZE != 0)
+        return (uint64)(-EINVAL);
+    if ((flags & ~(1UL | 2UL | 4UL)) != 0)
+        return (uint64)(-EINVAL);
+    return 0;
+}
+
 /*
     鑾峰彇鏂囦欢淇℃伅
     uint32 fd
@@ -783,6 +799,24 @@ uint64 sys_fstat()
 */
 uint64 sys_sync()
 {
+    return 0;
+}
+
+// 82 fsync(fd): valid fd succeeds; SeaOS test FS has no per-fd flush state.
+uint64 sys_fsync()
+{
+    file_t *file;
+    if (arg_fd(0, NULL, &file) < 0)
+        return (uint64)(-EBADF);
+    return 0;
+}
+
+// 83 fdatasync(fd): same minimal semantics as fsync.
+uint64 sys_fdatasync()
+{
+    file_t *file;
+    if (arg_fd(0, NULL, &file) < 0)
+        return (uint64)(-EBADF);
     return 0;
 }
 
@@ -1256,6 +1290,59 @@ uint64 sys_uname()
     memmove(u.release,  "6.1.0",   6);   // 缁欎釜杈冩柊鐨勫唴鏍哥増鏈彿, 瑙勯伩閮ㄥ垎鐗堟湰妫€鏌?    memmove(u.version,  "SeaOS",   6);
     memmove(u.machine,  "riscv64", 8);
     uvm_copyout(myproc()->pgtbl, addr, (uint64)&u, sizeof(u));
+    return 0;
+}
+
+static uint64 copy_nofile_rlimit(uint64 addr)
+{
+    uint64 limit[2] = {N_OPEN_FILE_PER_PROC, N_OPEN_FILE_PER_PROC};
+    if (addr == 0)
+        return (uint64)(-EFAULT);
+    uvm_copyout(myproc()->pgtbl, addr, (uint64)limit, sizeof(limit));
+    return 0;
+}
+
+// 163 getrlimit(resource, rlim): support RLIMIT_NOFILE for lmbench morefds().
+uint64 sys_getrlimit()
+{
+    uint64 resource = arg_raw(0);
+    uint64 rlim = arg_raw(1);
+    if (resource != 7)
+        return (uint64)(-EINVAL);
+    return copy_nofile_rlimit(rlim);
+}
+
+// 164 setrlimit(resource, rlim): accept RLIMIT_NOFILE without changing static fd table size.
+uint64 sys_setrlimit()
+{
+    uint64 resource = arg_raw(0);
+    uint64 rlim = arg_raw(1);
+    uint64 tmp[2];
+    if (resource != 7)
+        return (uint64)(-EINVAL);
+    if (rlim == 0)
+        return (uint64)(-EFAULT);
+    uvm_copyin(myproc()->pgtbl, (uint64)tmp, rlim, sizeof(tmp));
+    return 0;
+}
+
+// 261 prlimit64(pid, resource, new_limit, old_limit): combined get/set rlimit.
+uint64 sys_prlimit64()
+{
+    uint64 pid = arg_raw(0);
+    uint64 resource = arg_raw(1);
+    uint64 new_limit = arg_raw(2);
+    uint64 old_limit = arg_raw(3);
+    uint64 tmp[2];
+
+    if (pid != 0 && pid != (uint64)myproc()->pid)
+        return (uint64)(-ESRCH);
+    if (resource != 7)
+        return (uint64)(-EINVAL);
+    if (old_limit != 0)
+        copy_nofile_rlimit(old_limit);
+    if (new_limit != 0)
+        uvm_copyin(myproc()->pgtbl, (uint64)tmp, new_limit, sizeof(tmp));
     return 0;
 }
 
@@ -1930,6 +2017,8 @@ uint64 sys_rt_sigreturn()
     return tf->a0;
 }
 
+#define SELECT_FDSET_WORDS ((N_OPEN_FILE_PER_PROC + 63) / 64)
+
 static int fdset_has(uint64 *set, int fd)
 {
     return (set[fd / 64] & (1ull << (fd % 64))) != 0;
@@ -1952,6 +2041,37 @@ static uint64 timespec_to_ticks(uint64 ts_addr)
     return ticks;
 }
 
+static int pipe_select_ready(pipe_t *pi, int want_r, int want_w)
+{
+    int ready = 0;
+
+    spinlock_acquire(&pi->lk);
+    if (want_r && (pi->nread != pi->nwrite || !pi->writeopen))
+        ready |= 1;
+    if (want_w && (pi->nwrite < pi->nread + PIPE_SIZE || !pi->readopen))
+        ready |= 2;
+    spinlock_release(&pi->lk);
+    return ready;
+}
+
+static void pipe_select_wait(pipe_t *pi, int want_r, int want_w)
+{
+    if (pi == NULL)
+        return;
+    spinlock_acquire(&pi->lk);
+    if (want_r && pi->nread == pi->nwrite && pi->writeopen) {
+        proc_sleep(&pi->nread, &pi->lk);
+        spinlock_release(&pi->lk);
+        return;
+    }
+    if (want_w && pi->nwrite == pi->nread + PIPE_SIZE && pi->readopen) {
+        proc_sleep(&pi->nwrite, &pi->lk);
+        spinlock_release(&pi->lk);
+        return;
+    }
+    spinlock_release(&pi->lk);
+}
+
 // 72 pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask): select-compatible fd sets.
 uint64 sys_pselect6()
 {
@@ -1967,7 +2087,9 @@ uint64 sys_pselect6()
     if (nfds > N_OPEN_FILE_PER_PROC)
         nfds = N_OPEN_FILE_PER_PROC;
 
-    uint64 in_r[1] = {0}, in_w[1] = {0}, in_e[1] = {0};
+    uint64 in_r[SELECT_FDSET_WORDS] = {0};
+    uint64 in_w[SELECT_FDSET_WORDS] = {0};
+    uint64 in_e[SELECT_FDSET_WORDS] = {0};
     if (read_addr != 0)
         uvm_copyin(p->pgtbl, (uint64)in_r, read_addr, sizeof(in_r));
     if (write_addr != 0)
@@ -1983,8 +2105,15 @@ uint64 sys_pselect6()
     }
 
     for (;;) {
-        uint64 out_r[1] = {0}, out_w[1] = {0}, out_e[1] = {0};
+        uint64 out_r[SELECT_FDSET_WORDS] = {0};
+        uint64 out_w[SELECT_FDSET_WORDS] = {0};
+        uint64 out_e[SELECT_FDSET_WORDS] = {0};
         int ready = 0;
+        pipe_t *wait_pipe = NULL;
+        int wait_pipe_r = 0;
+        int wait_pipe_w = 0;
+        int saw_socket = 0;
+        int saw_pipe = 0;
 
         for (int fd = 0; fd < nfds; fd++) {
             int want_r = read_addr != 0 && fdset_has(in_r, fd);
@@ -1998,6 +2127,7 @@ uint64 sys_pselect6()
                 continue;
 
             if (f->is_socket) {
+                saw_socket = 1;
                 int events = 0;
                 if (want_r)
                     events |= 1;
@@ -2014,6 +2144,22 @@ uint64 sys_pselect6()
                 }
                 if (want_e && (revents & 0x8)) {
                     fdset_put(out_e, fd);
+                    ready++;
+                }
+            } else if (f->is_pipe) {
+                saw_pipe = 1;
+                if (wait_pipe == NULL) {
+                    wait_pipe = f->pipe;
+                    wait_pipe_r = want_r;
+                    wait_pipe_w = want_w;
+                }
+                int revents = pipe_select_ready(f->pipe, want_r, want_w);
+                if ((revents & 1) != 0) {
+                    fdset_put(out_r, fd);
+                    ready++;
+                }
+                if ((revents & 2) != 0) {
+                    fdset_put(out_w, fd);
                     ready++;
                 }
             } else {
@@ -2043,7 +2189,12 @@ uint64 sys_pselect6()
             return ready;
         }
 
-        socket_wait();
+        if (saw_socket && !saw_pipe)
+            socket_wait();
+        else if (saw_pipe && !saw_socket)
+            pipe_select_wait(wait_pipe, wait_pipe_r, wait_pipe_w);
+        else
+            timer_wait(1);
     }
 }
 

@@ -69,7 +69,6 @@ static uint32 device_stdout_write(uint32 len, uint64 src, bool is_user_src)
 /* 标准错误输出设备 */
 static uint32 device_stderr_write(uint32 len, uint64 src, bool is_user_src)
 {
-	printf("ERROR: ");
 	return cons_write(len, src, is_user_src);
 }
 

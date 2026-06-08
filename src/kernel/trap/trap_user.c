@@ -71,6 +71,10 @@ void trap_user_handler()
                 uint64 fault_addr = r_stval();
                 uint64 res = uvm_ustack_grow(p->pgtbl, p->ustack_npage, fault_addr);
                 if (res == (uint64)-1) {
+                    if (!p->sig_delivering && p->sig_handler[SIGSEGV] > 1) {
+                        p->sig_pending |= (1UL << (SIGSEGV - 1));
+                        break;
+                    }
                     printf("[SEGV] pid=%d t=%d pc=%p stval=%p gp=%p tp=%p sp=%p ra=%p\n",
                            p->pid, trap_id, sepc, (void*)fault_addr, (void*)tf->gp, (void*)tf->tp, (void*)tf->sp, (void*)tf->ra);
                     proc_exit(-11);
@@ -96,7 +100,8 @@ void trap_user_handler()
                 continue;
             }
             if (p->sig_handler[sig] == 0) {
-                if (sig == SIGINT || sig == SIGTERM || sig == SIGKILL || sig == SIGHUP)
+                if (sig == SIGINT || sig == SIGTERM || sig == SIGKILL || sig == SIGHUP ||
+                    sig == SIGSEGV || sig == SIGBUS)
                     proc_exit(128 + sig);
                 p->sig_pending &= ~(1UL << (sig - 1));
                 continue;

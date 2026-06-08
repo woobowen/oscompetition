@@ -476,7 +476,11 @@ int proc_fork()
     child->sched_ready_count++;
 
     // 复制页表
-    uvm_copy_pgtbl(parent->pgtbl, child->pgtbl, parent->heap_top, parent->ustack_npage, parent->mmap);
+    if (uvm_copy_pgtbl(parent->pgtbl, child->pgtbl, parent->heap_top, parent->ustack_npage, parent->mmap) < 0) {
+        proc_free(child);
+        spinlock_release(&child->lk);
+        return -1;
+    }
 
     // 继承open_file
     for (int i = 0; i < N_OPEN_FILE_PER_PROC; i++) {

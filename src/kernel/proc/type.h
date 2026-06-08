@@ -101,13 +101,15 @@ enum proc_state
 #define MLFQ_MKV_STATES 9
 
 // 单个进程最多打开N_OPEN_FILE_PER_PROC个文件
-#define N_OPEN_FILE_PER_PROC 32
+#define N_OPEN_FILE_PER_PROC 256
 
 // Signal
 #define NSIG        64
 #define SIGHUP      1
 #define SIGINT      2
+#define SIGBUS      7
 #define SIGKILL     9
+#define SIGSEGV     11
 #define SIGALRM     14
 #define SIGTERM     15
 #define SIGCHLD     17
