@@ -229,41 +229,6 @@ PWCL CSR 值：`0x53E4D52C`（PTbase=12, PTwidth=9, Dir1_base=21, Dir1_width=9, 
 | 内存 | `SYS_munmap`       | 215  | 桩实现，返回 0                                                                     |
 | 系统 | `SYS_shutdown`     | 502  | UART 打印关机消息 → `idle 0` 挂起                                                  |
 
-#### 关键技术实现
-
-**用户/内核数据拷贝**：
-
-由于内核运行在 DA=1（物理地址即虚拟地址），而用户态通过 TLB 分页，内核需要通过页表遍历来翻译用户虚拟地址。`la_copy_from_user` 和 `la_copy_to_user` 逐页边界处理跨页拷贝：
-
-```c
-// 伪代码
-while (done < len) {
-    pa = walk_page_table(user_va + done);  // 三级页表遍历
-    memcpy(kernel_buf + done, (void*)pa, chunk);
-    done += chunk;
-}
-```
-
-**fork 的页表深拷贝**：
-
-`la_uvm_copy_pgtbl` 遍历源页表的所有三级条目，为每个有效映射分配新的物理页并复制数据，保持相同的权限位。子进程的 trap frame 复制自父进程，但 a0 设为 0（fork 返回值）。
-
-**exec 的 argv 设置**：
-
-`la_do_exec_syscall` 从用户空间拷贝 argv 字符串数组，将字符串数据和指针推入用户栈，设置 a0=argc、a1=argv 指针。
-
-**SeaFS/EXT4 目录项转 dirent64**：
-
-`la_fs_get_dentries` 将内部文件系统格式转换为 Linux dirent64 格式：
-```
-struct dirent64 {
-    uint64_t d_ino;      // inode 号
-    uint64_t d_off;      // 下一条目的偏移
-    uint16_t d_reclen;   // 记录长度
-    uint8_t  d_type;     // DT_REG=8, DT_DIR=4
-    char     d_name[];   // 文件名，NUL 终止，8 字节对齐
-};
-```
 
 ### 当前启动输出
 
@@ -510,5 +475,268 @@ docker exec nostalgic_khayyam bash -c "cd /workspace && make check-la"
 | TICLR     | 0x44      | 定时器中断清除           |
 | DMW0      | 0x180     | 直接映射窗口 0           |
 
->     以上为2026-06-10内容
+>     以上为2026-06-10 21:15内容
+---
+
+## 八、当前状态总结
+
+### 已完成：内核框架搭建，OS 基本链路跑通
+
+经过 Step 1-9 的开发，LoongArch B 线已经完成了从零到"能启动、能进用户态、能响应系统调用"的完整内核框架搭建。具体来说：
+
+1. **硬件初始化链路完整**：从 entry.S 到 boot.c，内核能正确设置 SP、异常向量、物理内存管理器、DMW0 恒等映射、页表 CSR、TLB、定时器中断、进程表。
+2. **PCI 设备驱动工作正常**：VirtIO PCI 块设备能通过 ECAM 枚举发现、BAR 分配、VirtIO 协议初始化，并能读写 4KB 块。
+3. **双文件系统支持**：内核能自动识别并挂载 SeaFS（`disk.img`）和 EXT4（`sdcard-la.img`），支持路径解析、文件读取、目录枚举。
+4. **用户态完整链路**：内核 → swtch → user_bootstrap → proc_return → DA=0/PG=1 切换 → ertn → initcode 用户态运行 → syscall 陷入 → 返回用户态，整个循环已验证通过。
+5. **18 个系统调用可用**：fork/exec/wait/exit/getpid/open/close/read/write/lseek/dup/fstat/get_dentries/chdir/mkdir/brk/mmap/munmap/shutdown。
+6. **进程管理基础完备**：PCB、轮转调度器、内核线程/用户进程创建、sleep/wakeup、上下文切换。
+7. **fork 页表深拷贝**：三级页表递归遍历、物理页分配、数据复制、权限保持。
+
+**一句话概括**：内核的"骨架"和"循环系统"已经搭好，能跑能响应，但还缺"肌肉"——管道、文件写入、脚本执行、抢占调度等让实际测试程序跑起来的能力。
+
+### 关键发现：sdcard-la.img 已存在
+
+`sdcard-la.img`（4GB EXT4 镜像）已存在于项目根目录，包含完整的 LoongArch 测试程序：
+- `/musl/` 目录：unixbench、busybox（静态链接 ELF）、cyclictest、lmbench 等二进制 + `*_testcode.sh` 脚本
+- `/glibc/` 目录：glibc 版本的同类测试
+- 所有二进制均为 `ELF 64-bit LSB executable, LoongArch`
+
+内核使用 `sdcard-la.img` 启动时能成功挂载 EXT4（输出 `EXT4 mounted!`），但 initcode 仍报 "no *_testcode.sh found"——说明 EXT4 目录枚举或路径解析存在 bug，这是首要修复目标。
+
+---
+
+## 九、评测通过计划：分步实施路线图
+
+### 总体目标
+
+让 LoongArch 内核能够挂载 `sdcard-la.img`，运行 initcode 找到 `*_testcode.sh` 测试脚本，通过 fork/exec/wait 执行测试，至少覆盖 unixbench-musl、busybox-musl、cyclictest-musl 三组测试。
+
+### 推荐执行顺序
+
+```
+Step 10 (修EXT4 bug) → Step 11 (脚本执行) → Step 12 (定时器抢占)
+  → Step 13 (动态链接) → Step 14 (管道) → Step 15 (文件写入)
+  → Step 16 (补全syscall) → Step 17 (栈增长) → Step 18 (堆增强)
+  → Step 19 (资源回收) → Step 20 (块缓存) → Step 21 (集成验证)
+```
+
+---
+
+### Step 10：修复 EXT4 目录枚举 Bug（🔴 P0 阻塞级）
+
+**问题**：内核挂载 `sdcard-la.img`（EXT4）成功，但 initcode 的 `SYS_open("/musl")` + `SYS_get_dentries` 返回空结果，导致找不到测试脚本。
+
+**调试方向**：
+1. 在 `fs_la.c` 的 `e4_dir_lookup` 中添加调试输出，确认路径解析能否找到 `/musl`
+2. 检查 `e4_get_dentries` 是否正确遍历 EXT4 目录项
+3. 可能的原因：
+   - `e4_read_file` 读取目录数据失败（间接块映射问题）
+   - EXT4 目录项的 `h.rec_len` 解析有误
+   - 大目录跨越多个块时处理有误
+   - `e4_dir_lookup` 中字符串比较逻辑有 bug
+
+**涉及文件**：`src/kernel/loongarch/fs_la.c`
+
+**验证标准**：用 `sdcard-la.img` 启动，initcode 应输出 `run /musl/unixbench_testcode.sh`
+
+---
+
+### Step 11：脚本执行支持（#! shebang）（🔴 P0）
+
+**问题**：`unixbench_testcode.sh` 第一行是 `#!/bin/bash`，exec 需要识别 shebang 并用 busybox 解释执行。
+
+**实现内容**：
+1. 在 `exec_la.c` 的 `la_do_exec_syscall` 中，读取文件前 2 字节检查 `#!`
+2. 如果是脚本，读取第一行获取解释器路径（如 `/bin/bash`）
+3. 尝试解析器路径查找：先尝试原路径，失败则回退到 `/musl/busybox`
+4. 重新构建 argv：`[解释器, 脚本路径, 原argv...]`
+5. 加载解释器 ELF（busybox 是静态链接的）而不是脚本本身
+
+**涉及文件**：`src/kernel/loongarch/exec_la.c`
+
+**验证标准**：initcode fork 后子进程 exec 脚本不再返回 -1
+
+---
+
+### Step 12：定时器触发进程调度（时间片抢占）（🔴 P0）
+
+**问题**：当前 `la_timer_interrupt()` 只计数，不触发调度切换。长时间运行的测试程序会独占 CPU。
+
+**实现内容**：
+1. 在 `la_timer_interrupt()` 中增加时间片计数
+2. 每次时钟中断递增当前进程的 tick 计数
+3. 超过时间片（如 10 ticks = 100ms）时，标记 `RUNNABLE` 并 `la_proc_yield()`
+4. 注意在 trap 返回路径中调用 yield，需要保存/恢复 trap frame 状态
+
+**涉及文件**：`src/kernel/loongarch/timer.c`、`proc.c`、`trap.c`、`proc.h`（添加 ticks 字段）
+
+**验证标准**：多进程 fork/wait 场景不会卡死
+
+---
+
+### Step 13：动态链接器支持（🟡 P1，可延后）
+
+**问题**：部分测试程序（如 `dhry2`）是动态链接的，interpreter 为 `/lib64/ld-musl-loongarch-lp64d.so.1`。
+
+**实现内容**：
+1. 在 ELF 加载时检查 PT_INTERP 段，获取 interpreter 路径
+2. 检查 `sdcard-la.img` 中是否存在 musl dynamic linker
+3. 如果存在，先加载 interpreter ELF，设置辅助向量（AT_PHDR/AT_PHNUM/AT_ENTRY 等）
+4. 将用户程序的入口改为 interpreter 的 entry
+
+**备选方案**：如果动态链接太复杂，busybox 是静态链接的，可优先跑 busybox 测试组。unixbench 的部分程序也是静态链接的。
+
+**涉及文件**：`src/kernel/loongarch/exec_la.c`
+
+**验证标准**：能执行动态链接的测试程序
+
+---
+
+### Step 14：管道实现（🔴 P0）
+
+**问题**：测试脚本大量使用管道（如 `./dhry2reg 10 | ./busybox grep ...`），无管道则 unixbench 完全无法运行。
+
+**实现内容**：
+1. 定义 `la_pipe` 结构：环形缓冲区（4KB）+ 读/写指针 + 读/写端打开标志 + sleep/wakeup
+2. `SYS_pipe`：分配一个 pipe 结构，创建两个 fd（读端 + 写端）
+3. `SYS_read`（pipe fd）：如果缓冲区空且写端开着 → sleep；否则读取数据
+4. `SYS_write`（pipe fd）：如果缓冲区满且读端开着 → sleep；否则写入数据
+5. `SYS_close`：关闭对应端，若两端都关则释放 pipe 缓冲区
+6. `SYS_fork`：子进程继承 pipe fd（共享同一 pipe）
+
+**涉及文件**：`src/kernel/loongarch/syscall.c`、`proc.h`
+
+**验证标准**：能执行 `./dhry2reg 10 | ./busybox grep` 管道命令
+
+---
+
+### Step 15：文件系统写入支持（🔴 P0）
+
+**问题**：unixbench 的 fstime 测试需要文件写入。busybox 需要 touch/rm/mkdir/mv 等。当前文件系统只读。
+
+**推荐方案：内存文件系统 (memfs)**
+1. 在内存中创建一个小型文件系统（如 16MB），挂载在可写路径
+2. 实现 SYS_creat、SYS_unlink、SYS_mkdir、SYS_rmdir
+3. fd 的 SYS_write 对 memfs 文件写入
+4. 不修改磁盘上的 EXT4（保持只读）
+
+**实现内容**：
+1. 定义 `la_memfs` 结构：简单的 inode + 数据块数组
+2. `SYS_creat`：在 memfs 中创建文件，返回 fd
+3. `SYS_write`（文件 fd）：向 memfs 写入数据
+4. `SYS_unlink`：从 memfs 删除文件
+5. `SYS_mkdir`：在 memfs 创建目录
+6. 路径解析：区分 EXT4 路径（只读）和 memfs 路径（可写）
+
+**备选方案**：实现 EXT4 写入（复杂度高，需要块分配、inode 分配、目录项管理）
+
+**涉及文件**：`src/kernel/loongarch/fs_la.c`、`syscall.c`、`early_boot.h`、`proc.h`
+
+**验证标准**：unixbench FS_WRITE/READ/COPY 测试能产出结果
+
+---
+
+### Step 16：补全关键系统调用（🟡 P1）
+
+| Syscall             | 编号 | 用途             | 依赖 Step |
+| ------------------- | ---- | ---------------- | --------- |
+| `SYS_pipe`          | 59   | 管道创建         | Step 14   |
+| `SYS_creat`         | 35   | 创建文件         | Step 15   |
+| `SYS_unlink`        | 35   | 删除文件         | Step 15   |
+| `SYS_gettimeofday`  | 78   | 获取时间         | 无        |
+| `SYS_clock_gettime` | 113  | 高精度时钟       | 无        |
+| `SYS_times`         | 100  | 进程时间统计     | 无        |
+| `SYS_stat`          | 79   | 路径版 fstat     | 无        |
+| `SYS_uname`         | 160  | 系统信息         | 无        |
+| `SYS_getppid`       | 64   | 获取父进程 ID    | 无        |
+| `SYS_fcntl`         | 25   | 文件控制         | 无        |
+| `SYS_clone`         | 2    | 线程创建         | 中等难度  |
+| `SYS_ioctl`         | 29   | 设备控制         | 低        |
+
+**涉及文件**：`src/kernel/loongarch/syscall.c`
+
+---
+
+### Step 17：栈自动增长（🟡 P1）
+
+**问题**：复杂程序（busybox、unixbench）可能需要超过 1 页（4KB）的栈空间。
+
+**实现内容**：
+1. 在 trap_dispatch 中检测用户态页错误（TLB refill 失败时，检查 fault VA 是否在栈区域）
+2. 如果 VA 在 `[stack_base - 扩展上限, stack_top)` 范围内，分配新页并映射
+3. 最大栈限制：如 16 页（64KB）
+4. 在 `proc.h` 的 `la_proc` 中添加 `stack_bottom` 字段
+
+**涉及文件**：`src/kernel/loongarch/trap.c`、`uvm_la.c`、`proc.h`
+
+---
+
+### Step 18：用户程序堆管理增强（🟢 P2）
+
+**实现内容**：
+1. 完善 `SYS_mmap`：支持 MAP_ANONYMOUS、MAP_FIXED 等标志
+2. `SYS_brk`：实际分配物理页面映射到堆区
+3. fork 时正确复制/共享 mmap 区域
+
+**涉及文件**：`src/kernel/loongarch/syscall.c`、`uvm_la.c`
+
+---
+
+### Step 19：进程资源回收与稳定性（🟡 P1）
+
+**问题**：fork 后旧页表未释放，进程数量有限（16个），ZOMBIE 清理可能不完整。
+
+**实现内容**：
+1. `exec` 后释放旧页表和物理页面
+2. `exit` 后释放用户页表
+3. wait 回收子进程时释放所有资源
+4. 增加 `LA_NPROC` 到 64 或更高（unixbench 可能 fork 大量子进程）
+
+**涉及文件**：`src/kernel/loongarch/proc.c`、`uvm_la.c`、`exec_la.c`
+
+---
+
+### Step 20：缓冲区缓存（🟢 P2）
+
+**问题**：每次文件读取都直接发起 VirtIO 磁盘请求，性能极差。
+
+**实现内容**：
+1. 简单的 LRU 块缓存（如 256 个块 = 1MB）
+2. 读请求先查缓存，命中则直接返回
+3. 未命中则 VirtIO 读取并加入缓存
+4. 写请求标记脏块，延迟写回
+
+**涉及文件**：新增 `src/kernel/loongarch/bio_la.c` 或在 `fs_la.c` 中添加
+
+---
+
+### Step 21：综合集成与验证
+
+1. 用 `sdcard-la.img` 跑完整评测，确认 initcode 能扫描到测试脚本
+2. 逐个验证 unixbench-musl 子测试
+3. 验证 busybox-musl 各命令测试
+4. 验证 cyclictest-musl
+5. 修复集成过程中发现的所有 bug
+6. 确认 `make all` + `make check-la` 全部通过
+
+---
+
+### 实施优先级总览
+
+| Step | 内容             | 优先级   | 预估工作量 | 依赖        |
+| ---- | ---------------- | -------- | ---------- | ----------- |
+| 10   | 修复 EXT4 目录 bug | 🔴 P0  | 小         | 无          |
+| 11   | 脚本执行 shebang | 🔴 P0    | 中         | Step 10     |
+| 12   | 定时器抢占调度   | 🔴 P0    | 小         | 无          |
+| 13   | 动态链接器       | 🟡 P1    | 大（可延后）| Step 11     |
+| 14   | 管道实现         | 🔴 P0    | 中         | Step 11     |
+| 15   | 文件系统写入     | 🔴 P0    | 大         | Step 10     |
+| 16   | 补全关键 syscall | 🟡 P1    | 中         | Step 14, 15 |
+| 17   | 栈自动增长       | 🟡 P1    | 小         | 无          |
+| 18   | 堆管理增强       | 🟢 P2    | 中         | 无          |
+| 19   | 资源回收         | 🟡 P1    | 中         | 无          |
+| 20   | 缓冲区缓存       | 🟢 P2    | 中         | 无          |
+| 21   | 集成验证         | 🔴 P0    | 视情况     | 全部        |
+
+>     以上为2026-06-10 21:29内容
 ---
