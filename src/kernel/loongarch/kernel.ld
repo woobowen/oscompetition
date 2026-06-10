@@ -35,7 +35,9 @@ SECTIONS
     *(.bss .bss.* COMMON)
     . = ALIGN(16);
     la_boot_stack = .;
-    . += 4096;
+    . += 16384;
     la_boot_stack_top = .;
+    . = ALIGN(0x1000);
+    la_kernel_end = .;
   }
 }

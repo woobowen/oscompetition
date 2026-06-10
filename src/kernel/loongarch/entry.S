@@ -1,5 +1,7 @@
 # LoongArch early entry for the source-built kernel-la path.
 
+#include "src/kernel/loongarch/trap_layout.h"
+
 .section .text.entry, "ax"
 .globl _entry
 .type _entry, @function
@@ -11,6 +13,10 @@ _entry:
         csrwr   $t0, 0x4
         la.local $t0, la_exception_entry
         csrwr   $t0, 0xc
+
+        # TLB refill exceptions → same handler (for diagnostic)
+        la.local $t0, la_exception_entry
+        csrwr   $t0, LA_CSR_TLBRENTRY
 
         bl la_boot_main
 

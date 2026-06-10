@@ -2,9 +2,104 @@
 #define SEAOS_LOONGARCH_PROC_H
 
 #include <stdint.h>
-
 #include "trap.h"
 
+#define LA_NPROC        16
+#define LA_KSTACK_SIZE  4096   /* one page per kernel stack */
+
+/* ---- Process states ---- */
+enum la_proc_state {
+    LA_PROC_UNUSED = 0,
+    LA_PROC_RUNNABLE,
+    LA_PROC_RUNNING,
+    LA_PROC_SLEEPING,
+    LA_PROC_ZOMBIE,
+};
+
+/* ---- Kernel thread context (callee-saved regs, managed by swtch.S) ---- */
+struct la_context {
+    uint64_t ra;      /* $r1  */
+    uint64_t sp;      /* $r3  */
+    uint64_t fp;      /* $r22 */
+    uint64_t s0;      /* $r23 */
+    uint64_t s1;      /* $r24 */
+    uint64_t s2;      /* $r25 */
+    uint64_t s3;      /* $r26 */
+    uint64_t s4;      /* $r27 */
+    uint64_t s5;      /* $r28 */
+    uint64_t s6;      /* $r29 */
+    uint64_t s7;      /* $r30 */
+    uint64_t s8;      /* $r31 */
+};
+
+/* ---- File descriptor table ---- */
+#define LA_NFD 32
+
+/* fd types */
+#define LA_FD_UNUSED  0
+#define LA_FD_CONSOLE 1   /* stdin/stdout/stderr → UART */
+#define LA_FD_FILE    2   /* regular file on filesystem */
+
+struct la_fd {
+    uint32_t ino;            /* inode number (0 = unused) */
+    uint32_t offset;         /* current read/write offset */
+    int type;                /* LA_FD_UNUSED/CONSOLE/FILE */
+    int writable;            /* 1 = write allowed */
+};
+
+/* ---- Process control block ---- */
+struct la_proc {
+    int pid;
+    enum la_proc_state state;
+    char name[16];
+
+    uint64_t kstack;           /* kernel stack page address */
+    struct la_context ctx;     /* saved kernel context */
+
+    /* User-mode state */
+    struct la_trap_frame *tf;  /* user trap frame (on kernel stack) */
+    uint64_t *pgtbl;           /* user page table root */
+    uint64_t heap_top;         /* user heap top */
+    int is_user;               /* 1 = user process, 0 = kernel thread */
+
+    /* Process relationships */
+    int parent_pid;            /* parent's PID (0 for first process) */
+    int exit_code;             /* exit status for wait() */
+
+    /* File descriptor table */
+    struct la_fd fds[LA_NFD];
+
+    /* Current working directory */
+    uint32_t cwd_ino;          /* inode number of cwd */
+
+    /* Kernel thread entry (used only for kthreads) */
+    uint64_t entry;
+};
+
+/* ---- Per-CPU state (single CPU for now) ---- */
+struct la_cpu {
+    struct la_context scheduler_ctx;
+    struct la_proc *current;
+};
+
+/* ---- Process management functions ---- */
+void la_proc_init(void);
+void la_scheduler(void) __attribute__((noreturn));
+void la_proc_yield(void);
+void la_sched_switch(struct la_context *old_ctx);
+struct la_proc *la_proc_create_kthread(void (*entry)(void), const char *name);
+struct la_proc *la_proc_create_user(const char *name);
+struct la_proc *la_current_proc(void);
+
+/* ---- Sleep / wakeup ---- */
+void la_proc_sleep(void);
+void la_proc_wakeup_pid(int pid);
+
+/* ---- Process table accessor (for syscall.c) ---- */
+struct la_proc *la_proc_by_pid(int pid);
+struct la_proc *la_proc_table(void);  /* returns la_procs array */
+
+/* ---- User process helpers ---- */
 struct la_user_entry {
     uint64_t entry;
     uint64_t sp;
@@ -15,6 +110,12 @@ struct la_user_entry {
 void la_trap_frame_init_user(struct la_trap_frame *tf,
                              const struct la_user_entry *entry);
 void la_proc_return(struct la_trap_frame *tf);
-void la_proc_log_checkpoint(void);
+
+/* ---- Context switch (swtch.S) ---- */
+void la_swtch(struct la_context *old, struct la_context *new);
+
+/* ---- UVM globals (defined in uvm_la.c, used by trap_entry.S) ---- */
+extern uint64_t la_user_pgd;
+extern uint64_t la_trap_ksp;
 
 #endif

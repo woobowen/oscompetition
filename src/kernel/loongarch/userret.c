@@ -1,7 +1,5 @@
 #include "early_boot.h"
 #include "trap.h"
 
-void la_user_return_log_checkpoint(void)
-{
-    la_uart_puts("la_userret: era prmd gpr restore scaffold staged\n");
-}
+/* la_user_return is implemented in userret.S — this file just exists
+   to keep the build happy if anything references the C translation unit. */

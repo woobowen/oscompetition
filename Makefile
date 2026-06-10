@@ -37,8 +37,10 @@ LA_CC = $(LA_TOOLPREFIX)gcc
 LA_LD = $(LA_TOOLPREFIX)ld
 LA_BUILD_MODE ?= $(if $(shell command -v $(LA_CC) >/dev/null 2>&1 && command -v $(LA_LD) >/dev/null 2>&1 && echo yes),source,stub)
 LA_KERNEL_LD = $(KernelPath)/loongarch/kernel.ld
-LA_SOURCE_FILE = $(KernelPath)/loongarch/entry.S $(KernelPath)/loongarch/boot.c $(KernelPath)/loongarch/trap_entry.S $(KernelPath)/loongarch/trap.c $(KernelPath)/loongarch/syscall.c $(KernelPath)/loongarch/userret.S $(KernelPath)/loongarch/userret.c $(KernelPath)/loongarch/proc.c
-LA_SOURCE_OBJ = $(TARGET)/loongarch/entry.o $(TARGET)/loongarch/boot.o $(TARGET)/loongarch/trap_entry.o $(TARGET)/loongarch/trap.o $(TARGET)/loongarch/syscall.o $(TARGET)/loongarch/userret.o $(TARGET)/loongarch/userret_c.o $(TARGET)/loongarch/proc.o
+LA_SOURCE_FILE = $(wildcard $(KernelPath)/loongarch/*.S) $(filter-out $(KernelPath)/loongarch/userret.c,$(wildcard $(KernelPath)/loongarch/*.c))
+LA_SOURCE_OBJ = $(patsubst $(KernelPath)/loongarch/%.S,$(TARGET)/loongarch/%.o,$(filter %.S,$(LA_SOURCE_FILE)))
+LA_SOURCE_OBJ += $(patsubst $(KernelPath)/loongarch/%.c,$(TARGET)/loongarch/%.o,$(filter %.c,$(LA_SOURCE_FILE)))
+LA_SOURCE_OBJ += $(TARGET)/loongarch/userret_c.o
 LA_CFLAGS = -Wall -Werror -O2 -ffreestanding -fno-common -nostdlib -fno-stack-protector -fno-pie -I.
 LA_LDFLAGS = -z max-page-size=4096
 
@@ -54,7 +56,7 @@ KernelOBJ += $(patsubst $(KernelPath)/%.c, $(TARGET)/kernel/%.o, $(filter %.c, $
 # 用户程序分类: 启动程序(initcode.c) 通用库(syscall.c、help.c) 测试程序(test_1.c test_2.c ...)
 USER_INIT_C = $(UserPath)/initcode.c
 USER_LIB_C = $(UserPath)/syscall.c $(UserPath)/help.c
-USER_TEST_C = $(filter-out $(USER_INIT_C) $(USER_LIB_C), $(wildcard $(UserPath)/*.c))
+USER_TEST_C = $(filter-out $(USER_INIT_C) $(USER_LIB_C) $(LA_INITCODE_C), $(wildcard $(UserPath)/*.c))
 
 # 用户目标文件
 USER_INIT_OBJ = $(TARGET)/user/initcode.o
@@ -73,6 +75,11 @@ QEMUOPTS += -drive file=$(DISKIMG),if=none,format=raw,id=x0
 QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 LA_SERIAL_LOG = os_serial_out_la.txt
 LA_QEMU_TIMEOUT = 8s
+LA_USER_LD = $(LoaderPath)/user-la.ld
+LA_INITCODE_C = $(UserPath)/initcode_la.c
+LA_INITCODE_H = $(KernelPath)/loongarch/initcode_la.h
+LA_OBJCOPY = $(LA_TOOLPREFIX)objcopy
+LA_USER_CFLAGS = -Wall -O2 -ffreestanding -fno-common -nostdlib -fno-stack-protector -fno-pie -fno-builtin -I.
 
 # 调试配置
 GDBPORT = $(shell expr `id -u` % 5000 + 25000)
@@ -137,6 +144,13 @@ $(BIN2C): $(BIN2C_SRC) | $(TARGET)
 $(LA_ELFGEN): $(LA_ELFGEN_SRC) $(LA_EARLY_BOOT_HDR) | $(TARGET)
 	$(HOSTCC) $(HOSTCFLAGS) -I. -o $@ $<
 
+# LoongArch initcode: compile → link at 0 → binary → C header
+$(LA_INITCODE_H): $(LA_INITCODE_C) $(LA_USER_LD) $(BIN2C) | $(TARGET)
+	$(LA_CC) $(LA_USER_CFLAGS) -c -o $(TARGET)/loongarch/initcode_la.o $<
+	$(LA_LD) $(LA_LDFLAGS) -N -e main -T $(LA_USER_LD) -o $(TARGET)/loongarch/initcode_la.out $(TARGET)/loongarch/initcode_la.o
+	$(LA_OBJCOPY) -S -O binary $(TARGET)/loongarch/initcode_la.out $(TARGET)/loongarch/initcode_la
+	$(BIN2C) $(TARGET)/loongarch/initcode_la $@
+
 # LoongArch 源码构建路径（有 loongarch64-linux-gnu-* 工具链时启用）
 $(TARGET)/loongarch/%.o: $(KernelPath)/loongarch/%.S $(LA_SOURCE_HDR) | $(TARGET)
 	$(LA_CC) $(LA_CFLAGS) -c -o $@ $<
@@ -153,7 +167,7 @@ $(ELFKernel): $(KernelOBJ) $(ELFUser)
 
 ifeq ($(LA_BUILD_MODE),source)
 # 生成 LoongArch 源码启动 ELF
-$(ELFKernelLA): $(LA_SOURCE_OBJ) $(LA_KERNEL_LD) | $(TARGET)
+$(ELFKernelLA): $(LA_SOURCE_OBJ) $(LA_KERNEL_LD) $(LA_INITCODE_H) | $(TARGET)
 	$(LA_LD) $(LA_LDFLAGS) -T $(LA_KERNEL_LD) $(LA_SOURCE_OBJ) -o $@
 else ifeq ($(LA_BUILD_MODE),stub)
 # 生成 LoongArch 最小启动 ELF
@@ -197,10 +211,10 @@ run-la: build-la $(DISKIMG)
 
 .PHONY: check-la
 check-la: all
-	timeout $(LA_QEMU_TIMEOUT) $(QEMU_LA) -kernel kernel-la -m 1G -display none -serial file:$(LA_SERIAL_LOG) -smp $(CPUNUM) || test $$? -eq 124
+	timeout $(LA_QEMU_TIMEOUT) $(QEMU_LA) -kernel kernel-la -m 1G -display none -serial file:$(LA_SERIAL_LOG) -smp $(CPUNUM) -drive file=$(DISKIMG),if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0 || test $$? -eq 124
 	@cat $(LA_SERIAL_LOG)
 	@grep -q "loongarch boot start" $(LA_SERIAL_LOG)
-	@grep -q "la_boot_main: arch scaffold active" $(LA_SERIAL_LOG)
+	@grep -q "\[init\] kernel ready" $(LA_SERIAL_LOG)
 	@echo "===== make check-la success! ====="
 
 # 调试目标

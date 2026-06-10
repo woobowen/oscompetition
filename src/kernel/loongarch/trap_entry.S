@@ -1,14 +1,52 @@
 #include "src/kernel/loongarch/trap_layout.h"
 
-# LoongArch general exception entry scaffold.
+# LoongArch general exception entry.
+#
+# Handles both kernel-mode traps (timer interrupts) and user-mode traps
+# (syscalls, faults).  When coming from user mode we must switch to the
+# process's kernel stack; when coming from kernel mode we use the current SP.
 
 .section .text.trap, "ax"
 .align 12
 .globl la_exception_entry
 .type la_exception_entry, @function
 la_exception_entry:
-        addi.d  $sp, $sp, -LA_TF_SIZE
+        # ---- Check if TLB refill exception ----
+        # TLB refill updates TLBRERA/TLBRPRMD but NOT ERA/PRMD/ESTAT.
+        # If ISTLBR is set, copy TLBRPRMD→PRMD so the rest of the
+        # handler can use PRMD.PPLV to distinguish user vs kernel.
+        csrrd   $t0, LA_CSR_TLBRERA
+        andi    $t0, $t0, 1             # ISTLBR bit
+        beqz    $t0, .Lnot_tlb_refill
+        csrrd   $t0, LA_CSR_TLBRPRMD
+        csrwr   $t0, LA_CSR_PRMD
+.Lnot_tlb_refill:
 
+        # ---- Check where we came from ----
+        csrrd   $t0, LA_CSR_PRMD
+        andi    $t0, $t0, 0x3           # PRMD.PPLV
+        beqz    $t0, .Lfrom_kernel      # PLV0 → kernel mode
+
+.Lfrom_user:
+        # Came from user mode (PLV3).
+        # $sp is the user stack pointer — switch to kernel stack.
+        move    $t0, $sp                # t0 = user SP (save temporarily)
+
+        la.pcrel $t1, la_trap_ksp       # load saved kernel SP
+        ld.d    $sp, $t1, 0
+
+        addi.d  $sp, $sp, -LA_TF_SIZE   # allocate trap frame
+        st.d    $t0, $sp, LA_TF_GPR_SP  # save user SP
+        b       .Lsave_regs
+
+.Lfrom_kernel:
+        # Came from kernel mode — SP is already the kernel stack.
+        addi.d  $sp, $sp, -LA_TF_SIZE
+        addi.d  $t0, $sp, LA_TF_SIZE
+        st.d    $t0, $sp, LA_TF_GPR_SP  # save pre-trap SP
+
+.Lsave_regs:
+        # ---- Save all GPRs ----
         st.d    $r1,  $sp, LA_TF_GPR_RA
         st.d    $r2,  $sp, LA_TF_GPR_TP
         st.d    $r4,  $sp, LA_TF_GPR_A0
@@ -39,9 +77,7 @@ la_exception_entry:
         st.d    $r30, $sp, LA_TF_GPR_S7
         st.d    $r31, $sp, LA_TF_GPR_S8
 
-        addi.d  $r12, $sp, LA_TF_SIZE
-        st.d    $r12, $sp, LA_TF_GPR_SP
-
+        # ---- Save CSRs ----
         csrrd   $r12, LA_CSR_ERA
         st.d    $r12, $sp, LA_TF_ERA
         csrrd   $r12, LA_CSR_BADV
@@ -49,12 +85,35 @@ la_exception_entry:
         csrrd   $r12, LA_CSR_ESTAT
         st.d    $r12, $sp, LA_TF_ESTAT
 
+        # ---- Call C handler ----
         move    $a0, $sp
         bl      la_trap_dispatch
 
+        # ---- Restore CSRs ----
         ld.d    $r12, $sp, LA_TF_ERA
         csrwr   $r12, LA_CSR_ERA
 
+        # ---- Check if returning to user mode ----
+        csrrd   $t0, LA_CSR_PRMD
+        andi    $t0, $t0, 0x3           # PRMD.PPLV
+        beqz    $t0, .Lrestore_kernel   # returning to PLV0 → kernel
+
+.Lreturn_user:
+        # Returning to user mode (PLV3).
+        # Hardware will set DA=0 on ertn, so we need the user page table.
+        la.pcrel $t0, la_user_pgd
+        ld.d    $t1, $t0, 0
+        csrwr   $t1, LA_CSR_PGDL       # set page table low
+        csrwr   $zero, LA_CSR_PGDH     # clear page table high
+
+        # Save kernel SP for the next user→kernel trap.
+        # SP currently points to the trap frame; kernel SP is above it.
+        addi.d  $t0, $sp, LA_TF_SIZE
+        la.pcrel $t1, la_trap_ksp
+        st.d    $t0, $t1, 0
+
+.Lrestore_kernel:
+        # ---- Restore all GPRs ----
         ld.d    $r1,  $sp, LA_TF_GPR_RA
         ld.d    $r2,  $sp, LA_TF_GPR_TP
         ld.d    $r4,  $sp, LA_TF_GPR_A0

@@ -1,8 +1,46 @@
-qemu-system-loongarch64 -kernel kernel-la -m 1G -nographic -smp 1 -drive file=sdcard-la.img,if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0 -no-reboot -device virtio-net-pci,netdev=net0 -netdev user,id=net0 -rtc base=utc 
 loongarch boot start
-la_entry: qemu virt early console online
-la_boot_main: arch scaffold active
-la_trap: full trapframe syscall return scaffold staged
-la_userret: era prmd gpr restore scaffold staged
-la_proc: trapframe init userret bridge staged
-la_boot_main: next context switch virtio-pci ext4
+[init] pmem
+  pmem: region 0x0000000000219000 - 0x0000000010000000
+  pmem: 0x000000000000fde7 pages (0x00000000000000fd MB)
+[init] kvm
+  kvm: DMW0 identity-mapped for PLV0
+[init] paging
+  uvm: PWCL=0x0000000013e4d52c (expect 0x0000000053e4d52c)
+[init] tlb
+[init] timer
+  timer: periodic 100 Hz enabled
+[init] proc
+  proc: table initialized
+[init] enabling interrupts
+[init] kernel ready
+[init] virtio
+    pci 0x0000000000000000: vendor=0x0000000000001b36 device=0x0000000000000008
+    pci 0x0000000000000001: vendor=0x0000000000001af4 device=0x0000000000001000
+    pci 0x0000000000000002: vendor=0x0000000000001af4 device=0x0000000000001001
+    initial CMD=0x0000000000100000
+    CMD after write=0x0000000000100007
+    BAR0x0000000000000000 IO sz=0x0000000000000080 pio=0x0000000000004000 rb=0x0000000000004001 cpu=0x0000000018004000
+      io_val=0x0000000079006e54
+    host_features=0x0000000079006e54
+    queue_max=0x0000000000000100
+    vq_pages=0x0000000000212000 pfn=0x0000000000000212
+    status=0x000000000000000f
+  virtio: block device ready
+[init] fs
+  fs: mounting...
+  fs: SeaOS FS mounted! inodes=0x0000000000010000 data=0x000000000000042b+0x0000000000140000
+[init] fs: mounted
+[init] creating first user process
+[initcode] creating first user process
+  proc: created user 'initcode' pid=0x0000000000000001
+[initcode] trap frame at 0x000000000fff7000 era=0x0000000000001000 sp=0x0000007fffffe000
+[initcode] first user process ready
+[init] entering scheduler
+  ub: p=0x000000000020c090
+  ub: tf=0x000000000fff7000
+  proc_return: filled 0x0000000000000002 TLB entries
+  proc_return: switching DA=0 PG=1
+  proc_return: DA=0 PG=1 ok, entering userret
+initcode: started
+initcode: no *_testcode.sh found
+shutdown: system halting
