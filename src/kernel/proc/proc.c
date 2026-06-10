@@ -97,6 +97,83 @@ static proc_t *proczero;
 static int global_pid;
 static spinlock_t pid_lk;
 
+#define SLEEPCHAN_HINT_SLOTS 256
+typedef struct sleepchan_hint {
+    void *chan;
+    uint32 count;
+} sleepchan_hint_t;
+
+static sleepchan_hint_t sleepchan_hints[SLEEPCHAN_HINT_SLOTS];
+static uint32 sleepchan_overflow;
+static spinlock_t sleepchan_lk;
+
+static uint64 sleepchan_hash(void *chan)
+{
+    return (((uint64)chan) >> 4) % SLEEPCHAN_HINT_SLOTS;
+}
+
+static void sleepchan_inc(void *chan)
+{
+    if (chan == NULL)
+        return;
+
+    spinlock_acquire(&sleepchan_lk);
+    uint64 start = sleepchan_hash(chan);
+    for (uint64 off = 0; off < SLEEPCHAN_HINT_SLOTS; off++) {
+        uint64 i = (start + off) % SLEEPCHAN_HINT_SLOTS;
+        if (sleepchan_hints[i].chan == chan || sleepchan_hints[i].chan == NULL) {
+            sleepchan_hints[i].chan = chan;
+            sleepchan_hints[i].count++;
+            spinlock_release(&sleepchan_lk);
+            return;
+        }
+    }
+    sleepchan_overflow++;
+    spinlock_release(&sleepchan_lk);
+}
+
+static void sleepchan_dec(void *chan)
+{
+    if (chan == NULL)
+        return;
+
+    spinlock_acquire(&sleepchan_lk);
+    uint64 start = sleepchan_hash(chan);
+    for (uint64 off = 0; off < SLEEPCHAN_HINT_SLOTS; off++) {
+        uint64 i = (start + off) % SLEEPCHAN_HINT_SLOTS;
+        if (sleepchan_hints[i].chan == chan) {
+            if (sleepchan_hints[i].count > 0)
+                sleepchan_hints[i].count--;
+            if (sleepchan_hints[i].count == 0)
+                sleepchan_hints[i].chan = NULL;
+            spinlock_release(&sleepchan_lk);
+            return;
+        }
+    }
+    if (sleepchan_overflow > 0)
+        sleepchan_overflow--;
+    spinlock_release(&sleepchan_lk);
+}
+
+static int sleepchan_has_waiter(void *chan)
+{
+    if (chan == NULL)
+        return 0;
+
+    spinlock_acquire(&sleepchan_lk);
+    uint64 start = sleepchan_hash(chan);
+    for (uint64 off = 0; off < SLEEPCHAN_HINT_SLOTS; off++) {
+        uint64 i = (start + off) % SLEEPCHAN_HINT_SLOTS;
+        if (sleepchan_hints[i].chan == chan && sleepchan_hints[i].count > 0) {
+            spinlock_release(&sleepchan_lk);
+            return 1;
+        }
+    }
+    int has = sleepchan_overflow > 0;
+    spinlock_release(&sleepchan_lk);
+    return has;
+}
+
 /* 获取一个pid */
 static int alloc_pid()
 {
@@ -137,6 +214,9 @@ void proc_init()
     // 初始化全局 pid 与其锁
     global_pid = 1;
     spinlock_init(&pid_lk, "pid_lock");
+    memset(sleepchan_hints, 0, sizeof(sleepchan_hints));
+    sleepchan_overflow = 0;
+    spinlock_init(&sleepchan_lk, "sleepchan");
 
     // 初始化MLFQ调度器
     mlfq_init();
@@ -839,7 +919,10 @@ void proc_sleep(void *sleep_space, spinlock_t *lock)
     // 应对外设中断处理程序调用proc_sleep的情况
     if (lock != &p->lk) {
         spinlock_acquire(&p->lk);
+        sleepchan_inc(sleep_space);
         spinlock_release(lock);
+    } else {
+        sleepchan_inc(sleep_space);
     }
 
     // 开始睡眠
@@ -858,6 +941,7 @@ void proc_sleep(void *sleep_space, spinlock_t *lock)
 
     // 被唤醒
     // printf("proc %d is wakeup!\n", p->pid);
+    sleepchan_dec(sleep_space);
 
     // 恢复原样
     if (lock != &p->lk) {
@@ -872,6 +956,9 @@ void proc_sleep(void *sleep_space, spinlock_t *lock)
 */
 void proc_wakeup(void *sleep_space)
 {
+    if (!sleepchan_has_waiter(sleep_space))
+        return;
+
     for (int i = 0; i < N_PROC; i++) {
         proc_t *p = &proc_list[i];
         spinlock_acquire(&p->lk);

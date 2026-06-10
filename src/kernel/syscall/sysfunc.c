@@ -67,7 +67,7 @@ uint64 sys_mmap()
     // PROT_READ=1, PROT_WRITE=2, PROT_EXEC=4
     int perm = PTE_U;
     if (prot & 1) perm |= PTE_R;
-    if (prot & 2) perm |= PTE_W;
+    if (prot & 2) perm |= PTE_W | PTE_R;
     if (prot & 4) perm |= PTE_X;
     // 鑻?prot=PROT_NONE(0) 鎴栨湭璁剧疆璇绘潈闄愶紝缁欐渶灏忚鏉冮檺閬垮厤 musl 璁块棶澶撮儴澶辫触
     if (!(perm & (PTE_R | PTE_W | PTE_X)))

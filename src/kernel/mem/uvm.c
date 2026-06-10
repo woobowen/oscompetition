@@ -13,7 +13,8 @@ void uvm_copyin(pgtbl_t pgtbl, uint64 dst, uint64 src, uint32 len)
         pte_t *pte = vm_getpte(pgtbl, src, false);
         if (pte == NULL || !(*pte & PTE_V)) {
             proc_t *p = myproc();
-            if (p != NULL) uvm_ustack_grow(pgtbl, p->ustack_npage, src);
+            if (p != NULL && uvm_mmap_handle_fault(pgtbl, src) == (uint64)-1)
+                uvm_ustack_grow(pgtbl, p->ustack_npage, src);
             pte = vm_getpte(pgtbl, src, false);
             if (pte == NULL || !(*pte & PTE_V)) {
                 printf("uvm_copyin: invalid user address src=%p\n", (void *)src);
@@ -47,7 +48,8 @@ void uvm_copyout(pgtbl_t pgtbl, uint64 dst, uint64 src, uint32 len)
             // 目标用户页未映射: 若落在可增长的栈区则按需增长后重试。
             // uvm_ustack_grow 自带范围保护: dst 不在 (MMAP_END, TRAPFRAME) 时返回 -1, 无副作用。
             proc_t *p = myproc();
-            if (p != NULL) uvm_ustack_grow(pgtbl, p->ustack_npage, dst);
+            if (p != NULL && uvm_mmap_handle_fault(pgtbl, dst) == (uint64)-1)
+                uvm_ustack_grow(pgtbl, p->ustack_npage, dst);
             pte = vm_getpte(pgtbl, dst, false);
             if (pte == NULL || !(*pte & PTE_V)) {
                 printf("uvm_copyout: invalid dst=%p syscall=%d a0=%p a1=%p a2=%p\n",
@@ -103,8 +105,20 @@ void uvm_copyin_str(pgtbl_t pgtbl, uint64 dst, uint64 src, uint32 maxlen)
     }
 }
 
-// Update user leaf PTE permissions for an existing mapped range.
-// Return 0 on success, -1 if any page in the range is not mapped as a leaf.
+static mmap_region_t *uvm_mmap_region_at(proc_t *p, uint64 va)
+{
+    if (p == NULL)
+        return NULL;
+    for (mmap_region_t *m = p->mmap; m != NULL; m = m->next) {
+        uint64 begin = m->begin;
+        uint64 end = begin + (uint64)m->npages * PGSIZE;
+        if (va >= begin && va < end)
+            return m;
+    }
+    return NULL;
+}
+
+// Update user PTE permissions. Lazy mmap pages are allowed before allocation.
 int uvm_mprotect(pgtbl_t pgtbl, uint64 begin, uint64 len, int perm)
 {
     if (len == 0)
@@ -112,16 +126,27 @@ int uvm_mprotect(pgtbl_t pgtbl, uint64 begin, uint64 len, int perm)
     if (begin % PGSIZE != 0 || begin + len < begin || begin + len > VA_MAX)
         return -1;
 
+    proc_t *p = myproc();
     uint64 end = begin + len;
     for (uint64 va = begin; va < end; va += PGSIZE) {
         pte_t *pte = vm_getpte(pgtbl, va, false);
-        if (pte == NULL || !(*pte & PTE_V) || PTE_CHECK(*pte))
+        if (pte != NULL && (*pte & PTE_V) && !PTE_CHECK(*pte))
+            continue;
+        if (uvm_mmap_region_at(p, va) == NULL)
             return -1;
+    }
+
+    for (mmap_region_t *m = p ? p->mmap : NULL; m != NULL; m = m->next) {
+        uint64 m_begin = m->begin;
+        uint64 m_end = m_begin + (uint64)m->npages * PGSIZE;
+        if (m_begin < end && m_end > begin)
+            m->perm = perm;
     }
 
     for (uint64 va = begin; va < end; va += PGSIZE) {
         pte_t *pte = vm_getpte(pgtbl, va, false);
-        *pte = (*pte & ~(PTE_R | PTE_W | PTE_X)) | perm;
+        if (pte != NULL && (*pte & PTE_V) && !PTE_CHECK(*pte))
+            *pte = (*pte & ~(PTE_R | PTE_W | PTE_X)) | perm;
     }
     sfence_vma();
     return 0;
@@ -160,6 +185,7 @@ static void mmap_merge(mmap_region_t *mmap_1, mmap_region_t *mmap_2, bool keep_m
     } else {
         mmap_2->begin -= mmap_1->npages * PGSIZE;
         mmap_2->npages += mmap_1->npages;
+        mmap_2->perm = mmap_1->perm;
         mmap_region_free(mmap_1);
     }
 }
@@ -245,6 +271,7 @@ uint64 uvm_mmap(uint64 begin, uint32 npages, int perm)
     mmap_region_t *node = mmap_region_alloc();
     node->begin = begin;
     node->npages = npages;
+    node->perm = perm;
     node->next = curr; 
 
     // 3. 插入 mmap 链表
@@ -256,28 +283,46 @@ uint64 uvm_mmap(uint64 begin, uint32 npages, int perm)
 
     // 4. 尝试合并
     // 先向后合并：若后继节点紧邻则合并，保留node
-    if (node->next != NULL && node->begin + node->npages * PGSIZE == node->next->begin) {
+    if (node->next != NULL && node->perm == node->next->perm &&
+        node->begin + node->npages * PGSIZE == node->next->begin) {
         mmap_region_t *next_node = node->next; // 暂存即将被合并的节点
         node->next = next_node->next; // 【关键修复】先从链表中摘除 next_node
         mmap_merge(node, next_node, true); // 然后合并并释放 next_node
     }
     // 再向前合并：若前驱节点紧邻则合并，保留前驱节点
-    if (prev != NULL && prev->begin + prev->npages * PGSIZE == node->begin) {
+    if (prev != NULL && prev->perm == node->perm &&
+        prev->begin + prev->npages * PGSIZE == node->begin) {
         prev->next = node->next; // 【关键修复】先从链表中摘除 node
         mmap_merge(prev, node, true); // 然后合并并释放 node
     }
-
-    // 5. 分配并映射物理页
-    for (uint32 i = 0; i < npages; i++) {
-        void *pa = pmem_alloc(false); // 为每一页分配物理页（非内核页）
-        if (!pa) {
-            panic("uvm_mmap: pmem_alloc failed");
-        }
-        memset(pa, 0, PGSIZE); 
-        uint64 va = begin + (uint64)i * PGSIZE;
-        vm_mappages(p->pgtbl, va, (uint64)pa, PGSIZE, perm); // 映射
-    }
     return begin;
+}
+
+uint64 uvm_mmap_handle_fault(pgtbl_t pgtbl, uint64 fault_addr)
+{
+    proc_t *p = myproc();
+    if (p == NULL)
+        return (uint64)-1;
+
+    uint64 va = (fault_addr / PGSIZE) * PGSIZE;
+    for (mmap_region_t *m = p->mmap; m != NULL; m = m->next) {
+        uint64 begin = m->begin;
+        uint64 end = begin + (uint64)m->npages * PGSIZE;
+        if (va < begin || va >= end)
+            continue;
+
+        pte_t *pte = vm_getpte(pgtbl, va, false);
+        if (pte != NULL && (*pte & PTE_V))
+            return (uint64)-1;
+
+        void *pa = pmem_alloc(false);
+        if (pa == NULL)
+            return (uint64)-1;
+        memset(pa, 0, PGSIZE);
+        vm_mappages(pgtbl, va, (uint64)pa, PGSIZE, m->perm);
+        return va;
+    }
+    return (uint64)-1;
 }
 
 // 在用户页表和进程mmap链里释放mmap区域 [begin, begin + npages * PGSIZE)
@@ -304,7 +349,9 @@ void uvm_munmap(uint64 begin, uint32 npages)
             // 1. 解除交集区间的映射
             for (uint32 i = 0; i < o_npages; i++) {
                 uint64 va = o_begin + (uint64)i * PGSIZE;
-                vm_unmappages(p->pgtbl, va, PGSIZE, true);
+                pte_t *pte = vm_getpte(p->pgtbl, va, false);
+                if (pte != NULL && (*pte & PTE_V) && !PTE_CHECK(*pte))
+                    vm_unmappages(p->pgtbl, va, PGSIZE, true);
             }
 
             // 2. 根据交集在curr中的位置，处理 curr 节点
@@ -592,7 +639,7 @@ int uvm_copy_pgtbl(pgtbl_t old, pgtbl_t new, uint64 heap_top, uint64 ustack_npag
         uint64 begin = m->begin;
         uint64 end = m->begin + (uint64)m->npages * PGSIZE;
         if (end > begin) {
-            if (copy_range(old, new, begin, end) < 0)
+            if (copy_range_sparse(old, new, begin, end) < 0)
                 return -1;
         }
         m = m->next;

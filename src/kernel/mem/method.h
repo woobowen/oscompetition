@@ -24,6 +24,7 @@ void uvm_copyin_str(pgtbl_t pgtbl, uint64 dst, uint64 src, uint32 maxlen);
 void uvm_show_mmaplist(mmap_region_t *mmap);
 uint64 uvm_mmap(uint64 begin, uint32 npages, int perm);
 void uvm_munmap(uint64 begin, uint32 npages);
+uint64 uvm_mmap_handle_fault(pgtbl_t pgtbl, uint64 fault_addr);
 int uvm_mprotect(pgtbl_t pgtbl, uint64 begin, uint64 len, int perm);
 uint64 uvm_heap_grow(pgtbl_t pgtbl, uint64 cur_heap_top, uint32 len, int flag);
 uint64 uvm_heap_ungrow(pgtbl_t pgtbl, uint64 cur_heap_top, uint32 len);

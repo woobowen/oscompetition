@@ -502,4 +502,3 @@ typedef struct device {
 } device_t;
 
 #define N_DEVICE 16     // device_table中device的数量
-

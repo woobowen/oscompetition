@@ -69,7 +69,9 @@ void trap_user_handler()
             case 15:
             {
                 uint64 fault_addr = r_stval();
-                uint64 res = uvm_ustack_grow(p->pgtbl, p->ustack_npage, fault_addr);
+                uint64 res = uvm_mmap_handle_fault(p->pgtbl, fault_addr);
+                if (res == (uint64)-1)
+                    res = uvm_ustack_grow(p->pgtbl, p->ustack_npage, fault_addr);
                 if (res == (uint64)-1) {
                     if (!p->sig_delivering && p->sig_handler[SIGSEGV] > 1) {
                         p->sig_pending |= (1UL << (SIGSEGV - 1));
