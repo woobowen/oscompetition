@@ -516,10 +516,10 @@ docker exec nostalgic_khayyam bash -c "cd /workspace && make check-la"
 ```
 ✅ Step 10 (修EXT4 bug) → ✅ Step 11 (脚本执行) → ⬜ Step 12 (定时器抢占)
   → ⬜ Step 13 (动态链接) → ⬜ Step 14 (管道) → ⬜ Step 15 (文件写入)
-  → ⬜ Step 16 (补全syscall) → ⬜ Step 17 (栈增长) → ⬜ Step 18 (堆增强)
+  → ⬜ Step 16 (补全syscall) → ✅ Step 17 (栈增长+不挂死) → ⬜ Step 18 (堆增强)
   → ⬜ Step 19 (资源回收) → ⬜ Step 20 (块缓存) → ⬜ Step 21 (集成验证)
 ```
-> Step 10、Step 11 已完成。**当前最短解阻塞路径：Step 17（栈自动增长）+ Step 16（socket syscall）**，二者是 libc-bench 这类重栈/用网络的程序跑通的必要条件。
+> Step 10、11、17 已完成。**当前最短解阻塞路径：Step 19（资源回收：exec/exit 释放页表）**——Step 17 解挂后实测 libcbench-musl 能完整跑通，但跑完后物理内存耗尽（页表从不释放）→ 后续 12 个测试全部 `initcode: fork fail!`。修 Step 19 即可让全量测试逐个跑起来；Step 16（socket 族）与 Step 14（管道）是各测试自身功能跑通的条件。
 
 ---
 
@@ -674,17 +674,39 @@ docker exec nostalgic_khayyam bash -c "cd /workspace && make check-la"
 
 ---
 
-### Step 17：栈自动增长（🟡 P1）
+### Step 17：栈自动增长 + 用户态异常不再挂死（🟡 P1）— ✅ 已完成（2026-06-12）
 
-**问题**：复杂程序（busybox、unixbench）可能需要超过 1 页（4KB）的栈空间。
+**两个目标**（实测 `sdcard-la.img` 全量跑，`/tmp/la-step17c.log`）：
+1. **栈自动增长**：libc-bench 需 ~80KB 栈，exec 只预分配 8 页（32KB）→ 原 `trap: TLB refill FAIL badv=0x7ffffea5f8` 挂死。现按需向下扩栈。
+2. **用户态异常不再挂死**：原 trap.c 两处 `for(;;){}`（ISTLBR 重填失败 ~L333、通用异常 ~L424）会让**第一个崩溃的测试就挂死内核、后续 15 个全 0 分**。现改为只终结出错进程、内核继续。
 
 **实现内容**：
-1. 在 trap_dispatch 中检测用户态页错误（TLB refill 失败时，检查 fault VA 是否在栈区域）
-2. 如果 VA 在 `[stack_base - 扩展上限, stack_top)` 范围内，分配新页并映射
-3. 最大栈限制：如 16 页（64KB）
-4. 在 `proc.h` 的 `la_proc` 中添加 `stack_bottom` 字段
+1. **`proc.h`**：`struct la_proc` 加 `uint64_t stack_bottom`（已映射用户栈最低 VA）；`#define LA_MAX_STACK_PAGES 512`（2MB 上限）；`la_proc_exit(int code)` noreturn 原型。
+2. **`early_boot.h`**：`int la_uvm_grow_stack(uint64_t *root, uint64_t fault_addr)` 原型。
+3. **`uvm_la.c::la_uvm_grow_stack`**：fault_page 落在 `[LA_USER_STACK - 512*PGSIZE, stack_bottom)` 时，映射 `[fault_page, stack_bottom)` 全部缺失页（`LA_PTE_U_RWX`，pmem 已清零），更新 `stack_bottom = fault_page`；否则返回 -1（非栈区缺页/超上限）。
+4. **`trap.c` ISTLBR 失败分支**：先试 `la_uvm_grow_stack` + `la_tlb_refill_one`（成功则 `return`，**保持 ISTLBR 置位**让 ertn 重执行缺页指令）；仍失败且当前是用户进程 → `la_proc_exit(-11)`（segv）；内核态缺页才 `for(;;)` panic。**诊断 dump 块保留**（只在真正 segv 时打印）。
+5. **`trap.c` 通用异常分支**：用户进程 → `la_proc_exit(-11)`；内核态 → `for(;;)` panic。
+6. **`proc.c::la_proc_exit`**：清 ISTLBR 位（`TLBRERA & ~1`）→ 设 ZOMBIE + exit_code → 唤醒父进程 → `la_sched_switch`。**清 ISTLBR 是最关键正确性点**：trap_entry.S 对每个 trap 无条件读 `TLBRERA&1` 判 ISTLBR，若 kill 路径 swtch 走而不清，残留 ISTLBR 会让下一个进程的 trap 被误判为 TLB 重填、级联崩。`la_proc_alloc`/`create_user` 置零 `stack_bottom`。
+7. **`syscall.c`**：`sys_exit`/`exit_group` 复用 `la_proc_exit`（exit 开头加 `if (!me||!me->is_user)` panic 守卫）；`sys_fork` 复制 `child->stack_bottom = parent->stack_bottom`。
+8. **`exec_la.c`**：8 页栈循环后设 `p->stack_bottom = stack_top - 8*PGSIZE + PGSIZE`。
 
-**涉及文件**：`src/kernel/loongarch/trap.c`、`uvm_la.c`、`proc.h`
+**本轮关键修复（踩坑）**：
+- **`stack_bottom` off-by-one（首版踩中）**：初版按 plan 字面写 `stack_top - 8*PGSIZE`，比**实际**最低映射页（循环映射 si=0..7，最低 = `stack_top-7*PGSIZE`）低一页，在预映射区正下方留一个**永久空洞**（0x7FFFFF6000），`grow_stack` 因 `fault_page >= stack_bottom` 拒绝填充 → 子进程一过 7 页栈就 `ecode=2`(PIS) 被杀（首跑 `/tmp/la-step17.log` 现象）。修为 `stack_top - 8*PGSIZE + PGSIZE` 后空洞消失，libc-bench 4 次连续扩栈到 ~80KB、**零崩溃**。
+- **扩栈成功路径绝不清 ISTLBR**：必须留给 ertn 重启用分页；只有 kill 路径（`la_proc_exit`）清。
+
+**涉及文件**：`src/kernel/loongarch/{proc.h,early_boot.h,proc.c,syscall.c,trap.c,uvm_la.c,exec_la.c}`（全 LA 专有，不碰 RV）。
+
+**验证（实测 `/tmp/la-step17c.log`）**：
+- `badv=0x7ffffea5f8` 原「TLB refill FAIL + 挂死」消失 → 栈自动扩到 ~80KB，libc-bench 跑通无栈缺页。
+- 全程 **0 个 `kill user proc`、0 个 `ecode=`、0 个 TLB refill FAIL 挂死**；libcbench-musl 完整跑完后 initcode 继续进入 `/glibc/` 组（cyclictest/netperf/lmbench…）。
+- kill 路径在首版（修 off-by-one 前）已验证：socket NULL 解引用触发 `trap: kill user proc (segv) badv=0x28`，内核不挂、后续 trap 按 ecode 正确路由（ISTLBR 已清）。
+- `make build-la` 输出 `(source)`、`-Wall -Werror` 零 warning。
+
+**遗留（属后续 Step，非 Step 17 范围）**：
+- **`proc: no memory for user stack` → `initcode: fork fail!`**（libcbench-musl 跑完后、约日志 L62673 起，后续 12 个测试全部 fork 失败）：exec/exit 从不释放用户页表（`proc.c:82` `TODO: free user page table`），fork 又 `la_uvm_copy_pgtbl` 深拷贝每页 → 物理内存耗尽。属 **Step 19 资源回收**（修前内核在首次栈缺页就挂死，从未跑到耗尽；本 Step 解挂后才暴露）。
+- libc-bench 调 `UNKNOWN #0x42/0x71/0xa9`（socket 族）→ **Step 16**。
+
+---
 
 ---
 

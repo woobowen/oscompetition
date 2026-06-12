@@ -619,6 +619,16 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
             p[z] = 0;
     }
 
+    /* Record the lowest MAPPED stack page.  The loop above mapped si=0..7,
+     * i.e. pages [stack_top - 7*PGSIZE, stack_top]; the lowest mapped page
+     * is therefore stack_top - 7*PGSIZE.  grow_stack maps [fault_page,
+     * stack_bottom) and treats fault_page >= stack_bottom as "not a stack
+     * miss", so stack_bottom MUST equal this lowest mapped page — setting it
+     * one page lower (stack_top - 8*PGSIZE) would leave a permanent 1-page
+     * unmapped gap just below the pre-mapped region that growth can never
+     * fill, killing any process whose stack pointer crosses it. */
+    p->stack_bottom = stack_top - 8ULL * LA_PGSIZE + LA_PGSIZE;
+
     /* Initialize heap_top to the end of the highest LOAD segment, page-aligned.
      * brk(0) returns this so busybox knows where heap starts. */
     if (max_vaddr > 0) {

@@ -161,6 +161,48 @@ uint64_t la_uvm_alloc_page(uint64_t *root, uint64_t va, uint64_t perm)
     return (uint64_t)pa;
 }
 
+/* ---- Grow the current proc's user stack down to cover fault_addr ----
+ *
+ * exec pre-maps only 8 stack pages; real programs (libc-bench ~80 KB) need
+ * more.  When a TLB refill / page fault lands in the unmapped stack region,
+ * the trap handler calls this to extend the stack on demand.
+ *
+ *   fault_addr  – the address that faulted (any value in the missing page)
+ *
+ * Returns 0 and maps every page in [fault_page, stack_bottom) if fault_page
+ * is within the legal stack window; returns -1 (no change) if the fault is
+ * NOT a stack-region miss (caller then treats it as a fatal segv).  The
+ * pages are zeroed by la_pmem_alloc, matching Linux stack semantics. */
+int la_uvm_grow_stack(uint64_t *root, uint64_t fault_addr)
+{
+    struct la_proc *p = la_current_proc();
+    if (!p || !root || p->stack_bottom == 0)
+        return -1;
+
+    uint64_t fault_page = fault_addr & ~((uint64_t)LA_PGSIZE - 1);
+    uint64_t hard_floor = LA_USER_STACK
+                        - (uint64_t)LA_MAX_STACK_PAGES * LA_PGSIZE;
+
+    if (fault_page >= p->stack_bottom)   /* already mapped / not stack area */
+        return -1;
+    if (fault_page < hard_floor)          /* exceeded the growth cap */
+        return -1;
+
+    /* Map every page from the faulting one up to the current bottom.
+     * Skip any that are already present (e.g. a mid-region page touched
+     * out of order) so we never clobber an existing mapping. */
+    for (uint64_t va = fault_page; va < p->stack_bottom; va += LA_PGSIZE) {
+        uint64_t *pte = la_uvm_walk(root, va, 0);
+        if (pte && (*pte & LA_PTE_V))
+            continue;
+        if (la_uvm_alloc_page(root, va, LA_PTE_U_RWX) == 0)
+            return -1;   /* OOM: leave what we mapped; report failure */
+    }
+
+    p->stack_bottom = fault_page;
+    return 0;
+}
+
 /* ---- Copy data into user virtual address space ---- */
 void la_uvm_copy_in(uint64_t *root, uint64_t va, const void *src, uint32_t len)
 {

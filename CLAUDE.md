@@ -9,10 +9,11 @@
 
 - **项目**：SeaOS — 华东师大花狮小队，oscomp 2026「OS 内核实现赛道」初赛。xv6 风格内核，目标跑通 `/musl`、`/glibc` 下的 oscomp 测试脚本。
 - **两条线**：**A 线 = RISC-V**（`src/kernel/`，成熟，101+ syscall、动态链接、pipe、memfs 齐备，是事实参考实现）；**B 线 = LoongArch**（`src/kernel/loongarch/`，移植中，**本文档对象**）。LoongArch 与 RISC-V 共用同一套 Linux「通用 ABI」syscall 号表。
-- **当前状态（2026-06-12）**：**Step 11（脚本执行 / shebang）已完成并实测通过**——busybox 能 `sh` 解释执行 `*_testcode.sh`，echo 子命令打印评测标记、wait4 回收、相对路径 `exec ./libc-bench` 成功。§6 的 mallocng 崩溃（TLB 一致性）已修。**下一阻塞点**：libc-bench 需 ~80KB 用户栈但内核只预分配 32KB → Step 17 栈自动增长；libc-bench 调 socket 族 syscall（`UNKNOWN #0x42/0x71/0xa9`）→ Step 16。详见 §6。
+- **当前状态（2026-06-12）**：**Step 11（脚本执行）+ Step 17（栈自动增长 & 用户态异常不再挂死）已完成并实测通过**——libc-bench 按需扩栈到 ~80KB、`badv=0x7ffffea5f8` 不再挂死；任何用户态崩溃只终结该进程（父 wait4 回收、内核继续），libcbench-musl 完整跑通后 initcode 继续进入 `/glibc/` 组。**下一阻塞点**：exec/exit 从不释放用户页表 → 跑几个测试后物理内存耗尽 → `initcode: fork fail!`（**Step 19 资源回收**）；libc-bench 调 socket 族 syscall（`UNKNOWN #0x42/0x71/0xa9`）→ Step 16。详见 §6。
 - **常用命令（必须在 Docker 容器内执行，见 §3）**：
-  - 构建：`docker exec nostalgic_khayyam bash -lc 'cd /coursegrader/submit && make build-la'`（或 `make all`）
-  - 用真实测试镜像跑：`docker exec nostalgic_khayyam bash -lc 'cd /coursegrader/submit && /opt/qemu-bin-10.0.2/bin/qemu-system-loongarch64 -kernel kernel-la -m 1G -nographic -smp 1 -drive file=sdcard-la.img,if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0 -no-reboot'`
+  - 构建：`docker exec nostalgic_khayyam bash -lc 'cd /workspace && make build-la'`（或 `make all`）
+  - 用真实测试镜像跑：`docker exec nostalgic_khayyam bash -lc 'cd /workspace && /opt/qemu-bin-10.0.2/bin/qemu-system-loongarch64 -kernel kernel-la -m 1G -nographic -smp 1 -drive file=sdcard-la.img,if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0 -no-reboot'`
+  - ⚠️ 容器 `nostalgic_khayyam` 的仓库挂载点是 **`/workspace`**（实测），非 `/coursegrader/submit`（那是官方评测容器的路径）。
 
 ---
 
@@ -51,6 +52,7 @@
 - `src/kernel/`（A 线 RV）：成熟蓝本，syscall 实现可逐个对照移植。
 - `docs/SYSCALL_STATUS.md`：syscall 号权威台账（号 = Linux 通用 ABI，LA 与 RV 共用）。
 - `docs/DECISIONS.md`：不可轻易反悔的设计决策（errno 策略、动态链接 D4、mmap 约定等）。
+- `docs/LOONGARCH-ARCHITECTURE.md`：**LA 内核架构（小白向）总览**——按真实源码逐子系统图解（硬件背景 / 启动 / 内存 / 进程调度 / trap·中断·syscall / exec / fs / virtio / initcode），含"一次测试脚本执行的完整旅程"全链路串联与 10 条"踩过的坑"精华。新人入门 LA 线先读此篇。
 - `AGENTS.md`：全项目规则/约定（编码、构建、评测复现、硬约束）。**本文件与 AGENTS.md 互补，不重复其规则**。
 - `autotest-for-oskernel/`：oscomp 官方评测脚本与判分逻辑（见 §4）。
 - `data/`：评测用的压缩镜像（`sdcard-la.img.gz`、`sdcard-rv.img.gz`）——**只读，禁止改动**。
@@ -212,6 +214,7 @@ sudo docker run --rm \
 - brk/mmap 地址分离；ext4 挂载/路径解析/读文件/目录枚举可用。
 - `initcode` 能在 ext4 找到 `/musl/libcbench_testcode.sh`，exec 成功加载 `/musl/busybox sh /musl/libcbench_testcode.sh`。
 - **Step 11（脚本执行）已通**（实测 `/tmp/la-step11b.log`）：busybox `sh` 解释执行脚本，`./busybox echo "#### OS COMP TEST GROUP START libcbench-musl ####"` 打印到串口、子进程 exit=0 被 wait4 回收；继续 `exec ./libc-bench`（相对路径解析成功）加载运行并向 stdout 写。
+- **Step 17（栈自动增长 + 用户态异常不再挂死）已通**（实测 `/tmp/la-step17c.log`）：① 用户栈按需向下扩栈（`la_uvm_grow_stack`，上限 `LA_MAX_STACK_PAGES=512` 页/2MB），`badv=0x7ffffea5f8`（libc-bench ~80KB 栈）不再挂死、连续扩栈成功；② trap.c 两处 `for(;;){}` 改为终结出错用户进程（`la_proc_exit(-11)`，内部清 ISTLBR）+ 内核态才 panic——单个测试崩溃不再拖死后续 15 个；③ `sys_exit`/`exit_group` 复用 `la_proc_exit`，fork 复制 `stack_bottom`。实测 libcbench-musl 完整跑通、**0 崩溃 0 挂死**，initcode 继续进入 `/glibc/` 组。
 
 ### 已解决：busybox 启动崩溃（mallocng 一致性检查）—— Step 11 期间定位并修复
 
@@ -222,12 +225,14 @@ sudo docker run --rm \
 
 ### 当前阻塞点（属后续 Step）
 
-1. **用户栈自动增长（Step 17）**：libc-bench 需 ~80KB 栈，内核 exec 只预分配 8 页（32KB）→ `trap: TLB refill FAIL badv=0x7ffffea5f8`（栈区缺页）。trap.c 当前 TLB refill 失败即 `for(;;){}` 挂死，导致一个重栈程序崩溃后内核停摆、后续测试无法进行。
+1. **进程资源回收（Step 19，P0 新阻塞点）**：exec/exit 从不释放用户页表（`proc.c:82` `TODO: free user page table`），而 fork 的 `la_uvm_copy_pgtbl` 又深拷贝每页 → 跑几个测试后物理内存耗尽 → `proc: no memory for user stack` → `initcode: fork fail!`。实测 libcbench-musl 跑完后（约日志 L62673 起）后续 12 个测试全部 fork 失败。**Step 17 解挂后才暴露**（修前内核在首次栈缺页就挂死，从未跑到耗尽）。
 2. **socket 族 syscall（Step 16）**：libc-bench 调 `connect(0x42)` 等 → `syscall: UNKNOWN #N`。需按号补实现或返回合理 errno。
+3. **定时器抢占（Step 12）**：`la_timer_interrupt()` 仍只计数不调度，长任务独占 CPU（目前单测试串行尚可，多测试时有风险）。
 
 ### 旁注
 
 - 近期一次全量跑显示 16/16 测试 `initcode: exec fail!`，与本线单进程 exec 已通的结论**有出入**——疑为那次跑用了 `disk.img`（SeaFS）而非 `sdcard-la.img`，或镜像未挂载。回归前先确认启动命令挂的是 `sdcard-la.img`。
+- ⚠️ 容器 `nostalgic_khayyam` 仓库挂载点是 **`/workspace`**（实测，§0/§3 命令已据此修正），非 `/coursegrader/submit`。
 
 ---
 
@@ -238,10 +243,10 @@ sudo docker run --rm \
 ```
 ✅ Step 10 (修EXT4 bug) → ✅ Step 11 (脚本执行) → ⬜ Step 12 (定时器抢占)
   → ⬜ Step 13 (动态链接) → ⬜ Step 14 (管道) → ⬜ Step 15 (文件写入)
-  → ⬜ Step 16 (补全syscall) → ⬜ Step 17 (栈增长) → ⬜ Step 18 (堆增强)
+  → ⬜ Step 16 (补全syscall) → ✅ Step 17 (栈增长+不挂死) → ⬜ Step 18 (堆增强)
   → ⬜ Step 19 (资源回收) → ⬜ Step 20 (块缓存) → ⬜ Step 21 (集成验证)
 ```
-> **Step 10、Step 11 已完成并实测通过**（详见 §6 + `la-current.md`）。**当前最短解阻塞路径 = Step 17（栈自动增长）+ Step 16（socket 族 syscall）**，二者是 libc-bench 这类重栈/用网络的程序跑通的必要条件；Step 12（定时器抢占）可防止单进程长跑独占 CPU。
+> **Step 10、11、17 已完成并实测通过**（详见 §6 + `la-current.md`）。**当前最短解阻塞路径 = Step 19（资源回收）**——Step 17 解挂后 libcbench-musl 能完整跑通，但 exec/exit 从不释放页表 → 跑几个测试后内存耗尽、后续全部 `fork fail!`；修 Step 19 即可让全量测试逐个跑起来。
 
 ### 各步详情
 
@@ -274,8 +279,10 @@ sudo docker run --rm \
 #### Step 16：补全关键 syscall（🟡 P1）
 对照 `docs/SYSCALL_STATUS.md`，按 `syscall: UNKNOWN #N` 日志逐个补：`gettimeofday(78) clock_gettime(113) times(100) clone(2/220) ioctl(29已有桩) fcntl(25已有) uname(160已有) …`。涉及 `syscall.c`。
 
-#### Step 17：栈自动增长（🟡 P1）
-- trap 检测栈区页错误，在 `[stack_bottom, stack_top)` 内按需分配页（上限如 16 页=64KB）。`proc.h` 加 `stack_bottom`。涉及 `trap.c uvm_la.c proc.h`。
+#### Step 17：栈自动增长 + 用户态异常不挂死（🟡 P1）— ✅ 已完成
+- `la_uvm_grow_stack`（uvm_la.c）：fault VA 落在 `[LA_USER_STACK-512*PGSIZE, stack_bottom)` 时映射 `[fault_page, stack_bottom)` 全部缺失页，更新 `stack_bottom`。trap.c ISTLBR 失败先试扩栈+重填（成功 return，保持 ISTLBR 给 ertn），失败且为用户进程则 `la_proc_exit(-11)`；通用异常同样 kill 用户进程。
+- `la_proc_exit`（proc.c）：清 ISTLBR（**最关键**，防 swtch 走后下一个 trap 被误判为 TLB 重填）+ ZOMBIE + 唤醒父 + `la_sched_switch`。`sys_exit`/`exit_group` 复用之；fork 复制 `stack_bottom`；exec 设 `stack_bottom = stack_top - 8*PGSIZE + PGSIZE`（=最低映射页，**勿 off-by-one**，否则预映射区下方留永久空洞）。
+- 涉及 `proc.h early_boot.h proc.c syscall.c trap.c uvm_la.c exec_la.c`。验证：libcbench-musl 完整跑通、0 崩溃 0 挂死，initcode 继续进 `/glibc/` 组（`/tmp/la-step17c.log`）。
 
 #### Step 18：堆/mmap 增强（🟢 P2）
 - mmap 支持 `MAP_ANONYMOUS/MAP_FIXED`；fork 正确复制/共享 mmap。涉及 `syscall.c uvm_la.c`。
@@ -299,10 +306,10 @@ sudo docker run --rm \
 | 13 | 动态链接器 | 🟡 P1 | 大（可延后） | Step 11 | ⬜ 待做 |
 | 14 | 管道实现 | 🔴 P0 | 中 | Step 11 | ⬜ 待做 |
 | 15 | 文件系统写入 | 🔴 P0 | 大 | Step 10 | ⬜ 待做 |
-| 16 | 补全关键 syscall | 🟡 P1 | 中 | Step 14,15 | ⬜ 待做（当前阻塞点） |
-| 17 | 栈自动增长 | 🟡 P1 | 小 | 无 | ⬜ 待做（当前阻塞点） |
+| 16 | 补全关键 syscall | 🟡 P1 | 中 | Step 14,15 | ⬜ 待做 |
+| 17 | 栈增长+不挂死 | 🟡 P1 | 中 | 无 | ✅ 已完成 |
 | 18 | 堆/mmap 增强 | 🟢 P2 | 中 | 无 | ⬜ 待做 |
-| 19 | 资源回收 | 🟡 P1 | 中 | 无 | ⬜ 待做 |
+| 19 | 资源回收 | 🔴 P0 | 中 | 无 | ⬜ 待做（**当前阻塞点**） |
 | 20 | 缓冲区缓存 | 🟢 P2 | 中 | 无 | ⬜ 待做 |
 | 21 | 集成验证 | 🔴 P0 | 视情况 | 全部 | ⬜ 待做 |
 

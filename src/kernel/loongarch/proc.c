@@ -44,6 +44,7 @@ static struct la_proc *la_proc_alloc(void)
         p->tf     = 0;
         p->pgtbl  = 0;
         p->heap_top = 0;
+        p->stack_bottom = 0;
         p->is_user  = 0;
         p->parent_pid = 0;
         p->exit_code  = 0;
@@ -202,6 +203,7 @@ struct la_proc *la_proc_create_user(const char *name)
     p->tf       = 0;
     p->pgtbl    = 0;
     p->heap_top = 0;
+    p->stack_bottom = 0;
 
     /*
      * Set up context so swtch jumps to la_proc_user_bootstrap on first run.
@@ -252,6 +254,43 @@ void la_proc_yield(void)
 void la_sched_switch(struct la_context *old_ctx)
 {
     la_swtch(old_ctx, &la_cpu.scheduler_ctx);
+}
+
+/* ---- terminate the current user process (never returns) ----
+ *
+ * Used by sys_exit / sys_exit_group AND by trap handlers that must kill a
+ * user process on an unrecoverable fault (stack-overflow segv, ADEF, etc.).
+ * Two things make this safe to call from inside the ISTLBR (TLB-refill)
+ * trap path:
+ *
+ *   1. Clear the ISTLBR bit (bit 0 of TLBRERA).  trap_entry.S routes EVERY
+ *      trap through a TLBRERA&1 check; if ISTLBR stays set after we swtch
+ *      away (ertn is the only thing that clears it in hardware, and we are
+ *      NOT returning via ertn here), the NEXT process to trap is misrouted
+ *      down the TLB-refill path and the system cascades into failure.  On
+ *      the general-exception path ISTLBR is already 0, so this is a no-op.
+ *
+ *   2. Switch to the scheduler via la_sched_switch (never returns).  The
+ *      scheduler will reap this zombie once its parent waits (or immediately
+ *      if it has no living parent). */
+void __attribute__((noreturn)) la_proc_exit(int code)
+{
+    struct la_proc *me = la_current_proc();
+    /* Callers (sys_exit guards on is_user; trap guards on is_user) must
+     * ensure me != NULL && me->is_user.  If we ever get here without a
+     * current user process, that is a kernel bug — halt. */
+    if (!me || !me->is_user) {
+        la_uart_puts("la_proc_exit: no current user proc — HALT\n");
+        for (;;) {}
+    }
+
+    la_csr_write(la_csr_read(LA_CSR_TLBRERA) & ~1ULL, LA_CSR_TLBRERA);  /* clear ISTLBR */
+    me->exit_code = (int)(unsigned)code;
+    me->state     = LA_PROC_ZOMBIE;
+    if (me->parent_pid > 0)
+        la_proc_wakeup_pid(me->parent_pid);
+    la_sched_switch(&me->ctx);   /* does not return */
+    for (;;) {}
 }
 
 /* ---- sleep: mark current proc SLEEPING, switch to scheduler ---- */

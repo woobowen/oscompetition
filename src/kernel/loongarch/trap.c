@@ -103,6 +103,23 @@ void la_trap_dispatch(struct la_trap_frame *tf)
                 return;
             }
 
+            /* Refill found no mapping.  Before declaring a fatal fault,
+             * try to grow the user stack down to the faulting address:
+             * exec pre-maps only 8 stack pages, and deep-stack programs
+             * (libc-bench ~80 KB) legitimately fault below that.  On
+             * success we refill the TLB for badv and return with ISTLBR
+             * STILL set, so ertn re-runs the faulting instruction over
+             * the now-present mapping (we must NOT clear ISTLBR here). */
+            {
+                struct la_proc *p = la_current_proc();
+                if (p && p->is_user && p->pgtbl &&
+                    la_uvm_grow_stack(p->pgtbl, badv) == 0 &&
+                    la_tlb_refill_one(badv) == 0) {
+                    la_tlb_refill_count++;
+                    return;
+                }
+            }
+
             /* TLB refill failed — no mapping for this VA */
             {
                 uint64_t tlbrero = la_csr_read(LA_CSR_TLBRERA);
@@ -330,6 +347,23 @@ void la_trap_dispatch(struct la_trap_frame *tf)
                     }
                 }
             }
+            /* Refill genuinely failed (no mapping AND not a growable stack
+             * miss).  A user process segfaulted: terminate just that
+             * process so the kernel survives and the parent's wait4
+             * collects the status.  la_proc_exit clears ISTLBR — critical,
+             * because we arrived on the ISTLBR path and switch away WITHOUT
+             * ertn (ertn is the only hardware clearer).  Only if there is no
+             * current user process (kernel-mode fault) do we truly halt. */
+            {
+                struct la_proc *p = la_current_proc();
+                if (p && p->is_user) {
+                    la_uart_puts("trap: kill user proc (segv) badv=");
+                    la_uart_put_hex(badv);
+                    la_uart_puts("\n");
+                    la_proc_exit(-11);   /* noreturn */
+                }
+            }
+            la_uart_puts("trap: TLB refill FAIL in kernel — HALT\n");
             for (;;) {}
         }
     }
@@ -421,6 +455,15 @@ void la_trap_dispatch(struct la_trap_frame *tf)
         la_uart_puts("\n");
     }
 
-    for (;;) {
+    /* Unrecoverable exception.  If the victim is a user process, kill just
+     * that process (la_proc_exit clears ISTLBR — a harmless no-op here, since
+     * we are on the general-exception path where ISTLBR == 0).  Otherwise this
+     * is a kernel-mode fault and we truly halt. */
+    if (p && p->is_user) {
+        la_uart_puts("trap: kill user proc (fault) era=");
+        la_uart_put_hex(tf->era);
+        la_uart_puts("\n");
+        la_proc_exit(-11);   /* noreturn */
     }
+    for (;;) {}
 }

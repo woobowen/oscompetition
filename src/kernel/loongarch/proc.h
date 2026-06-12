@@ -7,6 +7,10 @@
 #define LA_NPROC        16
 #define LA_KSTACK_SIZE  4096   /* one page per kernel stack */
 
+/* Maximum user-stack size (pages).  exec pre-maps 8 pages; deeper stacks
+ * (libc-bench needs ~80 KB ≈ 20 pages) are grown on demand up to this cap. */
+#define LA_MAX_STACK_PAGES 512
+
 /* ---- Process states ---- */
 enum la_proc_state {
     LA_PROC_UNUSED = 0,
@@ -61,6 +65,8 @@ struct la_proc {
     uint64_t *pgtbl;           /* user page table root */
     uint64_t heap_top;         /* user heap top (brk grows up from here) */
     uint64_t mmap_top;         /* mmap region (grows up, separate from heap) */
+    uint64_t stack_bottom;     /* lowest mapped user-stack VA (grows down
+                                * from LA_USER_STACK; 0 = not a user proc) */
     int is_user;               /* 1 = user process, 0 = kernel thread */
 
     /* Process relationships */
@@ -88,6 +94,11 @@ void la_proc_init(void);
 void la_scheduler(void) __attribute__((noreturn));
 void la_proc_yield(void);
 void la_sched_switch(struct la_context *old_ctx);
+
+/* Terminate the current user process with `code` and switch to the
+ * scheduler.  Clears ISTLBR so a TLB-refill path that swtches away does
+ * not leave the bit set for the next process's trap.  Never returns. */
+void la_proc_exit(int code) __attribute__((noreturn));
 struct la_proc *la_proc_create_kthread(void (*entry)(void), const char *name);
 struct la_proc *la_proc_create_user(const char *name);
 struct la_proc *la_current_proc(void);

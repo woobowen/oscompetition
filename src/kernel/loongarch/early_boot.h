@@ -96,6 +96,10 @@ int     la_fs_is_sea(void);
 uint64_t *la_uvm_create(void);
 int      la_uvm_map_page(uint64_t *root, uint64_t va, uint64_t pa, uint64_t perm);
 uint64_t la_uvm_alloc_page(uint64_t *root, uint64_t va, uint64_t perm);
+/* Grow the current proc's user stack down to cover fault_addr.
+ * Returns 0 on success (pages now mapped), -1 if fault_addr is outside the
+ * allowed stack region [LA_USER_STACK - LA_MAX_STACK_PAGES*PGSIZE, stack_bottom). */
+int      la_uvm_grow_stack(uint64_t *root, uint64_t fault_addr);
 void     la_uvm_copy_in(uint64_t *root, uint64_t va, const void *src, uint32_t len);
 void     la_uvm_paging_init(void);
 void     la_uvm_switch(uint64_t *pgtbl);

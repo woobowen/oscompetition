@@ -471,6 +471,8 @@ static uint64_t sys_fork(struct la_trap_frame *tf)
     child->parent_pid = parent->pid;
     child->heap_top   = parent->heap_top;
     child->mmap_top   = parent->mmap_top;
+    child->stack_bottom = parent->stack_bottom;   /* so forked children keep
+                                                   * the grown stack floor */
     child->cwd_ino    = parent->cwd_ino;
 
     return (uint64_t)child->pid;
@@ -564,27 +566,23 @@ static uint64_t __attribute__((noreturn)) sys_exit(struct la_trap_frame *tf)
     uint32_t exit_code = (uint32_t)tf->gpr[LA_GPR_A0];
     struct la_proc *me = la_current_proc();
 
+    /* A normal exit must come from a user process.  If there is no current
+     * user process we cannot exit (la_proc_exit would dereference NULL) —
+     * halt as a kernel panic rather than corrupt state. */
+    if (!me || !me->is_user) {
+        la_uart_puts("  exit: no current user proc — HALT\n");
+        for (;;) {}
+    }
+
     la_uart_puts("  exit: code=");
     la_uart_put_hex(exit_code);
-    if (me) {
-        la_uart_puts(" pid=");
-        la_uart_put_hex(me->pid);
-    }
+    la_uart_puts(" pid=");
+    la_uart_put_hex(me->pid);
     la_uart_puts("\n");
 
-    if (me) {
-        me->exit_code = (int)exit_code;
-        me->state = LA_PROC_ZOMBIE;
-
-        /* Wake up parent so it can collect our exit status */
-        if (me->parent_pid > 0)
-            la_proc_wakeup_pid(me->parent_pid);
-    }
-
-    /* Switch back to scheduler — never returns */
-    la_sched_switch(&me->ctx);
-
-    for (;;) {}
+    /* la_proc_exit clears ISTLBR, marks us ZOMBIE, wakes the parent, and
+     * switches to the scheduler.  It never returns. */
+    la_proc_exit((int)exit_code);
 }
 
 /* SYS_brk: adjust program break.
