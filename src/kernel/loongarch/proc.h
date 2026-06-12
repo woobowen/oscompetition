@@ -110,6 +110,7 @@ void la_proc_wakeup_pid(int pid);
 /* ---- Process table accessor (for syscall.c) ---- */
 struct la_proc *la_proc_by_pid(int pid);
 struct la_proc *la_proc_table(void);  /* returns la_procs array */
+void la_proc_free(struct la_proc *p); /* reap a zombie: free pgtbl + kstack, mark UNUSED */
 
 /* ---- User process helpers ---- */
 struct la_user_entry {

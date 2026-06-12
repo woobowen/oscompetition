@@ -543,8 +543,12 @@ static uint64_t sys_wait(struct la_trap_frame *tf)
                 la_copy_to_user(ustatus, &wstatus, sizeof(int));
             }
             int cpid = child->pid;
-            /* Reclaim child — just mark unused */
-            child->state = LA_PROC_UNUSED;
+            /* Reclaim the child's resources (user page table + kernel stack).
+             * Previously this only set state=UNUSED, leaking BOTH — every
+             * fork/exec/exit cycle permanently lost a page table + kstack,
+             * exhausting physical memory after a few tests.  Capture cpid
+             * and exit status first; la_proc_free zeroes pid/pgtbl. */
+            la_proc_free(child);
             return (uint64_t)cpid;
         }
 

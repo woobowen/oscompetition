@@ -793,7 +793,7 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
     la_uvm_copy_in(new_pgtbl, sp, &argc64, 8);
 
     /* ---- Update process ---- */
-    /* TODO: free old page table */
+    uint64_t *old_pgtbl = p->pgtbl;   /* freed once new_pgtbl is installed live */
     p->pgtbl = new_pgtbl;
 
     /* Reset trap frame on separate page */
@@ -868,6 +868,14 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
         la_uart_put_hex(post_crmd);
         la_uart_puts("\n");
     }
+
+    /* Free the previous address space.  new_pgtbl is now p->pgtbl, the
+     * hardware PGD points at it (la_uvm_switch above), the TLB was
+     * invalidated and refilled with the new mappings — so old_pgtbl's pages
+     * are no longer referenced by the CPU or by p->pgtbl.  fork deep-copies
+     * the page table, so old_pgtbl is private to this process. */
+    if (old_pgtbl && old_pgtbl != new_pgtbl)
+        la_uvm_free_pgtbl(old_pgtbl);
 
     la_user_return(new_tf);
 

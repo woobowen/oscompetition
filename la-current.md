@@ -349,6 +349,12 @@ A 线成功运行了以下测试组：
 
 ## 六、待完成的工作
 
+> ⚠️ **重要（2026-06-12 实测 24 个 testcode.sh 后的规划纠正）**：现有 Step 计划是**必要脚手架，但不是充分条件**。
+> - **判分**：解析串口输出（`testcase X success` / lmbench 数值），程序须真跑完且语义正确才算过；崩溃/缺 syscall/stub 返回错 = fail。
+> - **路线图未列但必需的 6 个硬依赖**：① 信号栈（lmbench lat_sig + 作业控制）；② **futex**（pthread 线程 mutex 必需，clone CLONE_VM 隐形前置）；③ **动态链接 Step 13 提级必需**（libctest 动态组 + 整个 /glibc/）；④ 调度优先级/亲和（cyclictest -p99/-a）；⑤ 真实 loopback socket（iperf/netperf）；⑥ select/poll（lmbench）。
+> - **两层不确定性**：① **打地鼠**——当前 initcode 在第 1 个测试就崩，其余 23 组触发哪些 UNKNOWN syscall 尚未观测；② **正确性深度**——LTP 跑几百用例、测边界语义，是长尾大头。
+> - **现实预期**：做完 14/15/16（含上 6 缺口）+ 13 → 拿"像样部分分"（basic/lua/busybox 子集/简单 fs）；**24/24 全过**还需完整信号栈+futex+glibc 动态链接+真实网络+RT 调度+LTP 长尾，是持续迭代过程。完整「测试×依赖×Step」对照表见 `CLAUDE.md` §6「评测覆盖与功能依赖全景」。
+
 ### 6.1 核心缺失（阻塞评测）
 
 1. **LoongArch 测试程序编译**：当前磁盘映像（`disk.img`）中的 `.elf` 文件是 RISC-V 架构的。需要：
@@ -517,9 +523,11 @@ docker exec nostalgic_khayyam bash -c "cd /workspace && make check-la"
 ✅ Step 10 (修EXT4 bug) → ✅ Step 11 (脚本执行) → ⬜ Step 12 (定时器抢占)
   → ⬜ Step 13 (动态链接) → ⬜ Step 14 (管道) → ⬜ Step 15 (文件写入)
   → ⬜ Step 16 (补全syscall) → ✅ Step 17 (栈增长+不挂死) → ⬜ Step 18 (堆增强)
-  → ⬜ Step 19 (资源回收) → ⬜ Step 20 (块缓存) → ⬜ Step 21 (集成验证)
+  → ✅ Step 19 (资源回收) → ⬜ Step 20 (块缓存) → ⬜ Step 21 (集成验证)
 ```
-> Step 10、11、17 已完成。**当前最短解阻塞路径：Step 19（资源回收：exec/exit 释放页表）**——Step 17 解挂后实测 libcbench-musl 能完整跑通，但跑完后物理内存耗尽（页表从不释放）→ 后续 12 个测试全部 `initcode: fork fail!`。修 Step 19 即可让全量测试逐个跑起来；Step 16（socket 族）与 Step 14（管道）是各测试自身功能跑通的条件。
+> Step 10、11、17、19 已完成。**Step 19（资源回收）已实测验证**：`initcode: fork fail!` 从 13 次 → 0（exec/exit/wait 现在释放用户页表+内核栈，不再耗尽物理内存）。
+>
+> **当前最短解阻塞路径：Step 16（补全 syscall）的 `clone(CLONE_VM)` 线程支持 + socket 族（`#0x42/#0x71/#0xa9`）**。Step 19 解除内存耗尽后，libc-bench 仍因创建线程失败（`clone: CLONE_VM not supported`）而 NULL 解引用崩溃（`badv=0x28`），级联杀死 initcode（`ecode=0xd/INE @ era=0x137c`，wait4 返回点），导致只跑通第一个测试后内核空转。该崩溃经核对在 Step 19 之前的 `la-step17.log` 中**字节级一致**地存在 → 属预存问题，非 Step 19 回归。Step 14（管道）是脚本 `a | b` 跑通的前提。
 
 ---
 
@@ -591,21 +599,21 @@ docker exec nostalgic_khayyam bash -c "cd /workspace && make check-la"
 
 ---
 
-### Step 13：动态链接器支持（🟡 P1，可延后）
+### Step 13：动态链接器支持（🔴 P0，**提级——非可延后**）
 
 **问题**：部分测试程序（如 `dhry2`）是动态链接的，interpreter 为 `/lib64/ld-musl-loongarch-lp64d.so.1`。
+
+**为何提级（2026-06-12 实测脚本后纠正）**：`libctest_testcode.sh` 显式跑 `run-dynamic.sh`；unixbench 的 dhry2 动态链接；**整个 `/glibc/` 12 组** glibc 程序天然动态链接。不实现 = 直接放弃 libctest 动态组 + 全部 /glibc/（24 组里约 12 组受影响）。原先"可延后"是低估。
 
 **实现内容**：
 1. 在 ELF 加载时检查 PT_INTERP 段，获取 interpreter 路径
 2. 检查 `sdcard-la.img` 中是否存在 musl dynamic linker
-3. 如果存在，先加载 interpreter ELF，设置辅助向量（AT_PHDR/AT_PHNUM/AT_ENTRY 等）
-4. 将用户程序的入口改为 interpreter 的 entry
-
-**备选方案**：如果动态链接太复杂，busybox 是静态链接的，可优先跑 busybox 测试组。unixbench 的部分程序也是静态链接的。
+3. 如果存在，先加载 interpreter ELF，设置辅助向量（AT_PHDR/AT_PHNUM/AT_ENTRY/AT_BASE 等）
+4. 将用户程序的入口改为 interpreter 的 entry。蓝本：RV 线 DECISIONS D4。
 
 **涉及文件**：`src/kernel/loongarch/exec_la.c`
 
-**验证标准**：能执行动态链接的测试程序
+**验证标准**：能执行动态链接的测试程序（libctest 动态组、glibc 程序）
 
 ---
 
@@ -653,22 +661,30 @@ docker exec nostalgic_khayyam bash -c "cd /workspace && make check-la"
 
 ---
 
-### Step 16：补全关键系统调用（🟡 P1）
+### Step 16：补全关键系统调用（🔴 P0，**范围比标题大**——当前主阻塞点）
+
+> **2026-06-12 实测 24 个 testcode.sh 后纠正**：Step 16 远不止"补几个号"，而是耦合的一组工作。按依赖分组：
+
+1. **`clone(CLONE_VM|CLONE_THREAD|CLONE_FS|CLONE_FILES)` 真线程 + `futex`(98)**（pthread mutex/condvar 必需，**futex 是 clone CLONE_VM 的隐形前置**，缺则线程同步必崩）：解锁 libc-bench / iozone(`-t4`) / cyclictest(`-t8`) / libctest。
+2. **信号栈**：`rt_sigaction/rt_sigprocmask`(当前桩) + `rt_sigreturn/kill/tgkill` + 真实信号投递。lmbench `lat_sig`、netperf/cyclictest 后台进程 `&`(SIGCHLD)依赖。
+3. **socket 族真实实现**（非 errno-stub）：`socket(0x29)/bind/listen/accept/connect/sendto/recvfrom` + loopback。iperf/netperf 要在 `127.0.0.1` 跑 TCP，stub 直接 fail；libc-bench 的 `#0x42/#0x71/#0xa9` 也属此。
+4. **`select/pselect6/poll`**：lmbench `lat_select`。
+5. **`sched_setscheduler/sched_setaffinity/getcpu`**：cyclictest `-p99`(SCHED_FIFO)/`-a`(亲和)。
+6. 时间/信息类：`gettimeofday(78)/clock_gettime(113)/times(100)`、`uname/fcntl/ioctl` 补全。
 
 | Syscall             | 编号 | 用途             | 依赖 Step |
 | ------------------- | ---- | ---------------- | --------- |
-| `SYS_pipe`          | 59   | 管道创建         | Step 14   |
-| `SYS_creat`         | 35   | 创建文件         | Step 15   |
-| `SYS_unlink`        | 35   | 删除文件         | Step 15   |
-| `SYS_gettimeofday`  | 78   | 获取时间         | 无        |
-| `SYS_clock_gettime` | 113  | 高精度时钟       | 无        |
-| `SYS_times`         | 100  | 进程时间统计     | 无        |
-| `SYS_stat`          | 79   | 路径版 fstat     | 无        |
-| `SYS_uname`         | 160  | 系统信息         | 无        |
-| `SYS_getppid`       | 64   | 获取父进程 ID    | 无        |
-| `SYS_fcntl`         | 25   | 文件控制         | 无        |
-| `SYS_clone`         | 2    | 线程创建         | 中等难度  |
-| `SYS_ioctl`         | 29   | 设备控制         | 低        |
+| `SYS_clone`(CLONE_VM/THREAD) | 2/220 | 真线程 | Step 16 核心 |
+| `SYS_futex`         | 98   | pthread 同步（线程必需）| Step 16 核心 |
+| `SYS_rt_sigaction/return` | 134/206 | 信号投递 | Step 16 |
+| `SYS_kill/tgkill`   | 129/234 | 发信号 | Step 16 |
+| `SYS_socket/bind/listen/accept/connect` | 41/200/201/202/203/44 | loopback 网络栈 | Step 16（iperf/netperf）|
+| `SYS_select/pselect6/poll` | 23/270/73 | lmbench lat_select | Step 16 |
+| `SYS_sched_setscheduler/affinity` | 119/122/203 | cyclictest RT/亲和 | Step 16 |
+| `SYS_pipe2`         | 293  | 管道创建         | Step 14   |
+| `SYS_creat/unlink`  | 35   | 创建/删除文件    | Step 15   |
+| `SYS_gettimeofday/clock_gettime/times` | 78/113/100 | 时间 | 无 |
+| `SYS_uname/fcntl/ioctl` | 160/25/29 | 信息/控制 | 无 |
 
 **涉及文件**：`src/kernel/loongarch/syscall.c`
 
@@ -721,17 +737,27 @@ docker exec nostalgic_khayyam bash -c "cd /workspace && make check-la"
 
 ---
 
-### Step 19：进程资源回收与稳定性（🟡 P1）
+### Step 19：进程资源回收与稳定性（🟡 P1）— ✅ 已完成（2026-06-12）
 
-**问题**：fork 后旧页表未释放，进程数量有限（16个），ZOMBIE 清理可能不完整。
+**问题**：`exec`/`exit`/`wait` 从不释放用户页表与内核栈（`proc.c` 旧 `TODO: free user page table`）。fork 又 `la_uvm_copy_pgtbl` 深拷贝每页 → 每个测试周期永久丢失一整张页表 + 一页 kstack。Step 17 解挂后实测：libcbench-musl 跑完后物理内存耗尽，后续 12 个测试全部 `initcode: fork fail!`（Step 17 日志 `la-step17b/c.log` 各 13 次）。
 
 **实现内容**：
-1. `exec` 后释放旧页表和物理页面
-2. `exit` 后释放用户页表
-3. wait 回收子进程时释放所有资源
-4. 增加 `LA_NPROC` 到 64 或更高（unixbench 可能 fork 大量子进程）
+1. **`la_uvm_free_pgtbl(root)`**（`uvm_la.c`，新增）：三级遍历整张用户页表（与 `la_uvm_copy_pgtbl` 同构），释放每个 `V` 位叶项指向的数据页，再依次释放 leaf/mid/root 表页。**安全前提**：本内核 fork **深拷贝**页表（`uvm_la.c:404-416` 逐字节复制数据页，无共享/COW），故每张表下所有页归唯一进程私有；调用方须保证 `root` 非任何在跑上下文的活跃页表，且释放前已 drop 陈旧 TLB（调度器进用户态前 `la_tlb_inval_all`、exec 安装新镜像前 `la_tlb_inval_all`）。
+2. **`la_proc_free(p)`**（`proc.c`，由 `static` 改 public）：先 `la_uvm_free_pgtbl(p->pgtbl)` 再 `la_pmem_free(p->kstack)`，最后置 `UNUSED`。调度器对**无父**ZOMBIE 调用它（既有路径）；`proc.h` 新增原型。
+3. **`sys_wait` 回收**（`syscall.c:551`）：`child->state = UNUSED` → `la_proc_free(child)`（先存 `cpid`、先 `la_copy_to_user` 写 wstatus，再释放）。
+4. **exec 释放旧页表**（`exec_la.c`）：argv 拷贝（读旧表）完成、`p->pgtbl = new_pgtbl`、`la_uvm_switch` + `la_tlb_inval_all` + `la_tlb_fill_all`（CPU 已指向新表、TLB 已清并填新映射）之后、`la_user_return` 之前，调用 `la_uvm_free_pgtbl(old_pgtbl)`。fork 深拷贝保证 `old_pgtbl` 归本进程私有。
+5. （`LA_NPROC` 暂未上调；当前 16 槽位足够，多 fork 场景留待 Step 19 后续/集成期评估。）
 
-**涉及文件**：`src/kernel/loongarch/proc.c`、`uvm_la.c`、`exec_la.c`
+**涉及文件**：`uvm_la.c`、`early_boot.h`、`proc.c`、`proc.h`、`syscall.c`、`exec_la.c`
+
+**验证（2026-06-12，`sdcard-la.img` 全量跑 45s）**：
+- ✅ `initcode: fork fail!`：**13 → 0**（资源不再泄漏，目标达成）。
+- ✅ 无内核挂死/panic（用户态异常只杀单个进程、内核存活，Step 17 行为保持）。
+- ✅ 构建 `(source)` 模式、0 warning（`-Wall -Werror`）。
+- ✅ 无 use-after-free：深拷贝已核对，initcode(pid1) 从不 exec，其页表/代码页从不被本步任何释放路径触及。
+
+**遗留（属后续 Step，非 Step 19 回归）**：
+- **`clone: CLONE_VM not supported` → libc-bench NULL 解引用（`badv=0x28`）→ 级联杀死 initcode（`ecode=0xd/INE @ era=0x137c`，`run_test_entries` 的 wait4 返回点 `bgez $a0`）**。该崩溃在 Step 19 **之前**的 `la-step17.log` 中**字节级一致**地存在（同 era/badv/insn/`proc: initcode pid=1`）→ 系 libc-bench 用 `clone(CLONE_VM)` 建线程、内核不支持所致。属 **Step 16（补全 syscall：clone CLONE_VM 线程 + socket 族 `#0x42/#0x71/#0xa9`）**，是当前让全量测试逐个跑通的真正阻塞点。
 
 ---
 
@@ -767,17 +793,17 @@ docker exec nostalgic_khayyam bash -c "cd /workspace && make check-la"
 | 10   | 修复 EXT4 目录 bug | 🔴 P0  | 小         | 无          | ✅ 已完成     |
 | 11   | 脚本执行 shebang | 🔴 P0    | 中         | Step 10     | ✅ 已完成     |
 | 12   | 定时器抢占调度   | 🔴 P0    | 小         | 无          | ⬜ 待做       |
-| 13   | 动态链接器       | 🟡 P1    | 大（可延后）| Step 11     | ⬜ 待做       |
+| 13   | 动态链接器       | 🔴 P0（提级）| 大         | Step 11     | ⬜ 待做（libctest 动态组+/glibc 全组需要）|
 | 14   | 管道实现         | 🔴 P0    | 中         | Step 11     | ⬜ 待做       |
 | 15   | 文件系统写入     | 🔴 P0    | 大         | Step 10     | ⬜ 待做       |
-| 16   | 补全关键 syscall | 🟡 P1    | 中         | Step 14, 15 | ⬜ 待做       |
-| 17   | 栈自动增长       | 🟡 P1    | 小         | 无          | ⬜ 待做（当前阻塞点） |
+| 16   | 补全关键 syscall | 🔴 P0    | 大（线程+futex+信号+socket+select+sched）| Step 14 | ⬜ 待做（**当前阻塞点**）|
+| 17   | 栈自动增长       | 🟡 P1    | 小         | 无          | ✅ 已完成     |
 | 18   | 堆管理增强       | 🟢 P2    | 中         | 无          | ⬜ 待做       |
-| 19   | 资源回收         | 🟡 P1    | 中         | 无          | ⬜ 待做       |
+| 19   | 资源回收         | 🟡 P1    | 中         | 无          | ✅ 已完成     |
 | 20   | 缓冲区缓存       | 🟢 P2    | 中         | 无          | ⬜ 待做       |
 | 21   | 集成验证         | 🔴 P0    | 视情况     | 全部        | ⬜ 待做       |
 
-> 2026-06-12 16:36: **下一步建议**：Step 17（栈自动增长，libc-bench 需 ~80KB 栈而内核只预分配 32KB，当前 `TLB refill FAIL` 即此）与 Step 16（socket 族 syscall `#0x42/0x71/0xa9`）是让 libc-bench 类重程序跑通的最短路径；Step 12（定时器抢占）可防止单进程长跑独占 CPU。
+> 2026-06-12 17:50: **下一步建议**：Step 19 已完成（`fork fail` 13→0，内存不再耗尽）。当前真正阻塞是 **Step 16 的 `clone(CLONE_VM)` 线程支持 + socket 族（`#0x42/#0x71/#0xa9`）**——libc-bench 因线程创建失败崩溃并级联杀死 initcode（`INE @ 0x137c`，wait4 返回点），该崩溃在 Step 19 前的日志中字节级一致存在，非回归。其次 Step 14（管道）是脚本 `a | b` 跑通的前提；Step 12（定时器抢占）可防止单进程长跑独占 CPU。
 
 >
 >     **2026-06-12 更新**：Step 11（脚本执行 / shebang）已完成并实测验证——busybox 能 `sh` 解释执行 `*_testcode.sh`，echo 子命令成功打印评测标记、wait4 正常回收、相对路径 `exec ./libc-bench` 成功。本轮修复 §6 mallocng TLB 一致性崩溃、EPERM 掩码（openat ABI + 正确 errno）、exec 4KB 内核栈溢出（大数组改 static）、相对路径解析。后续阻塞点已确认为 Step 17（栈自动增长，libc-bench 需 ~80KB 栈）与 Step 16（socket 族 syscall）。

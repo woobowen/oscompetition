@@ -419,3 +419,42 @@ int la_uvm_copy_pgtbl(uint64_t *src, uint64_t *dst)
     }
     return 0;
 }
+
+/* ---- Free an entire user page table and every page it maps ----
+ *
+ * Walks the 3-level table exactly like la_uvm_copy_pgtbl: root → mid → leaf.
+ * Directory entries are raw PAs (no flags); a leaf entry with V set is a data
+ * page whose PPN is the data page PA.  We free every mapped data page, then
+ * each leaf table, each mid table, and finally the root.
+ *
+ * SAFE because this kernel's fork DEEP-COPIES the page table (no shared/COW
+ * pages) — every page under `root` is privately owned by exactly one process.
+ * The caller must guarantee `root` is not the active page table of any running
+ * context and that stale TLB entries are dropped before the freed pages are
+ * reused (the scheduler invalidates the whole TLB before entering the next
+ * user process; exec invalidates before installing the new image). */
+void la_uvm_free_pgtbl(uint64_t *root)
+{
+    if (!root) return;
+
+    for (int i = 0; i < LA_PT_ENTRIES; i++) {
+        uint64_t e0 = root[i];
+        if (!e0) continue;
+        uint64_t *mid = (uint64_t *)e0;
+
+        for (int j = 0; j < LA_PT_ENTRIES; j++) {
+            uint64_t e1 = mid[j];
+            if (!e1) continue;
+            uint64_t *leaf = (uint64_t *)e1;
+
+            for (int k = 0; k < LA_PT_ENTRIES; k++) {
+                uint64_t e2 = leaf[k];
+                if (e2 & LA_PTE_V)
+                    la_pmem_free((void *)LA_PTE_PPN(e2));   /* data page */
+            }
+            la_pmem_free(leaf);   /* leaf table page */
+        }
+        la_pmem_free(mid);   /* mid table page */
+    }
+    la_pmem_free(root);   /* root table page */
+}

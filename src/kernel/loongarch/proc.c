@@ -73,18 +73,29 @@ static struct la_proc *la_proc_alloc(void)
     return 0;
 }
 
-/* ---- release proc slot and kernel stack ---- */
-static void la_proc_free(struct la_proc *p)
+/* ---- release proc slot, kernel stack, and user page table ----
+ *
+ * Fully reclaims a zombie's resources: the user page table and every page it
+ * maps (la_uvm_free_pgtbl), then the kernel stack.  Called by the scheduler
+ * for parentless zombies AND by sys_wait when a parent collects a child.
+ * Safe to call on a ZOMBIE that has already swtch'd away: its kstack is no
+ * longer in use and the kernel runs off DMW0 identity mapping (not the user
+ * page table), so freeing pgtbl cannot fault the kernel.  The scheduler
+ * invalidates the whole TLB before the next user process runs, so freed pages
+ * are not referenced by stale TLB entries. */
+void la_proc_free(struct la_proc *p)
 {
+    if (p->pgtbl) {
+        la_uvm_free_pgtbl(p->pgtbl);
+        p->pgtbl = 0;
+    }
     if (p->kstack) {
         la_pmem_free((void *)p->kstack);
         p->kstack = 0;
     }
-    /* TODO: free user page table */
-    p->state = LA_PROC_UNUSED;
-    p->pid   = 0;
-    p->tf    = 0;
-    p->pgtbl = 0;
+    p->state   = LA_PROC_UNUSED;
+    p->pid     = 0;
+    p->tf      = 0;
     p->is_user = 0;
 }
 

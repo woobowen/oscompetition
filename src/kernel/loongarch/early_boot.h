@@ -104,6 +104,7 @@ void     la_uvm_copy_in(uint64_t *root, uint64_t va, const void *src, uint32_t l
 void     la_uvm_paging_init(void);
 void     la_uvm_switch(uint64_t *pgtbl);
 int      la_uvm_copy_pgtbl(uint64_t *src, uint64_t *dst);
+void     la_uvm_free_pgtbl(uint64_t *root);   /* free a whole user page table + all mapped data pages */
 uint64_t la_uva_to_pa(uint64_t *root, uint64_t va);
 
 /* ---- User ↔ Kernel data copy ---- */
