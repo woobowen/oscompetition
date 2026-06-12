@@ -361,6 +361,7 @@ sudo docker run --rm \
 - **单调改进**：新补丁须保持已通过的 unixbench-musl、busybox-musl 不回退。
 - **最小兼容要可解释**：允许桩实现，但返回值/errno/日志/DECISIONS 必须说清边界；无法用最小实现保正确性时转完整实现并记 DECISIONS。
 - **提交**：仅在用户要求时 commit/push；提交信息结尾加 `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`。默认分支 `master`，当前工作分支 `os2026-1`——若在默认分支须先开分支。
+- **每次 Step 完成必须更新两份文档**：① `CLAUDE.md`（Agent 工作记忆：更新 §0 当前状态 + §6 阻塞点 + §7 路线图/优先级表）；② `la-current.md`（人类开发日志：在第三部分按时间追加条目，记录做了什么、涉及文件、遗留问题；更新第二部分表格 + 末尾最后更新时间）。不得跳过。
 - 全项目通用规则详见 `AGENTS.md`。
 
 ---
