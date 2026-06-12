@@ -41,6 +41,8 @@ void la_timer_init(void)
 }
 
 /* ---- called from trap_dispatch on every timer tick ---- */
+extern int la_tlb_refill_count;
+
 void la_timer_interrupt(void)
 {
     /* Acknowledge: write 1 to TICLR to clear the pending bit */
@@ -52,7 +54,9 @@ void la_timer_interrupt(void)
     if (la_ticks % 100 == 0) {
         la_uart_puts("[tick ");
         la_uart_put_hex(la_ticks / 100);
-        la_uart_puts(" s]\n");
+        la_uart_puts(" s] refills=");
+        la_uart_put_hex(la_tlb_refill_count);
+        la_uart_puts("\n");
     }
 }
 

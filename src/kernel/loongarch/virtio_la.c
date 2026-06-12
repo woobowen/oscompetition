@@ -108,9 +108,9 @@ static __attribute__((aligned(4096))) char la_vq_pages[3 * 4096];
 
 static la_vring_desc_t *la_desc;
 static uint16_t        *la_avail;
-static la_used_area_t  *la_used;
+static volatile la_used_area_t  *la_used;
 static char             la_desc_free[VIRTIO_NUM];
-static uint16_t         la_used_idx;
+static volatile uint16_t         la_used_idx;
 
 /* Device register base (found during PCI init) */
 static uint64_t la_virtio_base;
@@ -448,8 +448,12 @@ int la_virtio_blk_read(uint32_t block_num, void *buf)
         return -1;
 
     int idx[3];
-    if (la_alloc3_desc(idx) < 0)
+    if (la_alloc3_desc(idx) < 0) {
+        la_uart_puts("  vbr: DESC ALLOC FAIL blk=");
+        la_uart_put_hex(block_num);
+        la_uart_puts("\n");
         return -1;
+    }
 
     static struct la_virtio_blk_outhdr hdr;
     hdr.type     = VIRTIO_BLK_T_IN;
@@ -483,28 +487,60 @@ int la_virtio_blk_read(uint32_t block_num, void *buf)
     la_avail[1] = la_avail[1] + 1;
     asm volatile("dbar 0" ::: "memory");
 
+    uint16_t avail_before = la_avail[1];
+
     /* Notify device */
     *(volatile uint16_t *)(la_virtio_base + VIRTIO_PCI_QUEUE_NOTIFY) = 0;
 
-    /* Poll used ring until completion (with timeout) */
+    /* Poll used ring until completion (with timeout).
+     *
+     * The virtio-blk file backend completes I/O asynchronously inside QEMU's
+     * device layer.  A tight loop that touches only RAM never yields to that
+     * layer, so on a single CPU the completion can land after our timeout.
+     * We therefore periodically re-write QUEUE_NOTIFY: the MMIO write hands
+     * control to QEMU (letting async I/O finish) and re-triggers the queue
+     * in case the original kick was coalesced.  dbar 0 orders the CPU's view
+     * of the device's DMA write to the used-ring index. */
     {
-        int timeout = 1000000;
-        while ((la_used_idx % VIRTIO_RING_SIZE) == (la_used->id % VIRTIO_RING_SIZE)) {
-            asm volatile("" ::: "memory");
+        int timeout = 50000000;
+        for (;;) {
+            asm volatile("dbar 0" ::: "memory");
+            if ((la_used_idx % VIRTIO_RING_SIZE) != (la_used->id % VIRTIO_RING_SIZE))
+                break;
             if (--timeout == 0) {
+                la_uart_puts("  vbr: TIMEOUT blk=");
+                la_uart_put_hex(block_num);
+                la_uart_puts(" used_idx=");
+                la_uart_put_hex(la_used_idx);
+                la_uart_puts(" used->id=");
+                la_uart_put_hex(la_used->id);
+                la_uart_puts(" avail=");
+                la_uart_put_hex(avail_before);
+                la_uart_puts("\n");
                 la_free_chain(idx[0]);
                 return -1;
             }
+            if ((timeout & 0x3fff) == 0)
+                *(volatile uint16_t *)(la_virtio_base + VIRTIO_PCI_QUEUE_NOTIFY) = 0;
         }
     }
 
     int id = la_used->elems[la_used_idx].id;
-    (void)id;
     la_used_idx = (la_used_idx + 1) % VIRTIO_RING_SIZE;
 
     la_free_chain(idx[0]);
 
-    return (status == 0) ? 0 : -1;
+    if (status != 0) {
+        la_uart_puts("  vbr: STATUS ERROR blk=");
+        la_uart_put_hex(block_num);
+        la_uart_puts(" status=");
+        la_uart_put_hex(status);
+        la_uart_puts(" id=");
+        la_uart_put_hex((uint32_t)id);
+        la_uart_puts("\n");
+        return -1;
+    }
+    return 0;
 }
 
 /* ---- Write one 4KB block (polling) ---- */
@@ -550,12 +586,17 @@ int la_virtio_blk_write(uint32_t block_num, const void *buf)
     *(volatile uint16_t *)(la_virtio_base + VIRTIO_PCI_QUEUE_NOTIFY) = 0;
 
     {
-        int timeout = 1000000;
-        while ((la_used_idx % VIRTIO_RING_SIZE) == (la_used->id % VIRTIO_RING_SIZE)) {
+        int timeout = 50000000;
+        for (;;) {
+            asm volatile("dbar 0" ::: "memory");
+            if ((la_used_idx % VIRTIO_RING_SIZE) != (la_used->id % VIRTIO_RING_SIZE))
+                break;
             if (--timeout == 0) {
                 la_free_chain(idx[0]);
                 return -1;
             }
+            if ((timeout & 0x3fff) == 0)
+                *(volatile uint16_t *)(la_virtio_base + VIRTIO_PCI_QUEUE_NOTIFY) = 0;
         }
     }
 

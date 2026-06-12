@@ -59,7 +59,8 @@ struct la_proc {
     /* User-mode state */
     struct la_trap_frame *tf;  /* user trap frame (on kernel stack) */
     uint64_t *pgtbl;           /* user page table root */
-    uint64_t heap_top;         /* user heap top */
+    uint64_t heap_top;         /* user heap top (brk grows up from here) */
+    uint64_t mmap_top;         /* mmap region (grows up, separate from heap) */
     int is_user;               /* 1 = user process, 0 = kernel thread */
 
     /* Process relationships */

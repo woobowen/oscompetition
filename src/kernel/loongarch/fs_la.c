@@ -326,25 +326,34 @@ static uint64_t e4_u64(uint32_t lo, uint32_t hi) { return ((uint64_t)hi << 32) |
 
 static uint32_t e4_read_bytes(uint64_t off, void *dst, uint32_t len)
 {
-    uint8_t *d = (uint8_t *)dst, *tmp = (uint8_t *)la_pmem_alloc();
-    if (!tmp) return 0;
+    uint8_t *d = (uint8_t *)dst;
     uint32_t done = 0;
     while (done < len) {
         uint32_t blk  = (uint32_t)((off + done) / LA_BLKSIZE);
         uint32_t boff = (uint32_t)((off + done) % LA_BLKSIZE);
         uint32_t take = LA_BLKSIZE - boff;
         if (take > len - done) take = len - done;
-        if (la_virtio_blk_read(blk, tmp) != 0) break;
-        la_memmove(d + done, tmp + boff, take);
+        if (la_virtio_blk_read(blk, la_blkbuf) != 0) break;
+        la_memmove(d + done, la_blkbuf + boff, take);
         done += take;
     }
-    la_pmem_free(tmp);
     return done;
 }
 
 static int e4_read_gd(uint32_t g, e4_gd_t *gd)
 {
     if (!e4.active || g >= e4.ng) return -1;
+    /* Sanity check: e4 struct should not be corrupted */
+    if (e4.bsz != 4096 || e4.isz == 0) {
+        la_uart_puts("  e4 CORRUPTED: bsz=");
+        la_uart_put_hex(e4.bsz);
+        la_uart_puts(" isz=");
+        la_uart_put_hex(e4.isz);
+        la_uart_puts(" active=");
+        la_uart_put_hex(e4.active);
+        la_uart_puts("\n");
+        return -1;
+    }
     uint64_t base = (e4.bsz == 1024 ? 2 : 1) * (uint64_t)e4.bsz;
     return e4_read_bytes(base + (uint64_t)g * e4.dsz, gd, sizeof(*gd)) == sizeof(*gd) ? 0 : -1;
 }
@@ -356,9 +365,10 @@ static int e4_read_inode(uint32_t inum, e4_inode_t *ip)
     e4_gd_t gd;
     if (e4_read_gd(g, &gd) < 0) return -1;
     uint64_t tbl = e4_u64(gd.inode_table_lo, gd.inode_table_hi);
+    uint64_t off = tbl * (uint64_t)e4.bsz + (uint64_t)l * e4.isz;
     la_memset(ip, 0, sizeof(*ip));
-    return e4_read_bytes(tbl * (uint64_t)e4.bsz + (uint64_t)l * e4.isz,
-                         ip, sizeof(*ip)) == sizeof(*ip) ? 0 : -1;
+    uint32_t nr = e4_read_bytes(off, ip, sizeof(*ip));
+    return nr == sizeof(*ip) ? 0 : -1;
 }
 
 static uint64_t e4_isize(const e4_inode_t *ip) { return ((uint64_t)ip->size_high << 32) | ip->size_lo; }
@@ -366,8 +376,7 @@ static uint64_t e4_isize(const e4_inode_t *ip) { return ((uint64_t)ip->size_high
 static int e4_lbn2pb(const e4_inode_t *ip, uint32_t lbn, uint64_t *pb)
 {
     if (!(ip->flags & E4_EXTENTS_FL)) return -1;
-    uint8_t *sc = (uint8_t *)la_pmem_alloc();
-    if (!sc) return -1;
+    uint8_t *sc = la_blkbuf;
     const uint8_t *nd = ip->block;
     int r = -1, cnt = 0;
     for (;;) {
@@ -396,7 +405,6 @@ static int e4_lbn2pb(const e4_inode_t *ip, uint32_t lbn, uint64_t *pb)
         if (e4_read_bytes(child * (uint64_t)e4.bsz, sc, e4.bsz) != e4.bsz) break;
         nd = sc;
     }
-    la_pmem_free(sc);
     return r;
 }
 
@@ -408,8 +416,7 @@ static uint32_t e4_read_file(uint32_t inum, uint32_t off, void *dst, uint32_t le
     uint64_t sz = e4_isize(&ip);
     if ((uint64_t)off >= sz) return 0;
     if ((uint64_t)off + len > sz) len = (uint32_t)(sz - off);
-    uint8_t *d = (uint8_t *)dst, *tmp = (uint8_t *)la_pmem_alloc();
-    if (!tmp) return 0;
+    uint8_t *d = (uint8_t *)dst;
     uint32_t done = 0;
     while (done < len) {
         uint32_t cur = off + done;
@@ -417,11 +424,24 @@ static uint32_t e4_read_file(uint32_t inum, uint32_t off, void *dst, uint32_t le
         uint32_t take = e4.bsz - boff;
         if (take > len - done) take = len - done;
         uint64_t pb;
-        if (e4_lbn2pb(&ip, lbn, &pb) < 0) break;
-        if (e4_read_bytes(pb * (uint64_t)e4.bsz + boff, d + done, take) != take) break;
+        if (e4_lbn2pb(&ip, lbn, &pb) < 0) {
+            la_uart_puts("  e4rf: lbn2pb FAIL inum=");
+            la_uart_put_hex(inum);
+            la_uart_puts(" lbn=");
+            la_uart_put_hex(lbn);
+            la_uart_puts("\n");
+            break;
+        }
+        if (e4_read_bytes(pb * (uint64_t)e4.bsz + boff, d + done, take) != take) {
+            la_uart_puts("  e4rf: read_bytes FAIL inum=");
+            la_uart_put_hex(inum);
+            la_uart_puts(" pb=");
+            la_uart_put_hex(pb);
+            la_uart_puts("\n");
+            break;
+        }
         done += take;
     }
-    la_pmem_free(tmp);
     return done;
 }
 
@@ -451,11 +471,19 @@ static int e4_dir_lookup(uint32_t dir, const char *name, uint32_t *out)
     return -1;
 }
 
-/* EXT4 path resolution */
+/* EXT4 path resolution.
+ * Relative paths (not starting with '/') resolve against the current
+ * process's cwd, carried in la_fs_cwd_ino (set by the syscall dispatcher
+ * from current->cwd_ino).  This is what lets scripts run "./cyclictest"
+ * after chdir-ing into the test directory.  SeaFS has no cwd support and
+ * keeps resolving from its root. */
+uint32_t la_fs_cwd_ino = 0;
+
 static int e4_lookup(char *path, uint32_t *out)
 {
     if (!e4.active) return -1;
-    uint32_t cur = E4_ROOT_INO;
+    uint32_t cur = (*path == '/' || la_fs_cwd_ino == 0) ? E4_ROOT_INO
+                                                        : la_fs_cwd_ino;
     char name[60];
     if (*path == 0 || (*path == '/' && path[1] == 0)) { if (out) *out = cur; return 0; }
     char *rest = path;

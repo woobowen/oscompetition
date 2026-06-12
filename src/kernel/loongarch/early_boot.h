@@ -28,6 +28,8 @@
 /* ---- User address space layout ---- */
 #define LA_USER_BASE    0x1000ULL     /* user code starts here */
 #define LA_USER_STACK   0x7FFFFFE000ULL  /* user stack top (39-bit space) */
+#define LA_MMAP_BASE    0x4000000000ULL  /* mmap region start (256 GB, grows up;
+                                           * disjoint from brk heap & stack) */
 
 /* ---- Physical memory layout (QEMU virt, -m 1G) ----
  *
@@ -80,6 +82,7 @@ int  la_virtio_blk_write(uint32_t block_num, const void *buf);
 
 /* ---- Filesystem (read-only, SeaOS FS + EXT4) ---- */
 int     la_fs_init(void);
+extern uint32_t la_fs_cwd_ino;   /* current proc cwd inode (set by syscall entry) */
 int     la_fs_lookup(char *path, uint32_t *inode_num);
 uint32_t la_fs_read_file(uint32_t inode_num, uint32_t offset,
                           void *dst, uint32_t len);
@@ -97,6 +100,7 @@ void     la_uvm_copy_in(uint64_t *root, uint64_t va, const void *src, uint32_t l
 void     la_uvm_paging_init(void);
 void     la_uvm_switch(uint64_t *pgtbl);
 int      la_uvm_copy_pgtbl(uint64_t *src, uint64_t *dst);
+uint64_t la_uva_to_pa(uint64_t *root, uint64_t va);
 
 /* ---- User ↔ Kernel data copy ---- */
 uint32_t la_copy_from_user(void *kdst, uint64_t usrc, uint32_t len);
@@ -106,7 +110,10 @@ int      la_copy_str_from_user(char *kdst, uint64_t usrc, uint32_t max);
 /* ---- TLB management ---- */
 void la_tlb_init(void);
 void la_tlb_inval_all(void);
+void la_tlb_inval_page(uint64_t va);
 int  la_tlb_fill_all(uint64_t *pgtbl);
+int  la_tlb_refill_one(uint64_t va);
+void la_tlb_dump(int max_entries);
 extern uint64_t la_tlb_active_pgtbl;  /* set by proc.c before user mode */
 
 /* ---- First user process ---- */

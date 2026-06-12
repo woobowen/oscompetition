@@ -11,6 +11,9 @@
 .globl la_exception_entry
 .type la_exception_entry, @function
 la_exception_entry:
+        csrwr   $t0, LA_CSR_KS0
+        csrwr   $t1, LA_CSR_KS1
+
         # ---- Check if TLB refill exception ----
         # TLB refill updates TLBRERA/TLBRPRMD but NOT ERA/PRMD/ESTAT.
         # If ISTLBR is set, copy TLBRPRMD→PRMD so the rest of the
@@ -41,8 +44,8 @@ la_exception_entry:
 
 .Lfrom_kernel:
         # Came from kernel mode — SP is already the kernel stack.
+        addi.d  $t0, $sp, 0
         addi.d  $sp, $sp, -LA_TF_SIZE
-        addi.d  $t0, $sp, LA_TF_SIZE
         st.d    $t0, $sp, LA_TF_GPR_SP  # save pre-trap SP
 
 .Lsave_regs:
@@ -57,8 +60,12 @@ la_exception_entry:
         st.d    $r9,  $sp, LA_TF_GPR_A5
         st.d    $r10, $sp, LA_TF_GPR_A6
         st.d    $r11, $sp, LA_TF_GPR_A7
-        st.d    $r12, $sp, LA_TF_GPR_T0
-        st.d    $r13, $sp, LA_TF_GPR_T1
+        
+        csrrd   $t0, LA_CSR_KS0
+        csrrd   $t1, LA_CSR_KS1
+        st.d    $t0, $sp, LA_TF_GPR_T0
+        st.d    $t1, $sp, LA_TF_GPR_T1
+
         st.d    $r14, $sp, LA_TF_GPR_T2
         st.d    $r15, $sp, LA_TF_GPR_T3
         st.d    $r16, $sp, LA_TF_GPR_T4
@@ -100,11 +107,9 @@ la_exception_entry:
 
 .Lreturn_user:
         # Returning to user mode (PLV3).
-        # Hardware will set DA=0 on ertn, so we need the user page table.
-        la.pcrel $t0, la_user_pgd
-        ld.d    $t1, $t0, 0
-        csrwr   $t1, LA_CSR_PGDL       # set page table low
-        csrwr   $zero, LA_CSR_PGDH     # clear page table high
+        # NOTE: Skip PGDL write — it's already set by la_uvm_switch().
+        # Writing PGDL in QEMU may flush the TLB, destroying entries
+        # we just filled in the TLB refill handler.
 
         # Save kernel SP for the next user→kernel trap.
         # SP currently points to the trap frame; kernel SP is above it.

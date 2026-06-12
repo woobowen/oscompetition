@@ -33,6 +33,10 @@ typedef unsigned long long uint64;
 /* ---- File open flags ---- */
 #define OPEN_READ   0x02
 
+/* openat() dirfd sentinel (asm-generic: syscall 56 is openat, not open).
+ * initcode must pass AT_FDCWD in a0 and the path in a1 to match musl. */
+#define AT_FDCWD    (-100)
+
 /* ---- LoongArch syscall wrappers ---- */
 
 static inline long syscall0(long n)
@@ -160,7 +164,8 @@ static int run_test_entries(const char *dir);
 
 static int run_test_entries(const char *dir)
 {
-    long fd = syscall2(SYS_open, (long)dir, OPEN_READ);
+    /* openat(AT_FDCWD, dir, OPEN_READ, 0) — asm-generic ABI for syscall 56. */
+    long fd = syscall4(SYS_open, AT_FDCWD, (long)dir, OPEN_READ, 0);
     if (fd < 0)
         return 0;
 

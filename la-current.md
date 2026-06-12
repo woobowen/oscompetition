@@ -1,6 +1,6 @@
 # LoongArch (B 线) 内核开发总结
 
-> 最后更新：2026-06-10
+> 最后更新：2026-06-12 16:35
 >
 > 本文档记录 SeaOS 项目 LoongArch 架构（B 线）的当前状态、已完成的工作、设计思路及待完成的任务。
 
@@ -514,34 +514,35 @@ docker exec nostalgic_khayyam bash -c "cd /workspace && make check-la"
 ### 推荐执行顺序
 
 ```
-Step 10 (修EXT4 bug) → Step 11 (脚本执行) → Step 12 (定时器抢占)
-  → Step 13 (动态链接) → Step 14 (管道) → Step 15 (文件写入)
-  → Step 16 (补全syscall) → Step 17 (栈增长) → Step 18 (堆增强)
-  → Step 19 (资源回收) → Step 20 (块缓存) → Step 21 (集成验证)
+✅ Step 10 (修EXT4 bug) → ✅ Step 11 (脚本执行) → ⬜ Step 12 (定时器抢占)
+  → ⬜ Step 13 (动态链接) → ⬜ Step 14 (管道) → ⬜ Step 15 (文件写入)
+  → ⬜ Step 16 (补全syscall) → ⬜ Step 17 (栈增长) → ⬜ Step 18 (堆增强)
+  → ⬜ Step 19 (资源回收) → ⬜ Step 20 (块缓存) → ⬜ Step 21 (集成验证)
 ```
+> Step 10、Step 11 已完成。**当前最短解阻塞路径：Step 17（栈自动增长）+ Step 16（socket syscall）**，二者是 libc-bench 这类重栈/用网络的程序跑通的必要条件。
 
 ---
 
-### Step 10：修复 EXT4 目录枚举 Bug（🔴 P0 阻塞级）
+### Step 10：修复 EXT4 目录枚举 Bug（🔴 P0 阻塞级）— ✅ 已完成（2026-06-12）
 
 **问题**：内核挂载 `sdcard-la.img`（EXT4）成功，但 initcode 的 `SYS_open("/musl")` + `SYS_get_dentries` 返回空结果，导致找不到测试脚本。
 
-**调试方向**：
-1. 在 `fs_la.c` 的 `e4_dir_lookup` 中添加调试输出，确认路径解析能否找到 `/musl`
-2. 检查 `e4_get_dentries` 是否正确遍历 EXT4 目录项
-3. 可能的原因：
-   - `e4_read_file` 读取目录数据失败（间接块映射问题）
-   - EXT4 目录项的 `h.rec_len` 解析有误
-   - 大目录跨越多个块时处理有误
-   - `e4_dir_lookup` 中字符串比较逻辑有 bug
+**实现内容（只读 EXT4 驱动，`fs_la.c`）**：
+1. **自动识别 FS 类型**：按 magic 区分 SeaFS（`disk.img`，magic 0x12341234）与 EXT4（`sdcard-la.img`，magic 0xEF53@superblock+0x438）。
+2. **EXT4 只读栈**：superblock 解析（块大小/inode size/每组 inode 数）→ 组描述符读取 → `e4_read_inode` → **extent 树块映射** `e4_lbn2pb`（支持 `depth>0` 的索引节点 + `depth==0` 叶子 extent，`E4_EXTENTS_FL`/`E4_EXT_MAGIC`）→ `e4_read_file`（按 offset 跨块读取）。
+3. **目录枚举**：`e4_dir_lookup` 线性扫描目录项（按 `h.rec_len` 步进，比对 `name_len` + 名称）；`e4_get_dentries` 把 EXT4 dirent 转成 Linux `dirent64`（19B 头 + 名 + NUL，按 8 对齐）。
+4. **路径解析**：`e4_lookup` 按 `/` 拆分逐级 `e4_dir_lookup`；**相对路径从 `la_fs_cwd_ino` 起查**（为 Step 11 的 `./busybox`、`./libc-bench` 铺路）。
+
+**本轮关键修复**：原先 `e4_get_dentries` 返回空（`rec_len`/跨块解析有误），修后目录枚举可用。
 
 **涉及文件**：`src/kernel/loongarch/fs_la.c`
 
-**验证标准**：用 `sdcard-la.img` 启动，initcode 应输出 `run /musl/unixbench_testcode.sh`
+**验证标准**：用 `sdcard-la.img` 启动，initcode 应输出 `run /musl/unixbench_testcode.sh` ✅
+（实测：`open: '/musl' -> ino=0xc`，`getdents: ino=0xc n=0x3f8`，能扫到 `*_testcode.sh`）
 
 ---
 
-### Step 11：脚本执行支持（#! shebang）（🔴 P0）
+### Step 11：脚本执行支持（#! shebang）（🔴 P0）— ✅ 已完成（2026-06-12）
 
 **问题**：`unixbench_testcode.sh` 第一行是 `#!/bin/bash`，exec 需要识别 shebang 并用 busybox 解释执行。
 
@@ -552,9 +553,25 @@ Step 10 (修EXT4 bug) → Step 11 (脚本执行) → Step 12 (定时器抢占)
 4. 重新构建 argv：`[解释器, 脚本路径, 原argv...]`
 5. 加载解释器 ELF（busybox 是静态链接的）而不是脚本本身
 
-**涉及文件**：`src/kernel/loongarch/exec_la.c`
+**涉及文件**：`src/kernel/loongarch/exec_la.c`、`syscall.c`、`fs_la.c`、`proc.c`、`uvm_la.c`、`tlb_la.c`
 
-**验证标准**：initcode fork 后子进程 exec 脚本不再返回 -1
+**完成情况（实测 `/tmp/la-step11b.log`）**：
+- initcode 扫到 `/musl/libcbench_testcode.sh` → `exec: script ... -> /musl/busybox`，busybox 静态 ELF 正常加载。
+- 脚本命令真实执行：`./busybox echo "#### OS COMP TEST GROUP START libcbench-musl ####"` 成功**打印到串口**，子进程 `exit code=0` 被 `wait4` 正常回收。
+- busybox 继续 `exec ./libc-bench`（**相对路径**解析成功）并加载运行，向 stdout 写出。
+- fork/exec/wait 全链路通；进程 pid 1→5 正常创建/退出。
+
+**本轮修复的连环 bug（Step 11 收尾）**：
+1. **§6 mallocng 崩溃**：根因是 TLB 一致性——所有叶 PTE 带全局位且无 ASID，exec 跨地址空间后残留全局 TLB 条目按 VPPN 别名指向错误物理页。修：`proc.c` 在 `la_proc_return` 与调度器每次进入用户地址空间前都 `la_tlb_inval_all()`；`uvm_la.c` 每次新映射 `la_tlb_inval_page(va)` 防止半对（even/odd）影子。
+2. **"Operation not permitted"（EPERM）掩盖**：`sys_open`/initcode 误用旧 ABI（读 a0 当路径），且失败统一返回 `-1` 被 musl 读成 errno=EPERM。修：`sys_open` 改 openat ABI（a1=路径、a2=flags）；`sys_wait` 无子进程返回 `-ECHILD`、支持 `WNOHANG`；`sys_exec` 失败返回 `-ENOENT`（非 -1）。
+3. **exec 内核栈溢出（4KB 栈）**：`la_do_exec_syscall` 的 `kargv_str[32][128]`（4KB）+ `kargv_ptr/ustr_pos` 局部数组撑爆 4KB 内核栈，第二次 exec 时污染相邻页导致 `la_uva_to_pa` 处取指 ADEF（ecode=8）。修：三大数组改 `static`（与同文件 `script_argv_str`/`tmpbuf2` 一致；exec 单线程、返回用户前独占，安全）。
+4. **相对路径解析**：`fs_la.c` 新增 `la_fs_cwd_ino`，`e4_lookup` 相对路径从当前进程 cwd 起查；`syscall.c` 分发入口发布 `cp->cwd_ino`。`./busybox`、`./libc-bench` 现可解析。
+
+**遗留（属后续 Step，非 Step 11 范围）**：
+- libc-bench 触发 `trap: TLB refill FAIL badv=0x7ffffea5f8`——需要 ~80KB 栈，内核只预分配 8 页（32KB）→ **Step 17 栈自动增长**。
+- `syscall: UNKNOWN #0x42(connect)/#0x71/#0xa9` → libc-bench 用 socket 族调用 → **Step 16 补全 syscall**。
+
+**验证标准**：initcode fork 后子进程 exec 脚本不再返回 -1 ✅（脚本执行机制完整可用）
 
 ---
 
@@ -723,20 +740,23 @@ Step 10 (修EXT4 bug) → Step 11 (脚本执行) → Step 12 (定时器抢占)
 
 ### 实施优先级总览
 
-| Step | 内容             | 优先级   | 预估工作量 | 依赖        |
-| ---- | ---------------- | -------- | ---------- | ----------- |
-| 10   | 修复 EXT4 目录 bug | 🔴 P0  | 小         | 无          |
-| 11   | 脚本执行 shebang | 🔴 P0    | 中         | Step 10     |
-| 12   | 定时器抢占调度   | 🔴 P0    | 小         | 无          |
-| 13   | 动态链接器       | 🟡 P1    | 大（可延后）| Step 11     |
-| 14   | 管道实现         | 🔴 P0    | 中         | Step 11     |
-| 15   | 文件系统写入     | 🔴 P0    | 大         | Step 10     |
-| 16   | 补全关键 syscall | 🟡 P1    | 中         | Step 14, 15 |
-| 17   | 栈自动增长       | 🟡 P1    | 小         | 无          |
-| 18   | 堆管理增强       | 🟢 P2    | 中         | 无          |
-| 19   | 资源回收         | 🟡 P1    | 中         | 无          |
-| 20   | 缓冲区缓存       | 🟢 P2    | 中         | 无          |
-| 21   | 集成验证         | 🔴 P0    | 视情况     | 全部        |
+| Step | 内容             | 优先级   | 预估工作量 | 依赖        | 状态          |
+| ---- | ---------------- | -------- | ---------- | ----------- | ------------- |
+| 10   | 修复 EXT4 目录 bug | 🔴 P0  | 小         | 无          | ✅ 已完成     |
+| 11   | 脚本执行 shebang | 🔴 P0    | 中         | Step 10     | ✅ 已完成     |
+| 12   | 定时器抢占调度   | 🔴 P0    | 小         | 无          | ⬜ 待做       |
+| 13   | 动态链接器       | 🟡 P1    | 大（可延后）| Step 11     | ⬜ 待做       |
+| 14   | 管道实现         | 🔴 P0    | 中         | Step 11     | ⬜ 待做       |
+| 15   | 文件系统写入     | 🔴 P0    | 大         | Step 10     | ⬜ 待做       |
+| 16   | 补全关键 syscall | 🟡 P1    | 中         | Step 14, 15 | ⬜ 待做       |
+| 17   | 栈自动增长       | 🟡 P1    | 小         | 无          | ⬜ 待做（当前阻塞点） |
+| 18   | 堆管理增强       | 🟢 P2    | 中         | 无          | ⬜ 待做       |
+| 19   | 资源回收         | 🟡 P1    | 中         | 无          | ⬜ 待做       |
+| 20   | 缓冲区缓存       | 🟢 P2    | 中         | 无          | ⬜ 待做       |
+| 21   | 集成验证         | 🔴 P0    | 视情况     | 全部        | ⬜ 待做       |
 
->     以上为2026-06-10 21:29内容
+> 2026-06-12 16:36: **下一步建议**：Step 17（栈自动增长，libc-bench 需 ~80KB 栈而内核只预分配 32KB，当前 `TLB refill FAIL` 即此）与 Step 16（socket 族 syscall `#0x42/0x71/0xa9`）是让 libc-bench 类重程序跑通的最短路径；Step 12（定时器抢占）可防止单进程长跑独占 CPU。
+
+>
+>     **2026-06-12 更新**：Step 11（脚本执行 / shebang）已完成并实测验证——busybox 能 `sh` 解释执行 `*_testcode.sh`，echo 子命令成功打印评测标记、wait4 正常回收、相对路径 `exec ./libc-bench` 成功。本轮修复 §6 mallocng TLB 一致性崩溃、EPERM 掩码（openat ABI + 正确 errno）、exec 4KB 内核栈溢出（大数组改 static）、相对路径解析。后续阻塞点已确认为 Step 17（栈自动增长，libc-bench 需 ~80KB 栈）与 Step 16（socket 族 syscall）。
 ---

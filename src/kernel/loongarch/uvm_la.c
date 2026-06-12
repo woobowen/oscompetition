@@ -42,11 +42,15 @@
 #define LA_PTE_NX       (1UL << 62)  /* No Execute */
 #define LA_PTE_NR       (1UL << 61)  /* No Read */
 
-/* Permission shorthand */
-#define LA_PTE_U_RWX    (LA_PTE_V | LA_PTE_D | LA_PTE_PLV_USER | LA_PTE_P)
-#define LA_PTE_U_RX     (LA_PTE_V | LA_PTE_PLV_USER | LA_PTE_P)
-#define LA_PTE_U_RW     (LA_PTE_V | LA_PTE_D | LA_PTE_PLV_USER | LA_PTE_P | LA_PTE_NX)
-#define LA_PTE_K_RW     (LA_PTE_V | LA_PTE_D | LA_PTE_PLV_KERN | LA_PTE_P)
+/* Permission shorthand.
+ * When HPTW is enabled, QEMU's pte_write() checks bit W (bit 8),
+ * NOT bit D (bit 1).  We set both D and W for maximum compatibility. */
+#define LA_PTE_MAT_CC   (1UL << 4)   /* Coherent Cached */
+#define LA_PTE_W        (1UL << 8)   /* Write permission (HPTW mode) */
+#define LA_PTE_U_RWX    (LA_PTE_V | LA_PTE_D | LA_PTE_PLV_USER | LA_PTE_MAT_CC | LA_PTE_P | LA_PTE_W)
+#define LA_PTE_U_RX     (LA_PTE_V | LA_PTE_PLV_USER | LA_PTE_MAT_CC | LA_PTE_P)
+#define LA_PTE_U_RW     (LA_PTE_V | LA_PTE_D | LA_PTE_PLV_USER | LA_PTE_MAT_CC | LA_PTE_P | LA_PTE_W | LA_PTE_NX)
+#define LA_PTE_K_RW     (LA_PTE_V | LA_PTE_D | LA_PTE_PLV_KERN | LA_PTE_MAT_CC | LA_PTE_P | LA_PTE_W)
 
 /* Page table index extraction from virtual address */
 #define LA_VA_DIR2(va)  (((va) >> 30) & 0x1FF)
@@ -58,7 +62,7 @@
 #define LA_PTE_PPN(pte)      ((pte) & ~0xFFFUL)
 
 /*
- * PWCL value for 3-level 4KB page tables with 64-bit PTEs.
+ * PWCL value for 3-level 4KB page tables.
  *
  *   PTbase  = 12  (bits [4:0])   page offset bits
  *   PTwidth = 9   (bits [9:5])   leaf table index width
@@ -66,9 +70,10 @@
  *   Dir1_width = 9 (bits [19:15]) mid table index width
  *   Dir2_base = 30 (bits [24:20]) root table index start
  *   Dir2_width = 9 (bits [29:25]) root table index width
- *   PTEwidth  = 1  (bits [31:30]) 64-bit PTEs
+ *   PTEwidth  = 0  (bits [31:30]) — we do software walks, HPTW unused.
+ *                QEMU rejects value 1 ("128 bit"), so use 0.
  */
-#define LA_PWCL_VAL  ((1UL << 30) | (9UL << 25) | (30UL << 20) | \
+#define LA_PWCL_VAL  ((9UL << 25) | (30UL << 20) | \
                       (9UL << 15) | (21UL << 10) | (9UL << 5)  | 12UL)
 
 /* ---- Globals (used by trap_entry.S) ---- */
@@ -81,7 +86,16 @@ uint64_t *la_uvm_create(void)
     return (uint64_t *)la_pmem_alloc();
 }
 
-/* ---- Walk page table, creating intermediate tables if needed ---- */
+/* ---- Walk page table, creating intermediate tables if needed ----
+ * CRITICAL: Directory PTEs (root/mid levels) store ONLY the physical
+ * address of the next-level table — NO flag bits.  This is required
+ * because QEMU's HW page table walker (loongarch_ptw) does NOT strip
+ * flag bits from directory entries; it uses base | index<<3 directly.
+ * If flags were present, the index would be ORed with the flags,
+ * producing wrong physical addresses.
+ *
+ * Leaf PTEs (level 2) still use the full V|D|PLV|P|W format.
+ */
 static uint64_t *la_uvm_walk(uint64_t *root, uint64_t va, int alloc)
 {
     /* Level 0: root table */
@@ -89,13 +103,13 @@ static uint64_t *la_uvm_walk(uint64_t *root, uint64_t va, int alloc)
     uint64_t pte0 = root[idx0];
     uint64_t *mid;
 
-    if (pte0 & LA_PTE_V) {
-        mid = (uint64_t *)LA_PTE_PPN(pte0);
+    if (pte0) {
+        mid = (uint64_t *)pte0;
     } else {
         if (!alloc) return 0;
         mid = (uint64_t *)la_pmem_alloc();
         if (!mid) return 0;
-        root[idx0] = LA_MK_PTE((uint64_t)mid, LA_PTE_V | LA_PTE_PLV_KERN | LA_PTE_P);
+        root[idx0] = (uint64_t)mid;  /* No flags — just the PA */
     }
 
     /* Level 1: mid table */
@@ -103,13 +117,13 @@ static uint64_t *la_uvm_walk(uint64_t *root, uint64_t va, int alloc)
     uint64_t pte1 = mid[idx1];
     uint64_t *leaf;
 
-    if (pte1 & LA_PTE_V) {
-        leaf = (uint64_t *)LA_PTE_PPN(pte1);
+    if (pte1) {
+        leaf = (uint64_t *)pte1;
     } else {
         if (!alloc) return 0;
         leaf = (uint64_t *)la_pmem_alloc();
         if (!leaf) return 0;
-        mid[idx1] = LA_MK_PTE((uint64_t)leaf, LA_PTE_V | LA_PTE_PLV_KERN | LA_PTE_P);
+        mid[idx1] = (uint64_t)leaf;  /* No flags — just the PA */
     }
 
     /* Level 2: leaf table — return pointer to the PTE */
@@ -128,6 +142,10 @@ int la_uvm_map_page(uint64_t *root, uint64_t va, uint64_t pa, uint64_t perm)
         return -1;
     }
     *pte = LA_MK_PTE(pa, perm);
+    /* A new mapping may share a TLB pair (even/odd) with an entry that a
+     * previous refill wrote with this page marked invalid (V=0).  Drop that
+     * pair so the next access refills both pages from the now-correct PTE. */
+    la_tlb_inval_page(va);
     return 0;
 }
 
@@ -177,7 +195,22 @@ void la_uvm_copy_in(uint64_t *root, uint64_t va, const void *src, uint32_t len)
 void la_uvm_paging_init(void)
 {
     la_csr_write(LA_PWCL_VAL, LA_CSR_PWCL);
-    la_csr_write(0, LA_CSR_PWCH);
+    /* Enable hardware page table walker (HPTW).
+     * HPTW_EN is bit 24 of PWCH (CSR 0x19).
+     * Without HPTW, QEMU never walks the page table on TLB miss — every
+     * miss raises an exception that our software handler must fill.
+     * With HPTW, QEMU walks the page table directly and fills the
+     * cputlb without raising exceptions — eliminating the millions
+     * of TLB refill exceptions for large binaries like busybox. */
+    la_csr_write(1UL << 24, LA_CSR_PWCH);  /* HPTW_EN = 1 */
+    {
+        uint64_t pwch = la_csr_read(LA_CSR_PWCH);
+        la_uart_puts("  uvm: PWCH=");
+        la_uart_put_hex(pwch);
+        la_uart_puts(" (HPTW_EN expect ");
+        la_uart_put_hex(1UL << 24);
+        la_uart_puts(")\n");
+    }
     /* Verify */
     uint64_t pwcl = la_csr_read(LA_CSR_PWCL);
     la_uart_puts("  uvm: PWCL=");
@@ -202,19 +235,20 @@ void la_uvm_switch(uint64_t *pgtbl)
  *  ARE physical addresses.  User VA→PA requires a page table walk.
  * ================================================================ */
 
-/* Walk the page table to translate a user VA to PA.  Returns 0 on fault. */
-static uint64_t la_uva_to_pa(uint64_t *root, uint64_t va)
+/* Walk the page table to translate a user VA to PA.  Returns 0 on fault.
+ * Directory entries are raw PAs (no flags); leaf entries have V|D|PLV|P|W. */
+uint64_t la_uva_to_pa(uint64_t *root, uint64_t va)
 {
     if (!root) return 0;
     uint64_t idx0 = (va >> 30) & 0x1FF;
     uint64_t e0 = root[idx0];
-    if (!(e0 & LA_PTE_V)) return 0;
-    uint64_t *mid = (uint64_t *)LA_PTE_PPN(e0);
+    if (!e0) return 0;
+    uint64_t *mid = (uint64_t *)e0;
 
     uint64_t idx1 = (va >> 21) & 0x1FF;
     uint64_t e1 = mid[idx1];
-    if (!(e1 & LA_PTE_V)) return 0;
-    uint64_t *leaf = (uint64_t *)LA_PTE_PPN(e1);
+    if (!e1) return 0;
+    uint64_t *leaf = (uint64_t *)e1;
 
     uint64_t idx2 = (va >> 12) & 0x1FF;
     uint64_t e2 = leaf[idx2];
@@ -302,27 +336,24 @@ int la_copy_str_from_user(char *kdst, uint64_t usrc, uint32_t max)
 int la_uvm_copy_pgtbl(uint64_t *src, uint64_t *dst)
 {
     for (int i = 0; i < LA_PT_ENTRIES; i++) {
-        if (!(src[i] & LA_PTE_V)) continue;
-        uint64_t *src_mid = (uint64_t *)LA_PTE_PPN(src[i]);
+        if (!src[i]) continue;
+        uint64_t *src_mid = (uint64_t *)src[i];
 
         /* Allocate mid-level table */
         uint64_t *dst_mid = (uint64_t *)la_pmem_alloc();
         if (!dst_mid) return -1;
-        /* Zero it */
         for (int z = 0; z < LA_PT_ENTRIES; z++) dst_mid[z] = 0;
-        dst[i] = LA_MK_PTE((uint64_t)dst_mid,
-                           LA_PTE_V | LA_PTE_PLV_KERN | LA_PTE_P);
+        dst[i] = (uint64_t)dst_mid;  /* No flags — raw PA */
 
         for (int j = 0; j < LA_PT_ENTRIES; j++) {
-            if (!(src_mid[j] & LA_PTE_V)) continue;
-            uint64_t *src_leaf = (uint64_t *)LA_PTE_PPN(src_mid[j]);
+            if (!src_mid[j]) continue;
+            uint64_t *src_leaf = (uint64_t *)src_mid[j];
 
             /* Allocate leaf-level table */
             uint64_t *dst_leaf = (uint64_t *)la_pmem_alloc();
             if (!dst_leaf) return -1;
             for (int z = 0; z < LA_PT_ENTRIES; z++) dst_leaf[z] = 0;
-            dst_mid[j] = LA_MK_PTE((uint64_t)dst_leaf,
-                                   LA_PTE_V | LA_PTE_PLV_KERN | LA_PTE_P);
+            dst_mid[j] = (uint64_t)dst_leaf;  /* No flags — raw PA */
 
             for (int k = 0; k < LA_PT_ENTRIES; k++) {
                 if (!(src_leaf[k] & LA_PTE_V)) continue;

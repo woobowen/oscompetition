@@ -117,20 +117,10 @@ static void __attribute__((used)) la_proc_bootstrap(void)
 static void __attribute__((used)) la_proc_user_bootstrap(void)
 {
     struct la_proc *p = la_current_proc();
-
-    la_uart_puts("  ub: p=");
-    la_uart_put_hex((uint64_t)p);
-    la_uart_puts("\n");
-
     if (!p) {
         la_uart_puts("  ub: p is NULL!\n");
         for (;;) {}
     }
-
-    la_uart_puts("  ub: tf=");
-    la_uart_put_hex((uint64_t)p->tf);
-    la_uart_puts("\n");
-
     if (!p->tf) {
         la_uart_puts("  ub: tf is NULL!\n");
         for (;;) {}
@@ -343,8 +333,17 @@ void la_scheduler(void)
          */
         if (p->is_user) {
             la_trap_ksp = p->kstack + LA_KSTACK_SIZE;
-            if (p->pgtbl)
+            if (p->pgtbl) {
                 la_tlb_active_pgtbl = (uint64_t)p->pgtbl;
+                /* Drop every global TLB entry.  Because all our mappings
+                 * are global and untagged by ASID, entries belonging to a
+                 * different process (or this one's pre-exec image) still
+                 * alias the very same VPPNs the resumed process will use.
+                 * Leaving them in causes non-deterministic wrong-PA loads.
+                 * The process refills what it needs on demand (or via
+                 * la_proc_return's fill on its first run). */
+                la_tlb_inval_all();
+            }
         }
 
         la_swtch(&la_cpu.scheduler_ctx, &p->ctx);
@@ -352,8 +351,13 @@ void la_scheduler(void)
         /* --- back in scheduler --- */
         la_cpu.current = 0;
 
-        if (p->state == LA_PROC_ZOMBIE)
-            la_proc_free(p);
+        if (p->state == LA_PROC_ZOMBIE) {
+            /* Only reap zombies that have no living parent.
+             * Zombies with a parent must stay until the parent
+             * calls sys_wait() to collect the exit status. */
+            if (p->parent_pid == 0 || !la_proc_by_pid(p->parent_pid))
+                la_proc_free(p);
+        }
     }
 }
 
@@ -384,25 +388,30 @@ void la_proc_return(struct la_trap_frame *tf)
     if (p && p->pgtbl) {
         la_uvm_switch(p->pgtbl);
 
-        /* Pre-fill TLB entries for all mapped user pages.
-         * After ertn, DA becomes 0 (paging enabled), so the TLB
-         * must already contain translations for user code & stack. */
+        /* ALWAYS invalidate the whole TLB before refilling.
+         *
+         * All our leaf PTEs are loaded with the G (global) bit and we use
+         * NO per-address-space ASID, so TLB entries are NOT tagged by
+         * process.  Entries left over from a previous image — e.g. the
+         * parent's (initcode) stack at the SAME virtual address the new
+         * image (busybox) reuses — survive across exec/fork and create
+         * DUPLICATE entries for one VPPN.  A TLB lookup may then return
+         * either the stale or the fresh entry non-deterministically, so a
+         * user load (notably musl reading AT_RANDOM to derive mallocng's
+         * ctx.secret) can hit the wrong physical page and corrupt heap
+         * metadata, crashing busybox in get_meta()'s secret check.
+         *
+         * Invalidating here guarantees only this image's mappings remain. */
         la_tlb_inval_all();
-        int n = la_tlb_fill_all(p->pgtbl);
-        la_uart_puts("  proc_return: filled ");
-        la_uart_put_hex(n);
-        la_uart_puts(" TLB entries\n");
+        la_tlb_fill_all(p->pgtbl);
     }
 
     /* Save kernel SP for next user→kernel trap */
     if (p)
         la_trap_ksp = p->kstack + LA_KSTACK_SIZE;
 
-    /* Test: switch DA=0 here (DMW0 provides kernel identity mapping).
-     * If DMW0 is working, the print after csrwr should appear. */
-    la_uart_puts("  proc_return: switching DA=0 PG=1\n");
+    /* Switch DA=0 PG=1 — DMW0 provides kernel identity mapping. */
     la_csr_write(LA_CRMD_PG | LA_CRMD_IE, LA_CSR_CRMD);   /* PLV=0, IE=1, DA=0, PG=1 */
-    la_uart_puts("  proc_return: DA=0 PG=1 ok, entering userret\n");
 
     la_user_return(tf);
     for (;;) {}

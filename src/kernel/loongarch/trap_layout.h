@@ -128,3 +128,6 @@
 #define LA_CTX_SIZE 96
 
 #endif
+#define LA_CSR_KS0 0x30
+#define LA_CSR_KS1 0x31
+

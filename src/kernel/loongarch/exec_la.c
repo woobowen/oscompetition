@@ -15,10 +15,10 @@
 #include "trap.h"
 
 /* ---- PTE permission flags (LoongArch TLBELO format) ----
- *   V=bit0, D=bit1, PLV=bits[3:2], P=bit7
- *   User RWX: V|D|PLV=3|P = 0x01|0x02|0x0C|0x80 = 0x8F
+ *   V=bit0, D=bit1, PLV=bits[3:2], P=bit7, W=bit8
+ *   User RWX: V|D|PLV=3|P|W = 0x01|0x02|0x0C|0x80|0x100 = 0x19F
  */
-#define EXE_PTE_U_RWX  0x8FUL
+#define EXE_PTE_U_RWX  0x19FUL
 
 /* ---- LoongArch ELF header constants ---- */
 #define LA_ELF_MAGIC   0x464C457FUL   /* "\x7fELF" */
@@ -67,6 +67,100 @@ struct la_elf_phdr {
 /* ---- Forward declarations ---- */
 extern uint64_t la_user_pgd;
 extern uint64_t la_trap_ksp;
+
+/* ---- Script execution helpers ---- */
+
+/* Check if path ends with ".sh" */
+static int la_is_script_path(const char *path)
+{
+    int len = 0;
+    while (path[len]) len++;
+    return len >= 3 && path[len-3] == '.' && path[len-2] == 's' && path[len-1] == 'h';
+}
+
+/* Parse #!shebang from file content.
+ * Returns 0 on success, -1 if no valid shebang. */
+static int la_parse_shebang(uint32_t ino, char *interp, int interp_sz,
+                             char *interp_arg, int arg_sz)
+{
+    char buf[128];
+    uint32_t n = la_fs_read_file(ino, 0, buf, sizeof(buf) - 1);
+    if (n < 2) return -1;
+    buf[n] = '\0';
+
+    if (buf[0] != '#' || buf[1] != '!') return -1;
+
+    int i = 2;
+    while (buf[i] == ' ' || buf[i] == '\t') i++;
+
+    int j = 0;
+    while (buf[i] && buf[i] != ' ' && buf[i] != '\t' && buf[i] != '\n' && j < interp_sz - 1)
+        interp[j++] = buf[i++];
+    interp[j] = '\0';
+    if (j == 0) return -1;
+
+    while (buf[i] == ' ' || buf[i] == '\t') i++;
+
+    j = 0;
+    while (buf[i] && buf[i] != '\n' && j < arg_sz - 1)
+        interp_arg[j++] = buf[i++];
+    interp_arg[j] = '\0';
+    return 0;
+}
+
+/* Try to find a working script interpreter.
+ * Checks shebang interpreter first, then falls back to busybox/sh candidates.
+ * Returns 0 on success with resolved_path/resolved_arg filled. */
+static int la_pick_interpreter(const char *shebang_interp, const char *shebang_arg,
+                               char *resolved_path, int rpath_sz,
+                               char *resolved_arg, int rarg_sz)
+{
+    /* Candidate interpreters: (path, arg) pairs */
+    struct { const char *path; const char *arg; } candidates[8];
+    int count = 0;
+
+    /* If shebang specified an interpreter, try it first */
+    if (shebang_interp && shebang_interp[0]) {
+        candidates[count].path = shebang_interp;
+        candidates[count].arg = (shebang_arg && shebang_arg[0]) ? shebang_arg : "";
+        count++;
+    }
+
+    /* Fallback candidates */
+    candidates[count].path = "/busybox";        candidates[count].arg = "sh"; count++;
+    candidates[count].path = "/musl/busybox";   candidates[count].arg = "sh"; count++;
+    candidates[count].path = "/glibc/busybox";  candidates[count].arg = "sh"; count++;
+    candidates[count].path = "/bin/busybox";    candidates[count].arg = "sh"; count++;
+
+    for (int i = 0; i < count; i++) {
+        uint32_t ino;
+        if (la_fs_lookup((char *)candidates[i].path, &ino) < 0)
+            continue;
+
+        /* Verify it's a valid ELF */
+        struct la_elf_ehdr eh;
+        uint32_t n = la_fs_read_file(ino, 0, &eh, sizeof(eh));
+        if (n != sizeof(eh) || *(uint32_t *)eh.e_ident != LA_ELF_MAGIC)
+            continue;
+
+        /* Copy resolved path */
+        int j = 0;
+        while (candidates[i].path[j] && j < rpath_sz - 1) {
+            resolved_path[j] = candidates[i].path[j];
+            j++;
+        }
+        resolved_path[j] = '\0';
+
+        j = 0;
+        while (candidates[i].arg[j] && j < rarg_sz - 1) {
+            resolved_arg[j] = candidates[i].arg[j];
+            j++;
+        }
+        resolved_arg[j] = '\0';
+        return 0;
+    }
+    return -1;
+}
 
 /*
  * Create the first user process from the embedded initcode.
@@ -329,8 +423,93 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
     if (n != sizeof(eh))
         return (uint64_t)-1;
 
-    if (*((uint32_t *)eh.e_ident) != LA_ELF_MAGIC)
-        return (uint64_t)-1;
+    if (*((uint32_t *)eh.e_ident) != LA_ELF_MAGIC) {
+        /* Not ELF — check if it's a script (.sh file) */
+        if (!la_is_script_path(path))
+            return (uint64_t)-1;
+
+        /* Parse shebang */
+        char shebang_interp[128], shebang_arg[128];
+        shebang_interp[0] = shebang_arg[0] = '\0';
+        la_parse_shebang(ino, shebang_interp, sizeof(shebang_interp),
+                         shebang_arg, sizeof(shebang_arg));
+
+        /* Find a working interpreter */
+        char resolved_interp[128], resolved_arg[128];
+        if (la_pick_interpreter(shebang_interp, shebang_arg,
+                                resolved_interp, sizeof(resolved_interp),
+                                resolved_arg, sizeof(resolved_arg)) < 0) {
+            la_uart_puts("  exec: no interpreter for script ");
+            la_uart_puts(path);
+            la_uart_puts("\n");
+            return (uint64_t)-1;
+        }
+
+        la_uart_puts("  exec: script ");
+        la_uart_puts(path);
+        la_uart_puts(" -> ");
+        la_uart_puts(resolved_interp);
+        la_uart_puts("\n");
+
+        /* Build new argv on the current user stack:
+         *   [resolved_interp, resolved_arg, path, NULL]
+         * The old user address space is still active, so we can write to it.
+         * Linux convention: execve(interp, [interp, arg, script, ...], envp) */
+        {
+            uint64_t user_sp = tf->gpr[LA_GPR_SP];
+
+            /* argv strings: interp, arg, script_path */
+            static char script_argv_str[3][128];
+            int slens[3];
+
+            /* String 0: interpreter path (argv[0]) */
+            int l0 = 0;
+            while (resolved_interp[l0] && l0 < 127) { script_argv_str[0][l0] = resolved_interp[l0]; l0++; }
+            script_argv_str[0][l0] = '\0';
+            slens[0] = l0 + 1;
+
+            /* String 1: shebang arg or "sh" fallback */
+            int l1 = 0;
+            if (resolved_arg[0]) {
+                while (resolved_arg[l1] && l1 < 127) { script_argv_str[1][l1] = resolved_arg[l1]; l1++; }
+            } else {
+                script_argv_str[1][0] = 's'; script_argv_str[1][1] = 'h'; l1 = 2;
+            }
+            script_argv_str[1][l1] = '\0';
+            slens[1] = l1 + 1;
+
+            /* String 2: original script path */
+            int l2 = 0;
+            while (path[l2] && l2 < 127) { script_argv_str[2][l2] = path[l2]; l2++; }
+            script_argv_str[2][l2] = '\0';
+            slens[2] = l2 + 1;
+
+            /* Push strings onto user stack (growing downward) */
+            uint64_t ustr_pos[3];
+            for (int i = 2; i >= 0; i--) {
+                user_sp -= (uint64_t)slens[i];
+                user_sp &= ~7ULL;  /* 8-byte align */
+                la_copy_to_user(user_sp, script_argv_str[i], slens[i]);
+                ustr_pos[i] = user_sp;
+            }
+
+            /* Push argv pointer array: [ptr0, ptr1, ptr2, NULL] */
+            user_sp &= ~7ULL;
+            uint64_t zero_val = 0;
+            user_sp -= 8;
+            la_copy_to_user(user_sp, &zero_val, 8);  /* NULL terminator */
+
+            for (int i = 2; i >= 0; i--) {
+                user_sp -= 8;
+                la_copy_to_user(user_sp, &ustr_pos[i], 8);
+            }
+
+            /* Update SP in trap frame for the recursive call */
+            tf->gpr[LA_GPR_SP] = user_sp;
+
+            return la_do_exec_syscall(tf, resolved_interp, user_sp);
+        }
+    }
 
     if (eh.e_machine != LA_EM_LOONGARCH)
         return (uint64_t)-1;
@@ -340,6 +519,14 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
     if (!new_pgtbl) return (uint64_t)-1;
 
     /* Load PT_LOAD segments */
+    la_uart_puts("  exec: entry=");
+    la_uart_put_hex(eh.e_entry);
+    la_uart_puts(" phnum=");
+    la_uart_put_hex(eh.e_phnum);
+    la_uart_puts("\n");
+
+    uint64_t ph_first_vaddr = 0;
+    uint64_t max_vaddr = 0;  /* track highest VA+memsz for heap_top init */
     for (int i = 0; i < eh.e_phnum; i++) {
         struct la_elf_phdr ph;
         uint64_t ph_off = eh.e_phoff + i * eh.e_phentsize;
@@ -349,12 +536,44 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
         if (ph.p_type != LA_ELF_PROG_LOAD || ph.p_memsz == 0)
             continue;
 
+        if (ph_first_vaddr == 0) ph_first_vaddr = ph.p_vaddr & ~0xFFFUL;
+
+        /* Track highest virtual address for heap initialization */
+        {
+            uint64_t seg_end = ph.p_vaddr + ph.p_memsz;
+            if (seg_end > max_vaddr) max_vaddr = seg_end;
+        }
+
+        la_uart_puts("  exec: LOAD va=");
+        la_uart_put_hex(ph.p_vaddr);
+        la_uart_puts(" filesz=");
+        la_uart_put_hex(ph.p_filesz);
+        la_uart_puts(" memsz=");
+        la_uart_put_hex(ph.p_memsz);
+        la_uart_puts("\n");
+
         /* Map pages */
         uint64_t va = ph.p_vaddr & ~0xFFFUL;
         uint64_t va_end = (ph.p_vaddr + ph.p_memsz + 0xFFF) & ~0xFFFUL;
         for (; va < va_end; va += LA_PGSIZE) {
             if (la_uvm_alloc_page(new_pgtbl, va, EXE_PTE_U_RWX) == 0)
                 goto exec_fail;
+        }
+
+        /* Zero ALL pages for this segment (BSS + any padding).
+         * Without this, global variables in BSS contain garbage
+         * from previously-used physical pages. */
+        {
+            uint64_t zva = ph.p_vaddr & ~0xFFFUL;
+            while (zva < va_end) {
+                uint64_t pa = la_uva_to_pa(new_pgtbl, zva);
+                if (pa) {
+                    uint8_t *px = (uint8_t *)pa;
+                    for (int z = 0; z < (int)LA_PGSIZE; z++)
+                        px[z] = 0;
+                }
+                zva += LA_PGSIZE;
+            }
         }
 
         /* Read segment data */
@@ -375,17 +594,59 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
         }
     }
 
-    /* Allocate stack (2 pages for argv space) */
+    /* Verify: read back first bytes from first LOAD page */
+    {
+        uint64_t check_va = ph_first_vaddr;
+        uint64_t pa = la_uva_to_pa(new_pgtbl, check_va);
+        if (pa) {
+            uint32_t *w = (uint32_t *)pa;
+            if (w[0] != 0x464c457f) {
+                la_uart_puts("  exec: BAD ELF magic at first page!\n");
+                goto exec_fail;
+            }
+        }
+    }
+    /* Allocate stack (8 pages, including top page for busybox argv/envp scan) */
     uint64_t stack_top = LA_USER_STACK;
-    uint64_t stack_base = stack_top - LA_PGSIZE;
-    if (la_uvm_alloc_page(new_pgtbl, stack_base, EXE_PTE_U_RWX) == 0)
-        goto exec_fail;
+    for (int si = 0; si < 8; si++) {
+        uint64_t va = stack_top - (uint64_t)si * LA_PGSIZE;
+        uint64_t pa = la_uvm_alloc_page(new_pgtbl, va, EXE_PTE_U_RWX);
+        if (pa == 0)
+            goto exec_fail;
+        /* Zero the stack page to prevent garbage auxv/envp data */
+        uint8_t *p = (uint8_t *)pa;
+        for (int z = 0; z < (int)LA_PGSIZE; z++)
+            p[z] = 0;
+    }
+
+    /* Initialize heap_top to the end of the highest LOAD segment, page-aligned.
+     * brk(0) returns this so busybox knows where heap starts. */
+    if (max_vaddr > 0) {
+        p->heap_top = (max_vaddr + LA_PGSIZE - 1) & ~((uint64_t)LA_PGSIZE - 1);
+    } else {
+        p->heap_top = 0x400000ULL;  /* fallback: 4MB */
+    }
+    /* mmap uses a SEPARATE address region (high, growing up) so it never
+     * collides with the brk heap (which grows up from heap_top).
+     * Linux keeps brk and mmap in disjoint ranges; mapping mmap onto the
+     * heap corrupts musl's malloc metadata. */
+    p->mmap_top = LA_MMAP_BASE;
+    la_uart_puts("  exec: heap_top=");
+    la_uart_put_hex(p->heap_top);
+    la_uart_puts("\n");
 
     /* ---- Set up argv on the user stack ---- */
-    /* Copy argv strings from user space */
+    /* Copy argv strings from user space.
+     * NOTE: these buffers (~4.6 KB total) are declared `static` to keep them
+     * OFF the 4 KB kernel stack — a stack-local array this large overflows
+     * the stack, corrupts an adjacent page, and on the 2nd exec causes a
+     * wild return / ADEF deep in a callee (la_uva_to_pa).  exec is
+     * single-threaded per process (one CPU, no preemption) and these are
+     * only touched in the ELF path before returning to user, so static
+     * storage is safe here (same pattern as script_argv_str / tmpbuf2). */
     #define MAX_EXEC_ARGS 32
-    char kargv_str[MAX_EXEC_ARGS][128];
-    uint64_t kargv_ptr[MAX_EXEC_ARGS];
+    static char kargv_str[MAX_EXEC_ARGS][128];
+    static uint64_t kargv_ptr[MAX_EXEC_ARGS];
     int argc = 0;
 
     if (uargv) {
@@ -405,7 +666,7 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
     uint64_t sp = stack_top;
 
     /* Push string data (growing downward) */
-    uint64_t ustr_pos[MAX_EXEC_ARGS];
+    static uint64_t ustr_pos[MAX_EXEC_ARGS];
     for (int i = argc - 1; i >= 0; i--) {
         int slen = 0;
         while (kargv_str[i][slen]) slen++;
@@ -417,12 +678,93 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
         ustr_pos[i] = sp;
     }
 
-    /* Align sp for argv array */
+    /* Align sp for the stack frame */
     sp &= ~7ULL;
 
-    /* Push argv pointers (NULL terminated) */
-    sp -= 8; /* NULL terminator */
+    /* ---- Push auxv ---- */
+    /* Auxiliary vector: a contiguous array of (type, value) pairs,
+     * terminated by AT_NULL.  musl / ld parse it linearly from low to
+     * high address until they hit AT_NULL. */
+    #define AT_NULL   0
+    #define AT_PHDR   3
+    #define AT_PHNUM  5
+    #define AT_PAGESZ 6
+    #define AT_ENTRY  9
+    #define AT_UID    11
+    #define AT_EUID   12
+    #define AT_GID    13
+    #define AT_EGID   14
+    #define AT_RANDOM 25
+
+    /* AT_RANDOM points to 16 bytes of random data used to initialise
+     * the stack canary and musl mallocng's secret.  CRITICAL: those 16
+     * bytes must NOT sit inside the auxv array — otherwise the loader
+     * mistakes them for an auxv entry (type = low byte of the random
+     * data).  If that byte happens to equal a known AT_* value (e.g.
+     * AT_RANDOM=25) it corrupts libc initialisation: the canary and the
+     * mallocng secret become garbage, malloc's get_meta() consistency
+     * check then fails, and musl deliberately crashes (a_crash → badv=0).
+     * We therefore push the random bytes ABOVE the AT_NULL terminator,
+     * where the loader never parses them. */
+    sp -= 16;                       /* 16 random bytes — highest on stack */
+    uint64_t at_rand_base = sp;
+    uint64_t seed = 0xDEADBEEFCAFEBABEULL;
+    seed ^= (uint64_t)new_pgtbl;
+    seed ^= sp;
+    seed ^= (uint64_t)&la_kernel_end;
+    {
+        uint64_t rand_data[2] = { seed, seed * 6364136223846793005ULL + 1ULL };
+        la_uvm_copy_in(new_pgtbl, sp, rand_data, 16);
+    }
+    /* DIAGNOSTIC: read back the seed from user memory to confirm AT_RANDOM
+     * actually points at our random bytes (not leftover kernel/stack data). */
+    {
+        uint64_t rpa = la_uva_to_pa(new_pgtbl, at_rand_base);
+        la_uart_puts("  exec: AT_RANDOM@");
+        la_uart_put_hex(at_rand_base);
+        la_uart_puts(" seed=");
+        la_uart_put_hex(seed);
+        la_uart_puts(" pa=");
+        la_uart_put_hex(rpa);
+        if (rpa) {
+            la_uart_puts(" rb=[");
+            la_uart_put_hex(*(uint64_t *)rpa);
+            la_uart_puts(",");
+            la_uart_put_hex(*((uint64_t *)rpa + 1));
+            la_uart_puts("]");
+        }
+        la_uart_puts("\n");
+    }
+
+    /* AT_NULL terminator — top of the auxv array, ends parsing. */
+    sp -= 16;
+    { uint64_t a[2] = { AT_NULL, 0 };           la_uvm_copy_in(new_pgtbl, sp, a, 16); }
+
+    /* Remaining auxv entries (order is irrelevant to the loader). */
+    sp -= 16; { uint64_t a[2] = { AT_EGID,  0 };            la_uvm_copy_in(new_pgtbl, sp, a, 16); }
+    sp -= 16; { uint64_t a[2] = { AT_GID,   0 };            la_uvm_copy_in(new_pgtbl, sp, a, 16); }
+    sp -= 16; { uint64_t a[2] = { AT_EUID,  0 };            la_uvm_copy_in(new_pgtbl, sp, a, 16); }
+    sp -= 16; { uint64_t a[2] = { AT_UID,   0 };            la_uvm_copy_in(new_pgtbl, sp, a, 16); }
+    sp -= 16; { uint64_t a[2] = { AT_ENTRY, eh.e_entry };   la_uvm_copy_in(new_pgtbl, sp, a, 16); }
+    sp -= 16; { uint64_t a[2] = { AT_PHNUM, eh.e_phnum };   la_uvm_copy_in(new_pgtbl, sp, a, 16); }
+    {
+        uint64_t at_phdr = ph_first_vaddr + eh.e_phoff;
+        sp -= 16; { uint64_t a[2] = { AT_PHDR, at_phdr };   la_uvm_copy_in(new_pgtbl, sp, a, 16); }
+    }
+    sp -= 16; { uint64_t a[2] = { AT_PAGESZ, LA_PGSIZE };  la_uvm_copy_in(new_pgtbl, sp, a, 16); }
+
+    /* AT_RANDOM header — lowest auxv entry (first one musl sees after
+     * the envp NULL).  Its value points up to the random bytes. */
+    sp -= 16;
+    { uint64_t a[2] = { AT_RANDOM, at_rand_base }; la_uvm_copy_in(new_pgtbl, sp, a, 16); }
+
+    /* ---- Push envp (empty — just NULL terminator) ---- */
+    sp -= 8;
     uint64_t zero = 0;
+    la_uvm_copy_in(new_pgtbl, sp, &zero, 8);
+
+    /* ---- Push argv pointers (NULL terminated) ---- */
+    sp -= 8; /* NULL terminator */
     la_uvm_copy_in(new_pgtbl, sp, &zero, 8);
 
     for (int i = argc - 1; i >= 0; i--) {
@@ -431,6 +773,14 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
     }
 
     uint64_t argv_uaddr = sp;
+
+    /* ---- Push argc (at the very bottom) ----
+     * Linux ABI: sp+0 = argc, sp+8 = argv[0], ...
+     * The C runtime (_start) reads argc from *(sp) and argv from sp+8.
+     * $a0 = argc, $a1 = &argv[0] = sp + 8. */
+    sp -= 8;
+    uint64_t argc64 = (uint64_t)argc;
+    la_uvm_copy_in(new_pgtbl, sp, &argc64, 8);
 
     /* ---- Update process ---- */
     /* TODO: free old page table */
@@ -447,9 +797,26 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
     while (d < e) *d++ = 0;
 
     new_tf->era = eh.e_entry;
-    new_tf->gpr[LA_GPR_SP] = sp;
+    new_tf->gpr[LA_GPR_SP] = sp;              /* sp points to argc on stack */
     new_tf->gpr[LA_GPR_A0] = (uint64_t)argc;
-    new_tf->gpr[LA_GPR_A1] = argv_uaddr;
+    new_tf->gpr[LA_GPR_A1] = argv_uaddr;      /* &argv[0] = sp + 8 */
+
+    la_uart_puts("  exec: era=");
+    la_uart_put_hex(eh.e_entry);
+    la_uart_puts(" sp=");
+    la_uart_put_hex(sp);
+    la_uart_puts(" argc=");
+    la_uart_put_hex(argc);
+    la_uart_puts(" argv_uaddr=");
+    la_uart_put_hex(argv_uaddr);
+    la_uart_puts("\n");
+    for (int i = 0; i < argc && i < 8; i++) {
+        la_uart_puts("    argv[");
+        la_uart_put_hex(i);
+        la_uart_puts("]='");
+        la_uart_puts(kargv_str[i]);
+        la_uart_puts("'\n");
+    }
 
     /* Save kernel SP for trap handler */
     la_trap_ksp = p->kstack + LA_KSTACK_SIZE;
@@ -457,9 +824,41 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
     /* Switch page table and return to user mode */
     if (p->pgtbl) {
         la_uvm_switch(p->pgtbl);
+
+        /* Update the active page table for the TLB refill handler.
+         * Without this, TLB refills would walk the OLD page table
+         * (from before exec) and fail to find the new mappings. */
+        la_tlb_active_pgtbl = (uint64_t)p->pgtbl;
+
+        /* Invalidate all TLB entries, then pre-fill ALL mapped pages
+         * into the STLB (2048 entries).  la_tlb_fill_all uses the
+         * normal (non-ISTLBR) tlbfill path, writing TLBEHI/TLBIDX/TLBELO.
+         * Note: la_tlb_refill_one uses the ISTLBR path (TLBREHI/TLBRELO)
+         * which is wrong here since ISTLBR=0 during exec. */
         la_tlb_inval_all();
-        la_tlb_fill_all(p->pgtbl);
+        int nfills = la_tlb_fill_all(new_pgtbl);
+        la_uart_puts("  exec: pre-filled ");
+        la_uart_put_hex(nfills);
+        la_uart_puts(" TLB pairs\n");
     }
+
+    /* CRITICAL: Set DA=0, PG=1 before returning to user mode.
+     * Without this, CRMD.DA stays 1 (from boot) and the CPU uses
+     * DA mode (direct addressing) instead of TLB-based paging.
+     * In DA mode at PLV3, DMW0 doesn't match → all user addresses
+     * cause ADEF (BADADDR).  proc.c:la_proc_return() does this,
+     * but exec bypasses proc_return. */
+    {
+        uint64_t pre_crmd = la_csr_read(LA_CSR_CRMD);
+        la_uart_puts("  pre-crmd=");
+        la_uart_put_hex(pre_crmd);
+        la_csr_write(LA_CRMD_PG | LA_CRMD_IE, LA_CSR_CRMD);
+        uint64_t post_crmd = la_csr_read(LA_CSR_CRMD);
+        la_uart_puts(" post-crmd=");
+        la_uart_put_hex(post_crmd);
+        la_uart_puts("\n");
+    }
+
     la_user_return(new_tf);
 
     /* Never reached */
