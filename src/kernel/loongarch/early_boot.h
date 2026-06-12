@@ -70,6 +70,7 @@ void la_timer_init(void);
 
 /* ---- Timer interrupt handler (called from trap_dispatch) ---- */
 void la_timer_interrupt(void);
+uint64_t la_timer_get_ticks(void);     /* monotonic tick counter (100 Hz) */
 
 /* ---- Physical memory allocator ---- */
 void *la_pmem_alloc(void);

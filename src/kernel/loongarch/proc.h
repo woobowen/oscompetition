@@ -43,12 +43,27 @@ struct la_context {
 #define LA_FD_UNUSED  0
 #define LA_FD_CONSOLE 1   /* stdin/stdout/stderr → UART */
 #define LA_FD_FILE    2   /* regular file on filesystem */
+#define LA_FD_PIPE    3   /* pipe (read end or write end) */
+
+/* ---- Pipe ---- */
+#define LA_PIPE_SIZE   4096
+#define LA_NPIPE       32
+
+struct la_pipe {
+    char data[LA_PIPE_SIZE];   /* circular buffer */
+    uint32_t nread;            /* total bytes read (monotonic; mod PIPE_SIZE) */
+    uint32_t nwrite;           /* total bytes written (monotonic) */
+    int readopen;              /* refcount of open read-end fds */
+    int writeopen;             /* refcount of open write-end fds */
+    int used;                  /* 1 = allocated from the pool */
+};
 
 struct la_fd {
     uint32_t ino;            /* inode number (0 = unused) */
     uint32_t offset;         /* current read/write offset */
-    int type;                /* LA_FD_UNUSED/CONSOLE/FILE */
+    int type;                /* LA_FD_UNUSED/CONSOLE/FILE/PIPE */
     int writable;            /* 1 = write allowed */
+    struct la_pipe *pipe;    /* pipe object (valid when type == LA_FD_PIPE) */
 };
 
 /* Shared address-space state (heap + mmap cursors).
@@ -58,6 +73,51 @@ struct la_fd {
 struct la_mm {
     uint64_t heap_top;         /* user heap top (brk grows up from here) */
     uint64_t mmap_top;         /* mmap region (grows up, separate from heap) */
+};
+
+/* Signal action structure (matches Linux sigaction ABI — 32 bytes).
+ * When handler == 0: SIG_DFL (default action).
+ * When handler == 1: SIG_IGN (ignore).
+ * restorer is the user-space trampoline that calls rt_sigreturn. */
+#define LA_NSIG   32
+#define LA_SIG_DFL 0
+#define LA_SIG_IGN 1
+
+/* Signal numbers (Linux generic ABI) */
+#define LA_SIGHUP    1
+#define LA_SIGINT    2
+#define LA_SIGQUIT   3
+#define LA_SIGILL    4
+#define LA_SIGTRAP   5
+#define LA_SIGABRT   6
+#define LA_SIGBUS    7
+#define LA_SIGFPE    8
+#define LA_SIGKILL   9
+#define LA_SIGUSR1  10
+#define LA_SIGSEGV  11
+#define LA_SIGUSR2  12
+#define LA_SIGPIPE  13
+#define LA_SIGALRM  14
+#define LA_SIGTERM  15
+#define LA_SIGCHLD  17
+#define LA_SIGCONT  18
+#define LA_SIGSTOP  19
+
+struct la_sigaction {
+    uint64_t handler;     /* signal handler address (SIG_DFL/SIG_IGN or function) */
+    uint64_t flags;       /* SA_SIGINFO etc. */
+    uint64_t restorer;    /* user-space sigreturn trampoline address */
+    uint64_t mask;        /* additional signals blocked during handler */
+};
+
+/* Signal frame saved on the user stack when a signal is delivered.
+ * Must be 16-byte aligned on LoongArch. */
+struct la_sigframe {
+    /* saved registers */
+    uint64_t gpr[32];
+    uint64_t era;
+    /* delivery metadata */
+    uint64_t sig;          /* signal number */
 };
 
 /* ---- Process control block ---- */
@@ -82,6 +142,11 @@ struct la_proc {
                                 * free pgtbl on reap — owned by the leader) */
     uint64_t clear_child_tid;  /* user VA of cleartid word (0 = none) */
     void  *wait_chan;          /* futex sleep channel (0 = pid-wakeup sleeper) */
+
+    /* Signal handling */
+    uint64_t sig_pending;      /* bitmap of pending signals */
+    uint64_t sig_mask;         /* bitmap of blocked signals */
+    struct la_sigaction sig_actions[LA_NSIG];
 
     /* Process relationships */
     int parent_pid;            /* parent's PID (0 for first process) */
@@ -116,6 +181,10 @@ void la_proc_exit(int code) __attribute__((noreturn));
 struct la_proc *la_proc_create_kthread(void (*entry)(void), const char *name);
 struct la_proc *la_proc_create_user(const char *name);
 struct la_proc *la_current_proc(void);
+
+/* ---- Signal delivery (called from trap.c before returning to user) ---- */
+int la_signal_pending(struct la_trap_frame *tf);
+void la_signal_deliver(struct la_trap_frame *tf);
 
 /* ---- Sleep / wakeup ---- */
 void la_proc_sleep(void);

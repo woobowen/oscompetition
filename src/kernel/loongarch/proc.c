@@ -51,6 +51,14 @@ static struct la_proc *la_proc_alloc(void)
         p->shared_vm = 0;
         p->clear_child_tid = 0;
         p->wait_chan = 0;
+        p->sig_pending = 0;
+        p->sig_mask    = 0;
+        for (int s = 0; s < LA_NSIG; s++) {
+            p->sig_actions[s].handler  = LA_SIG_DFL;
+            p->sig_actions[s].flags    = 0;
+            p->sig_actions[s].restorer = 0;
+            p->sig_actions[s].mask     = 0;
+        }
         p->parent_pid = 0;
         p->exit_code  = 0;
         p->cwd_ino    = 0;       /* caller must set to root ino */
@@ -573,4 +581,138 @@ void la_proc_return(struct la_trap_frame *tf)
 
     la_user_return(tf);
     for (;;) {}
+}
+
+/* ---- Signal delivery ----
+ *
+ * Called from trap.c BEFORE returning to user mode (after syscall
+ * dispatch or interrupt handling).  Checks for pending non-blocked
+ * signals and, if one exists, saves the current register state as a
+ * signal frame on the user stack and redirects execution to the
+ * registered handler (or performs the default action).
+ *
+ * Returns 1 if a signal was delivered (caller must re-enter the signal
+ * check via ertn to the handler), 0 if nothing is pending.  */
+
+int la_signal_pending(struct la_trap_frame *tf)
+{
+    struct la_proc *p = la_current_proc();
+    if (!p || !p->is_user) return 0;
+
+    uint64_t pending = p->sig_pending & ~p->sig_mask;
+
+    /* SIGKILL and SIGSTOP are always delivered */
+    pending |= (p->sig_pending & (1UL << LA_SIGKILL));
+    pending |= (p->sig_pending & (1UL << LA_SIGSTOP));
+
+    if (pending == 0) return 0;
+    return 1;
+}
+
+void la_signal_deliver(struct la_trap_frame *tf)
+{
+    struct la_proc *p = la_current_proc();
+    if (!p || !p->is_user || !p->pgtbl) return;
+
+    uint64_t pending = p->sig_pending & ~p->sig_mask;
+    /* Always deliver SIGKILL and SIGSTOP */
+    pending |= (p->sig_pending & (1UL << LA_SIGKILL));
+    pending |= (p->sig_pending & (1UL << LA_SIGSTOP));
+
+    if (pending == 0) return;
+
+    /* Find the lowest-numbered pending signal */
+    int sig = 0;
+    for (int s = 1; s < LA_NSIG; s++) {
+        if (pending & (1UL << s)) { sig = s; break; }
+    }
+    if (sig == 0) return;
+
+    p->sig_pending &= ~(1UL << sig);
+
+    /* Default actions */
+    if (p->sig_actions[sig].handler == LA_SIG_DFL) {
+        /* Most signals terminate the process by default.
+         * SIGCHLD, SIGCONT, SIGURG are ignored by default.
+         * SIGSTOP/SIGTSTP stop by default. */
+        if (sig == LA_SIGCHLD || sig == LA_SIGCONT) {
+            return;  /* default: ignore */
+        }
+        /* Default: terminate */
+        la_uart_puts("  signal: default kill sig=");
+        la_uart_put_hex(sig);
+        la_uart_puts("\n");
+        la_proc_exit(-sig);
+        /* not reached */
+    }
+
+    if (p->sig_actions[sig].handler == LA_SIG_IGN) {
+        return;  /* explicitly ignored */
+    }
+
+    /* ---- Deliver the signal: build sigframe on user stack ---- */
+
+    /* Allocate space below the current user SP.
+     * The frame must be 16-byte aligned (LoongArch ABI). */
+    uint64_t old_sp = tf->gpr[LA_GPR_SP];
+    uint64_t sf_size = (sizeof(struct la_sigframe) + 15) & ~15UL;
+    uint64_t new_sp = old_sp - sf_size;
+
+    /* Build the sigframe in a kernel buffer, then copy to user stack */
+    struct la_sigframe sf;
+    for (int i = 0; i < 32; i++) sf.gpr[i] = tf->gpr[i];
+    sf.era     = tf->era;   /* save original PC */
+    sf.sig     = (uint64_t)sig;
+
+    la_copy_to_user(new_sp, &sf, sizeof(sf));
+
+    /* Set up the child's context to run the signal handler:
+     *   a0 = signal number (first argument to handler)
+     *   a1 = siginfo pointer (NULL for now — simplified)
+     *   a2 = ucontext pointer (NULL for now)
+     *   ra = restorer address (user-space trampoline → rt_sigreturn)
+     *   era = handler address
+     *   sp = new stack pointer (bottom of sigframe) */
+    tf->gpr[LA_GPR_SP] = new_sp;
+    tf->gpr[LA_GPR_A0] = (uint64_t)sig;
+    tf->gpr[LA_GPR_A1] = 0;  /* no siginfo */
+    tf->gpr[LA_GPR_A2] = 0;  /* no ucontext */
+    tf->gpr[LA_GPR_RA] = p->sig_actions[sig].restorer;
+    tf->era = p->sig_actions[sig].handler;
+    /* The dispatcher will add 4 to era, so subtract 4 here so that the
+     * net result is era = handler address (the dispatcher's +4 is undone
+     * by entering the handler at exactly the right address).  Actually,
+     * for signal delivery we want era = handler EXACTLY — not handler+4.
+     * The trap.c path does tf->era += 4, so... hmm, signal delivery is
+     * called BEFORE the dispatcher advances era?  Let me verify.
+     *
+     * Actually, signal delivery is called from trap.c AFTER the TLB-refill
+     * check but the syscall path (ecode==SYS) already handles the era
+     * advance.  For signals delivered to a process that just made a
+     * syscall, the dispatcher has not yet returned — the signal check
+     * happens inside la_trap_dispatch, after syscall handling?  No —
+     * it happens as part of trap.c's exit path.
+     *
+     * The current flow: trap_dispatch → [syscall / timer / refill] → return.
+     * Signal check must be inserted BETWEEN the dispatch and the return.
+     * For the syscall path: dispatcher sets a0 = ret, era += 4, returns.
+     * signal check runs AFTER this, so era is already advanced.
+     * If we set era = handler, we override the already-advanced era.
+     * So we DO want era = handler (not handler+4), and we must NOT
+     * have the dispatcher advance it again.  Since signal delivery
+     * runs after the dispatcher, we just set era directly.
+     *
+     * But wait — for the ISTLBR (TLB refill) path, the trap handler
+     * does NOT advance era (it just returns with ISTLBR set so ertn
+     * re-executes the faulting instruction).  Signal delivery after
+     * a TLB refill would set era = handler, which is correct.
+     *
+     * For the general-exception path: the dispatch returns, era was
+     * NOT advanced (non-syscall exception).  Signal delivery sets
+     * era = handler directly.  Also correct.
+     *
+     * For the syscall path: era was already advanced by the dispatcher.
+     * We override it with handler.  Correct — handler runs, returns
+     * to restorer → rt_sigreturn restores the ORIGINAL context which
+     * was saved in the sigframe. */
 }

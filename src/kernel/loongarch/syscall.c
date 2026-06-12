@@ -41,6 +41,8 @@
 /* Additional LoongArch syscalls needed by busybox */
 #define SYS_set_tid_address  96
 #define SYS_set_robust_list  99
+#define SYS_writev          66   /* scatter/gather write */
+#define SYS_getcpu          168  /* get CPU number */
 #define SYS_futex            98
 #define SYS_nanosleep       101
 #define SYS_clock_gettime   113
@@ -69,8 +71,33 @@
 #define SYS_fcntl            25
 #define SYS_sched_yield     124
 #define SYS_prlimit64       261
-#define SYS_setrlimit       139
-#define SYS_getrlimit       140
+
+/* Signal syscalls (LoongArch generic ABI) */
+#define SYS_kill            129
+#define SYS_tgkill          131
+#define SYS_rt_sigreturn    139  /* note: NOT setrlimit — LoongArch has no setrlimit */
+
+/* Scheduling / time / info */
+#define SYS_sched_setaffinity 122
+#define SYS_sched_getaffinity 123
+#define SYS_sched_setscheduler 119
+#define SYS_times           153
+#define SYS_gettimeofday    169
+
+/* Select / poll */
+#define SYS_pselect6         72
+#define SYS_ppoll            73
+
+/* Socket family (198–207, return -ENOSYS stubs for now) */
+#define SYS_socket          198
+#define SYS_bind            200
+#define SYS_listen          201
+#define SYS_accept          202
+#define SYS_connect         203
+#define SYS_sendto          206
+#define SYS_recvfrom        207
+#define SYS_getsockname     204
+#define SYS_getpeername     205
 
 #define LA_ENOSYS 38
 
@@ -92,6 +119,7 @@
 #define LA_ENOTDIR 20
 #define LA_EISDIR  21
 #define LA_EINVAL  22
+#define LA_ESRCH    3
 #define LA_EMFILE  24
 #define LA_ENOSPC  28
 #define LA_ESPIPE  29
@@ -100,6 +128,63 @@
 /* ---- Root inode numbers (set by fs_la.c after mount) ---- */
 #define LA_ROOT_INO_SEA  0
 #define LA_ROOT_INO_E4   2
+
+/* ---- Pipe pool ---- */
+static struct la_pipe la_pipes[LA_NPIPE];
+
+/* Allocate a free pipe slot from the static pool.  Returns NULL when
+ * exhausted — caller should return -ENOMEM / -EMFILE. */
+static struct la_pipe *la_pipe_alloc(void)
+{
+    for (int i = 0; i < LA_NPIPE; i++) {
+        if (!la_pipes[i].used) {
+            struct la_pipe *p = &la_pipes[i];
+            p->used      = 1;
+            p->nread     = 0;
+            p->nwrite    = 0;
+            p->readopen  = 0;   /* caller sets per-end ref counts */
+            p->writeopen = 0;
+            return p;
+        }
+    }
+    return 0;
+}
+
+/* Release a pipe slot back to the pool.  Only call when both ends
+ * are fully closed (readopen == 0 && writeopen == 0). */
+static void la_pipe_close_end(struct la_proc *proc, int fd)
+{
+    struct la_pipe *pi = proc->fds[fd].pipe;
+    if (!pi) return;
+
+    if (proc->fds[fd].writable) {
+        pi->writeopen--;
+        if (pi->writeopen == 0)
+            la_proc_wakeup_chan(&pi->nread);   /* EOF for blocked readers */
+    } else {
+        pi->readopen--;
+        if (pi->readopen == 0)
+            la_proc_wakeup_chan(&pi->nwrite);  /* broken pipe for writers */
+    }
+
+    /* Last end closed — free the pipe slot. */
+    if (pi->readopen == 0 && pi->writeopen == 0)
+        pi->used = 0;
+}
+
+/* After fork/clone copies fd table entries, bump pipe ref counts for
+ * every inherited pipe fd so the pipe object knows each end is shared. */
+static void la_pipe_dup_all(struct la_proc *child)
+{
+    for (int i = 0; i < LA_NFD; i++) {
+        if (child->fds[i].type != LA_FD_PIPE || !child->fds[i].pipe)
+            continue;
+        if (child->fds[i].writable)
+            child->fds[i].pipe->writeopen++;
+        else
+            child->fds[i].pipe->readopen++;
+    }
+}
 
 /* ================================================================
  *  Syscall implementations
@@ -163,6 +248,58 @@ static uint64_t sys_write(struct la_trap_frame *tf)
         return written;
     }
 
+    /* Pipe write */
+    if (fd >= 0 && fd < LA_NFD && p->fds[fd].type == LA_FD_PIPE) {
+        struct la_pipe *pi = p->fds[fd].pipe;
+        if (!pi || !p->fds[fd].writable)
+            return (uint64_t)-1;
+
+        uint32_t done = 0;
+        while (done < len) {
+            /* If no reader left, return -1 (broken pipe).
+             * Wake any blocked reader first so it can drain. */
+            if (pi->readopen == 0) {
+                la_proc_wakeup_chan(&pi->nread);
+                return done > 0 ? (uint64_t)done : (uint64_t)-1;
+            }
+
+            /* Wait while buffer full, but only if a reader exists. */
+            while (pi->nwrite == pi->nread + LA_PIPE_SIZE
+                   && pi->readopen > 0)
+                la_proc_sleep_chan(&pi->nwrite);
+            if (pi->readopen == 0)
+                continue;   /* re-check after wake (reader gone) */
+
+            /* How much space is left in the pipe? */
+            uint32_t space = LA_PIPE_SIZE
+                           - (pi->nwrite - pi->nread);
+            uint32_t chunk = len - done;
+            if (chunk > space) chunk = space;
+
+            /* Copy from user buffer into the circular pipe buffer,
+             * wrapping at the end if needed. */
+            uint32_t wi = pi->nwrite % LA_PIPE_SIZE;
+            if (wi + chunk > LA_PIPE_SIZE) {
+                /* Write wraps around buffer end */
+                uint32_t first = LA_PIPE_SIZE - wi;
+                la_copy_from_user(&pi->data[wi],
+                                  buf + done, first);
+                la_copy_from_user(&pi->data[0],
+                                  buf + done + first,
+                                  chunk - first);
+            } else {
+                la_copy_from_user(&pi->data[wi],
+                                  buf + done, chunk);
+            }
+            pi->nwrite += chunk;
+            done += chunk;
+
+            /* Wake any blocked reader */
+            la_proc_wakeup_chan(&pi->nread);
+        }
+        return done;
+    }
+
     /* File fd */
     if (fd < 0 || fd >= LA_NFD || p->fds[fd].type != LA_FD_FILE)
         return (uint64_t)-1;
@@ -187,6 +324,42 @@ static uint64_t sys_read(struct la_trap_frame *tf)
     /* Console stdin — no input available */
     if (p->fds[fd].type == LA_FD_CONSOLE)
         return 0;
+
+    /* Pipe read */
+    if (p->fds[fd].type == LA_FD_PIPE) {
+        struct la_pipe *pi = p->fds[fd].pipe;
+        if (!pi || p->fds[fd].writable)
+            return (uint64_t)-1;   /* read from write-end is invalid */
+
+        /* Block until data is available or the write end closes. */
+        while (pi->nread == pi->nwrite && pi->writeopen > 0)
+            la_proc_sleep_chan(&pi->nread);
+
+        uint32_t avail = pi->nwrite - pi->nread;
+        if (avail == 0)
+            return 0;   /* EOF — no writers left, buffer empty */
+
+        uint32_t chunk = avail;
+        if (chunk > len) chunk = len;
+
+        /* Copy directly from pipe buffer to user, wrapping if needed. */
+        uint32_t ri = pi->nread % LA_PIPE_SIZE;
+        uint32_t done = 0;
+        while (done < chunk) {
+            uint32_t seg = chunk - done;
+            if (ri + seg > LA_PIPE_SIZE)
+                seg = LA_PIPE_SIZE - ri;   /* wrap at end */
+            la_copy_to_user(buf + done, &pi->data[ri], seg);
+            done += seg;
+            ri = (ri + seg) % LA_PIPE_SIZE;
+        }
+        pi->nread += chunk;
+
+        /* Wake any blocked writer (now has more buffer space). */
+        la_proc_wakeup_chan(&pi->nwrite);
+
+        return chunk;
+    }
 
     /* File fd */
     if (p->fds[fd].type != LA_FD_FILE)
@@ -279,10 +452,17 @@ static uint64_t sys_close(struct la_trap_frame *tf)
     if (p->fds[fd].type == LA_FD_UNUSED)
         return (uint64_t)-1;
 
+    /* Pipe cleanup: decrement the appropriate end's refcount,
+     * wake the other end if this was the last open descriptor,
+     * and free the pipe struct when both ends are fully closed. */
+    if (p->fds[fd].type == LA_FD_PIPE && p->fds[fd].pipe)
+        la_pipe_close_end(p, fd);
+
     p->fds[fd].ino = 0;
     p->fds[fd].offset = 0;
     p->fds[fd].type = LA_FD_UNUSED;
     p->fds[fd].writable = 0;
+    p->fds[fd].pipe = 0;
     return 0;
 }
 
@@ -467,6 +647,10 @@ static uint64_t sys_fork(struct la_trap_frame *tf)
     for (int i = 0; i < LA_NFD; i++)
         child->fds[i] = parent->fds[i];
 
+    /* Bump pipe-end reference counts so the pipe object knows both
+     * parent and child hold open ends (for correct EOF / refcounting). */
+    la_pipe_dup_all(child);
+
     /* Inherit other state */
     child->parent_pid = parent->pid;
     child->__mm.heap_top   = parent->mm->heap_top;
@@ -477,6 +661,12 @@ static uint64_t sys_fork(struct la_trap_frame *tf)
     child->shared_vm  = 0;
     child->clear_child_tid = 0;
     child->mm         = &child->__mm;
+
+    /* Inherit signal state */
+    child->sig_pending = parent->sig_pending;
+    child->sig_mask    = parent->sig_mask;
+    for (int s = 0; s < LA_NSIG; s++)
+        child->sig_actions[s] = parent->sig_actions[s];
 
     return (uint64_t)child->pid;
 }
@@ -791,23 +981,141 @@ static uint64_t sys_futex(struct la_trap_frame *tf)
     return 0;
 }
 
-/* SYS_rt_sigaction: set signal handler (stub) */
+/* SYS_rt_sigaction(134): register a signal handler.
+ *   a0 = signum, a1 = *act (or NULL to query), a2 = *oldact (or NULL),
+ *   a3 = sigsetsize (must be 8)
+ * The sigaction struct is { handler(8), flags(8), restorer(8), mask(8) }.
+ * SIGKILL(9) and SIGSTOP(19) cannot be caught or ignored. */
 static uint64_t sys_rt_sigaction(struct la_trap_frame *tf)
 {
-    (void)tf;
+    int signum       = (int)tf->gpr[LA_GPR_A0];
+    uint64_t uact    = tf->gpr[LA_GPR_A1];
+    uint64_t uoldact = tf->gpr[LA_GPR_A2];
+    uint64_t sigsetsize = tf->gpr[LA_GPR_A3];
+    struct la_proc *p = la_current_proc();
+
+    if (!p || signum < 1 || signum >= LA_NSIG || sigsetsize != 8)
+        return (uint64_t)(-LA_EINVAL);
+    if (signum == LA_SIGKILL || signum == LA_SIGSTOP)
+        return (uint64_t)(-LA_EINVAL);
+
+    /* Read old action for query */
+    if (uoldact) {
+        struct la_sigaction old = p->sig_actions[signum];
+        la_copy_to_user(uoldact, &old, sizeof(old));
+    }
+
+    /* Set new handler */
+    if (uact) {
+        struct la_sigaction new;
+        if (la_copy_from_user(&new, uact, sizeof(new)) != sizeof(new))
+            return (uint64_t)(-LA_EFAULT);
+        p->sig_actions[signum] = new;
+    }
     return 0;
 }
 
-/* SYS_rt_sigprocmask: change signal mask (stub) */
+/* SYS_rt_sigprocmask(135): examine or change the blocked signal mask.
+ *   a0 = how (0=SIG_BLOCK, 1=SIG_UNBLOCK, 2=SIG_SETMASK)
+ *   a1 = *set (or NULL), a2 = *oldset (or NULL), a3 = sigsetsize (must be 8) */
 static uint64_t sys_rt_sigprocmask(struct la_trap_frame *tf)
 {
-    /* If oset pointer is non-NULL, write empty signal mask */
-    uint64_t oset = tf->gpr[LA_GPR_A1];
-    if (oset) {
-        uint64_t empty_mask = 0;
-        la_copy_to_user(oset, &empty_mask, 8);
+    int how          = (int)tf->gpr[LA_GPR_A0];
+    uint64_t uset    = tf->gpr[LA_GPR_A1];
+    uint64_t uoldset = tf->gpr[LA_GPR_A2];
+    uint64_t sigsetsize = tf->gpr[LA_GPR_A3];
+    struct la_proc *p = la_current_proc();
+
+    if (!p || sigsetsize != 8)
+        return (uint64_t)(-LA_EINVAL);
+
+    /* Read old mask */
+    if (uoldset)
+        la_copy_to_user(uoldset, &p->sig_mask, sizeof(p->sig_mask));
+
+    if (!uset) return 0;  /* just querying */
+
+    uint64_t set = 0;
+    if (la_copy_from_user(&set, uset, sizeof(set)) != sizeof(set))
+        return (uint64_t)(-LA_EFAULT);
+
+    if (how == 0)        p->sig_mask |= set;        /* SIG_BLOCK */
+    else if (how == 1)   p->sig_mask &= ~set;       /* SIG_UNBLOCK */
+    else if (how == 2)   p->sig_mask = set;         /* SIG_SETMASK */
+    else                 return (uint64_t)(-LA_EINVAL);
+
+    p->sig_mask &= ~(1UL << LA_SIGKILL);   /* SIGKILL unblockable */
+    p->sig_mask &= ~(1UL << LA_SIGSTOP);   /* SIGSTOP unblockable */
+    return 0;
+}
+
+/* SYS_kill(129): send a signal to a process.
+ * a0 = pid, a1 = sig.  Only pid > 0 and sig 1–31 are supported. */
+static uint64_t sys_kill(struct la_trap_frame *tf)
+{
+    int pid  = (int)tf->gpr[LA_GPR_A0];
+    int sig  = (int)tf->gpr[LA_GPR_A1];
+
+    if (sig < 1 || sig >= LA_NSIG) return (uint64_t)(-LA_EINVAL);
+
+    struct la_proc *target = la_proc_by_pid(pid);
+    if (!target) return (uint64_t)(-LA_ESRCH);
+
+    /* Set the pending bit.  If the target is sleeping on a wait_chan,
+     * wake it so it can check signals on its way back to user mode. */
+    target->sig_pending |= (1UL << sig);
+    if (target->state == LA_PROC_SLEEPING) {
+        target->state = LA_PROC_RUNNABLE;
     }
     return 0;
+}
+
+/* SYS_tgkill(131): send a signal to a specific thread.
+ * a0 = tgid, a1 = tid, a2 = sig.  Simplified — same as kill(tid, sig). */
+static uint64_t sys_tgkill(struct la_trap_frame *tf)
+{
+    /* int tgid = (int)tf->gpr[LA_GPR_A0]; */  /* ignored */
+    int tid  = (int)tf->gpr[LA_GPR_A1];
+    int sig  = (int)tf->gpr[LA_GPR_A2];
+
+    if (sig < 1 || sig >= LA_NSIG) return (uint64_t)(-LA_EINVAL);
+
+    struct la_proc *target = la_proc_by_pid(tid);
+    if (!target) return (uint64_t)(-LA_ESRCH);
+
+    target->sig_pending |= (1UL << sig);
+    if (target->state == LA_PROC_SLEEPING)
+        target->state = LA_PROC_RUNNABLE;
+    return 0;
+}
+
+/* SYS_rt_sigreturn(139): restore context after a signal handler returns.
+ * The signal frame was pushed onto the user stack by la_signal_deliver.
+ * Reads it back, restores the original trap frame, and the dispatcher's
+ * ertn resumes the original execution where it was interrupted.
+ *
+ * NOTE: we set tf->era = sf.era - 4 because trap.c's syscall path
+ * unconditionally does tf->era += 4 after this function returns,
+ * so the net effect is era = sf.era (the original interrupted PC). */
+static uint64_t sys_rt_sigreturn(struct la_trap_frame *tf)
+{
+    struct la_proc *p = la_current_proc();
+    if (!p || !p->pgtbl) return (uint64_t)-1;
+
+    uint64_t frame_va = tf->gpr[LA_GPR_SP];
+
+    struct la_sigframe sf;
+    if (la_copy_from_user(&sf, frame_va, sizeof(sf)) != sizeof(sf))
+        return (uint64_t)-1;
+
+    /* Restore all 32 GPRs and ERA from the saved sigframe.
+     * Subtract 4 from era because the dispatcher adds 4 unconditionally. */
+    for (int i = 0; i < 32; i++)
+        tf->gpr[i] = sf.gpr[i];
+    tf->era = sf.era - LA_SYSCALL_INSN_SIZE;
+
+    /* Return the original a0 so the dispatcher writes it back */
+    return sf.gpr[LA_GPR_A0];
 }
 
 /* SYS_msync: synchronize file mapping (stub) */
@@ -1041,11 +1349,64 @@ static uint64_t __attribute__((noreturn)) sys_exit_group(struct la_trap_frame *t
     __builtin_unreachable();
 }
 
-/* SYS_pipe2: create pipe (stub — return -ENOSYS) */
+/* SYS_pipe2: create a pipe (circular buffer, blocking read/write).
+ *
+ *   a0 = user-space int fds[2]
+ *   a1 = flags (O_CLOEXEC=0x80000, O_NONBLOCK=0x800; we ignore both)
+ *
+ * Allocates one pipe object and two file descriptors (fd0=read,
+ * fd1=write).  A reader blocks on empty buffer until a writer produces
+ * data or closes the write end.  A writer blocks on full buffer until a
+ * reader drains data or closes the read end — in which case write
+ * returns -1 (broken pipe).  Fork and clone inherit pipe fds; the
+ * kernel tracks per-end refcounts so both parent and child can use the
+ * pipe independently. */
 static uint64_t sys_pipe2(struct la_trap_frame *tf)
 {
-    (void)tf;
-    return (uint64_t)(-LA_ENOSYS);
+    uint64_t ufdarray = tf->gpr[LA_GPR_A0];
+    /* int flags = (int)tf->gpr[LA_GPR_A1]; */
+    struct la_proc *p = la_current_proc();
+
+    if (!p || !ufdarray) return (uint64_t)-1;
+
+    struct la_pipe *pi = la_pipe_alloc();
+    if (!pi) return (uint64_t)-1;
+
+    /* Find two free file descriptors */
+    int fd0 = -1, fd1 = -1;
+    for (int i = 0; i < LA_NFD; i++) {
+        if (p->fds[i].type == LA_FD_UNUSED) {
+            if (fd0 < 0)      fd0 = i;
+            else if (fd1 < 0) { fd1 = i; break; }
+        }
+    }
+    if (fd1 < 0) {
+        pi->used = 0;
+        return (uint64_t)-1;
+    }
+
+    /* Read end (fd0) */
+    pi->readopen  = 1;
+    pi->writeopen = 1;
+
+    p->fds[fd0].type     = LA_FD_PIPE;
+    p->fds[fd0].pipe     = pi;
+    p->fds[fd0].writable = 0;
+    p->fds[fd0].ino      = 0;
+    p->fds[fd0].offset   = 0;
+
+    /* Write end (fd1) */
+    p->fds[fd1].type     = LA_FD_PIPE;
+    p->fds[fd1].pipe     = pi;
+    p->fds[fd1].writable = 1;
+    p->fds[fd1].ino      = 0;
+    p->fds[fd1].offset   = 0;
+
+    /* Copy fds to user-space int[2] */
+    int fdarray[2] = { fd0, fd1 };
+    la_copy_to_user(ufdarray, fdarray, sizeof(fdarray));
+
+    return 0;
 }
 
 /* SYS_dup3: duplicate fd with flags */
@@ -1165,7 +1526,16 @@ static uint64_t sys_clone(struct la_trap_frame *tf)
     for (int i = 0; i < LA_NFD; i++)
         child->fds[i] = parent->fds[i];
 
+    /* Bump pipe-end reference counts for inherited pipe fds. */
+    la_pipe_dup_all(child);
+
     child->cwd_ino = parent->cwd_ino;
+
+    /* Inherit signal state */
+    child->sig_pending = parent->sig_pending;
+    child->sig_mask    = parent->sig_mask;
+    for (int s = 0; s < LA_NSIG; s++)
+        child->sig_actions[s] = parent->sig_actions[s];
 
     /* tid pointers */
     child->clear_child_tid = (flags & 0x00200000UL) ? ctid : 0;
@@ -1279,16 +1649,135 @@ static uint64_t sys_prlimit64(struct la_trap_frame *tf)
     return 0;
 }
 
-/* SYS_setrlimit / SYS_getrlimit: resource limits (stub) */
-static uint64_t sys_setrlimit(struct la_trap_frame *tf) { (void)tf; return 0; }
-static uint64_t sys_getrlimit(struct la_trap_frame *tf)
+/* SYS_writev(66): scatter/gather write — write multiple buffers at once.
+ *   a0 = fd, a1 = iovec ptr, a2 = iov count
+ * Each iovec entry is { void *iov_base; size_t iov_len; }.
+ * Iterates all iovec entries and writes each buffer sequentially. */
+static uint64_t sys_writev(struct la_trap_frame *tf)
 {
-    uint64_t urlim = tf->gpr[LA_GPR_A1];
-    if (urlim) {
-        uint64_t lim[2] = {(uint64_t)-1, (uint64_t)-1}; /* RLIM_INFINITY */
-        la_copy_to_user(urlim, lim, 16);
+    int fd        = (int)tf->gpr[LA_GPR_A0];
+    uint64_t uiov  = tf->gpr[LA_GPR_A1];
+    int iovcnt    = (int)tf->gpr[LA_GPR_A2];
+    struct la_proc *p = la_current_proc();
+
+    if (!p) return (uint64_t)-1;
+    if (fd < 0 || fd >= LA_NFD) return (uint64_t)-1;
+    if (iovcnt <= 0) return 0;
+
+    uint64_t total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        /* iovec = { iov_base (8 bytes), iov_len (8 bytes) } */
+        uint8_t iov[16];
+        if (la_copy_from_user(iov, uiov + i * 16UL, 16) != 16)
+            break;
+        uint64_t base = *(uint64_t *)&iov[0];
+        uint64_t len  = *(uint64_t *)&iov[8];
+
+        if (len == 0) continue;
+
+        /* Re-use the existing write path per-buffer.
+         * We build a mini trap frame so sys_write sees the right args. */
+        struct la_trap_frame wtf = *tf;
+        wtf.gpr[LA_GPR_A1] = base;
+        wtf.gpr[LA_GPR_A2] = (uint64_t)(uint32_t)len;
+        uint64_t n = sys_write(&wtf);
+        if (n > (uint64_t)len) break;   /* error */
+        total += n;
+        if (n < len) break;             /* short write — stop */
+    }
+    return total;
+}
+
+/* SYS_clock_gettime(113): get clock time.
+ *   a0 = clock_id, a1 = struct timespec *tp (16 bytes: tv_sec + tv_nsec)
+ * Returns 0 on success.  Only CLOCK_MONOTONIC(1) / CLOCK_REALTIME(0)
+ * are supported; returns time based on the kernel tick counter. */
+static uint64_t sys_clock_gettime(struct la_trap_frame *tf)
+{
+    uint64_t clock_id = tf->gpr[LA_GPR_A0];
+    uint64_t utp      = tf->gpr[LA_GPR_A1];
+    struct la_proc *p  = la_current_proc();
+
+    if (!p || !utp) return (uint64_t)-1;
+
+    /* Our timer runs at 100 Hz; each tick = 10 ms.
+     * tv_sec = ticks/100, tv_nsec = (ticks%100) * 10_000_000 */
+    uint64_t ticks = la_timer_get_ticks();
+    uint64_t sec   = ticks / 100;
+    uint64_t nsec  = (ticks % 100) * 10000000UL;
+
+    /* struct timespec: tv_sec (8 bytes) + tv_nsec (8 bytes) */
+    uint64_t ts[2] = { sec, nsec };
+    la_copy_to_user(utp, ts, sizeof(ts));
+    (void)clock_id;
+    return 0;
+}
+
+/* SYS_getcpu(169): get CPU and NUMA node.
+ *   a0 = *cpu, a1 = *node, a2 = tcache (ignored)
+ * Returns 0.  Single-CPU kernel — always cpu=0, node=0. */
+static uint64_t sys_getcpu(struct la_trap_frame *tf)
+{
+    uint64_t ucpu = tf->gpr[LA_GPR_A0];
+    uint64_t unode = tf->gpr[LA_GPR_A1];
+    uint32_t zero = 0;
+
+    if (ucpu)
+        la_copy_to_user(ucpu, &zero, sizeof(zero));
+    if (unode)
+        la_copy_to_user(unode, &zero, sizeof(zero));
+    return 0;
+}
+
+/* ---- Minimal stubs for socket / sched / select / times ----
+ * These return -ENOSYS so programs degrade gracefully.  Real
+ * implementations are planned for later steps (loopback socket
+ * for iperf/netperf, select/poll for lmbench, scheduler for
+ * cyclictest).  */
+
+static uint64_t sys_stub_enosys(struct la_trap_frame *tf) { (void)tf; return (uint64_t)(-LA_ENOSYS); }
+static uint64_t sys_gettimeofday(struct la_trap_frame *tf)
+{
+    /* Return time based on ticks (same as clock_gettime). */
+    uint64_t utv = tf->gpr[LA_GPR_A0];
+    /* uint64_t utz = tf->gpr[LA_GPR_A1]; */  /* timezone, ignored */
+    if (!utv) return 0;
+    uint64_t ticks = la_timer_get_ticks();
+    uint64_t sec  = ticks / 100;
+    uint64_t usec = (ticks % 100) * 10000UL;
+    uint64_t tv[2] = { sec, usec };
+    la_copy_to_user(utv, tv, sizeof(tv));
+    return 0;
+}
+static uint64_t sys_times(struct la_trap_frame *tf)
+{
+    uint64_t ubuf = tf->gpr[LA_GPR_A0];
+    if (ubuf) {
+        /* Return 0 for all fields (simplified). */
+        uint64_t tms[4] = { 0, 0, 0, 0 };
+        la_copy_to_user(ubuf, tms, sizeof(tms));
     }
     return 0;
+}
+static uint64_t sys_sched_setaffinity(struct la_trap_frame *tf)
+{
+    /* Single CPU — always succeed. */
+    (void)tf;
+    return 0;
+}
+static uint64_t sys_sched_getaffinity(struct la_trap_frame *tf)
+{
+    uint64_t ubuf = tf->gpr[LA_GPR_A2];
+    if (ubuf) {
+        uint64_t mask = 1;  /* CPU 0 only */
+        la_copy_to_user(ubuf, &mask, 8);
+    }
+    return 0;
+}
+static uint64_t sys_sched_setscheduler(struct la_trap_frame *tf)
+{
+    (void)tf;
+    return 0;   /* accept any policy */
 }
 
 /* SYS_shutdown: halt the system */
@@ -1384,6 +1873,11 @@ uint64_t la_syscall_dispatch(struct la_trap_frame *tf)
     case SYS_set_robust_list: return sys_set_robust_list(tf);
     case SYS_futex:      return sys_futex(tf);
 
+    /* Signal */
+    case SYS_kill:       return sys_kill(tf);
+    case SYS_tgkill:     return sys_tgkill(tf);
+    case SYS_rt_sigreturn: return sys_rt_sigreturn(tf);
+
     /* File info */
     case SYS_statx:      return sys_statx(tf);
     case SYS_uname:      return sys_uname(tf);
@@ -1391,10 +1885,33 @@ uint64_t la_syscall_dispatch(struct la_trap_frame *tf)
     /* Other stubs */
     case SYS_msync:      return sys_msync(tf);
     case SYS_pipe2:      return sys_pipe2(tf);
+    case SYS_writev:     return sys_writev(tf);
     case SYS_sched_yield: return sys_sched_yield(tf);
-    case SYS_setrlimit:  return sys_setrlimit(tf);
-    case SYS_getrlimit:  return sys_getrlimit(tf);
     case SYS_prlimit64:  return sys_prlimit64(tf);
+    case SYS_clock_gettime: return sys_clock_gettime(tf);
+    case SYS_getcpu:     return sys_getcpu(tf);
+    case SYS_gettimeofday: return sys_gettimeofday(tf);
+    case SYS_times:      return sys_times(tf);
+
+    /* Scheduler (minimal) */
+    case SYS_sched_setaffinity: return sys_sched_setaffinity(tf);
+    case SYS_sched_getaffinity: return sys_sched_getaffinity(tf);
+    case SYS_sched_setscheduler: return sys_sched_setscheduler(tf);
+
+    /* Select / poll */
+    case SYS_pselect6:   return sys_stub_enosys(tf);
+    case SYS_ppoll:      return sys_stub_enosys(tf);
+
+    /* Socket family (ENOSYS stubs for now) */
+    case SYS_socket:     return sys_stub_enosys(tf);
+    case SYS_bind:       return sys_stub_enosys(tf);
+    case SYS_listen:     return sys_stub_enosys(tf);
+    case SYS_accept:     return sys_stub_enosys(tf);
+    case SYS_connect:    return sys_stub_enosys(tf);
+    case SYS_sendto:     return sys_stub_enosys(tf);
+    case SYS_recvfrom:   return sys_stub_enosys(tf);
+    case SYS_getsockname: return sys_stub_enosys(tf);
+    case SYS_getpeername: return sys_stub_enosys(tf);
 
     /* System */
     case SYS_shutdown:   return sys_shutdown();

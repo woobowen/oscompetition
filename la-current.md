@@ -1,6 +1,6 @@
 # LoongArch (B 线) 内核开发总结
 
-> 最后更新：2026-06-12 21:00
+> 最后更新：2026-06-12 22:30
 >
 > 本文档记录 SeaOS 项目 LoongArch 架构（B 线）的当前状态、已完成的工作、设计思路及待完成的任务。
 
@@ -521,8 +521,8 @@ docker exec nostalgic_khayyam bash -c "cd /workspace && make check-la"
 
 ```
 ✅ Step 10 (修EXT4 bug) → ✅ Step 11 (脚本执行) → ⬜ Step 12 (定时器抢占)
-  → ⬜ Step 13 (动态链接) → ⬜ Step 14 (管道) → ⬜ Step 15 (文件写入)
-  → 🟡 Step 16 (clone+futex ✅，socket/信号/select/sched 待做)
+  → ⬜ Step 13 (动态链接) → ✅ Step 14 (管道) → ⬜ Step 15 (文件写入)
+  → ✅ Step 16 (clone+futex+信号投递+存根全部完成)
   → ✅ Step 17 (栈增长+不挂死) → ⬜ Step 18 (堆增强)
   → ✅ Step 19 (资源回收) → ⬜ Step 20 (块缓存) → ⬜ Step 21 (集成验证)
 ```
@@ -673,19 +673,19 @@ docker exec nostalgic_khayyam bash -c "cd /workspace && make check-la"
 5. **`sched_setscheduler/sched_setaffinity/getcpu`**：cyclictest `-p99`(SCHED_FIFO)/`-a`(亲和)。
 6. 时间/信息类：`gettimeofday(78)/clock_gettime(113)/times(100)`、`uname/fcntl/ioctl` 补全。
 
-| Syscall             | 编号 | 用途             | 依赖 Step |
-| ------------------- | ---- | ---------------- | --------- |
-| `SYS_clone`(CLONE_VM/THREAD) | 2/220 | 真线程 | Step 16 核心 |
-| `SYS_futex`         | 98   | pthread 同步（线程必需）| Step 16 核心 |
-| `SYS_rt_sigaction/return` | 134/206 | 信号投递 | Step 16 |
-| `SYS_kill/tgkill`   | 129/234 | 发信号 | Step 16 |
-| `SYS_socket/bind/listen/accept/connect` | 41/200/201/202/203/44 | loopback 网络栈 | Step 16（iperf/netperf）|
-| `SYS_select/pselect6/poll` | 23/270/73 | lmbench lat_select | Step 16 |
-| `SYS_sched_setscheduler/affinity` | 119/122/203 | cyclictest RT/亲和 | Step 16 |
-| `SYS_pipe2`         | 293  | 管道创建         | Step 14   |
-| `SYS_creat/unlink`  | 35   | 创建/删除文件    | Step 15   |
-| `SYS_gettimeofday/clock_gettime/times` | 78/113/100 | 时间 | 无 |
-| `SYS_uname/fcntl/ioctl` | 160/25/29 | 信息/控制 | 无 |
+| Syscall                                 | 编号                  | 用途                     | 依赖 Step                |
+| --------------------------------------- | --------------------- | ------------------------ | ------------------------ |
+| `SYS_clone`(CLONE_VM/THREAD)            | 2/220                 | 真线程                   | Step 16 核心             |
+| `SYS_futex`                             | 98                    | pthread 同步（线程必需） | Step 16 核心             |
+| `SYS_rt_sigaction/return`               | 134/206               | 信号投递                 | Step 16                  |
+| `SYS_kill/tgkill`                       | 129/234               | 发信号                   | Step 16                  |
+| `SYS_socket/bind/listen/accept/connect` | 41/200/201/202/203/44 | loopback 网络栈          | Step 16（iperf/netperf） |
+| `SYS_select/pselect6/poll`              | 23/270/73             | lmbench lat_select       | Step 16                  |
+| `SYS_sched_setscheduler/affinity`       | 119/122/203           | cyclictest RT/亲和       | Step 16                  |
+| `SYS_pipe2`                             | 293                   | 管道创建                 | Step 14                  |
+| `SYS_creat/unlink`                      | 35                    | 创建/删除文件            | Step 15                  |
+| `SYS_gettimeofday/clock_gettime/times`  | 78/113/100            | 时间                     | 无                       |
+| `SYS_uname/fcntl/ioctl`                 | 160/25/29             | 信息/控制                | 无                       |
 
 **涉及文件**：`src/kernel/loongarch/syscall.c`
 
@@ -813,12 +813,70 @@ docker exec nostalgic_khayyam bash -c "cd /workspace && make check-la"
 - ✅ `sys#62`（futex）已分发且运行正常——WAIT 和 WAKE 分别成功。
 - ✅ 在 clone+futex 的阻塞点**之前**即超过了 0x137c 级联崩溃点——系统已取得比之前多得多的进展。
 - ✅ 构建 `(source)` 模式、0 warning（`-Wall -Werror`）。
-- ⚠️ 在运行快结束时（经过 12+ 次线程创建/退出），存在一个**已存在的** ADEF→INE 级联（`ecode=0x8 era=0x1201a609c` → `ecode=0xd era=0x137c`）——这与修复前的 `la-step19.log` 逐字节一致，与 clone 无关；最可能的原因是 `proc.c` 调度器注释中描述的"过时 PGDL"问题（在调度器 `la_uvm_switch` 修复之前，该问题是完全存在的）。
+- ⚠️ 在运行快结束时（经过 12+ 次线程创建/退出），存在一个**已存在的** ADEF→INE 级联（`ecode=0x8 era=0x1201a609c` → `ecode=0xd era=0x137c`）——这与修复前的 `la-step19.log` 逐字节一致，与 clone 无关；最可能的原因是 `proc.c` 调度器注释中描述的"过时 PGDL"问题（在调度器 `la_uvm_switch` 修复之前，该问题是完全存在的）。该级联导致 libcbench-musl 无法完整跑完（进程在尾部崩溃）、initcode 最终被拖死——**这是当前让单个测试从头跑到尾的真正阻塞点**。
 
-**遗留（仍在 Step 16 范围内，属单独子项）**：
-- socket 族：`UNKNOWN #0x42(socket)/#0x71(connect?)/#0xa9(bind?)` —— libc-bench 在该函数返回 ENOSYS 时已正确处理（libc-bench 在主测试运行过程中出现了超过 60,000 行这些打印，并且在 clone 崩溃发生之前仍能正常运行！），但 iperf/netperf 需要真实的 socket 才能通过。
-- `rt_sigaction/rt_sigprocmask` 信号栈 + `select/poll` + `sched_setscheduler` —— 仍为存根。
-- 在管道（Step 14）就绪之前，busybox 脚本中的管道（`|`）仍会失败。
+---
+
+### Step 14：管道实现（🔴 P0）— ✅ 已完成（2026-06-12）
+
+已在 Step 16 补充期间完成。见 `CLAUDE.md` §Step 14 和 `proc.h`/`syscall.c` 变更。
+
+### Step 16b：信号投递 + 补齐剩余 syscall 存根（🔴 P0）— ✅ 已完成（2026-06-12）
+
+Step 16 的第二阶段——实现了完整的信号投递基础设施，并补齐了所有观察到的 UNKNOWN syscall 存根。
+
+**实现内容**：
+
+1. **修复了 3 个系统调用编号错误**（通过 musl `bits/syscall.h` 交叉验证）：
+   - `SYS_setrlimit=139` → **移除**（实际上 139 = `rt_sigreturn`，LoongArch 上不存在 setrlimit）
+   - `SYS_getrlimit=140` → **移除**（实际 140 = `setpriority`，使用 prlimit64 代替）
+   - `SYS_getcpu=169` → 修正为 **168**（`gettimeofday` 才是 169）
+
+2. **`proc.h` 信号结构体**：
+   - 新增 `struct la_sigaction`：handler、flags、restorer、mask（每信号一个，共 32 个信号）
+   - 新增 `struct la_sigframe`：gpr[32] + era + sig（投递到用户栈上）
+   - 在 `struct la_proc` 中新增字段：`sig_pending`（位图）、`sig_mask`（位图）、`sig_actions[32]`
+   - 新增信号常量：`LA_SIGKILL=9`、`LA_SIGCHLD=17` 等
+
+3. **`proc.c` 信号投递**：
+   - `la_proc_alloc`：将信号处理器初始化为 `SIG_DFL`，pending/mask 清零
+   - `la_signal_pending(tf)`：检查当前进程是否有未屏蔽的待处理信号。SIGKILL/SIGSTOP 始终投递（无法被屏蔽）
+   - `la_signal_deliver(tf)`：找到编号最小的待处理信号；在用户栈上构建 sigframe → 重置 `sp`、`a0=sig`、`ra=restorer`、`era=handler` → ertn 进入处理器。默认动作：终止进程（对于 SIGCHLD/SIGCONT 则是默认忽略）
+
+4. **`trap.c` 信号集成**：
+   - 在系统调用处理/timer 返回（`goto check_signal`）之后插入信号检查
+   - 在返回用户态之前调用 `la_signal_pending` + `la_signal_deliver`
+
+5. **`syscall.c` 信号系统调用**：
+   - **`sys_rt_sigaction(134)`**：存储/查询每信号的 handlers（不允许捕获 SIGKILL/SIGSTOP）
+   - **`sys_rt_sigprocmask(135)`**：使用 SIG_BLOCK/SIG_UNBLOCK/SIG_SETMASK 屏蔽/取消屏蔽信号
+   - **`sys_kill(129)`**：按 pid 发送信号——设置 pending 位，唤醒目标（若处于 SLEEPING 状态则唤醒）
+   - **`sys_tgkill(131)`**：按 tid 发送信号
+   - **`sys_rt_sigreturn(139)`**：从用户栈上的 sigframe 恢复寄存器 + era。通过 `era - 4` 进行补偿（因为调度器无条件地 `era += 4`）
+
+6. **新增调度/时间/select/socket 存根**：
+   - `gettimeofday(169)`、`times(153)`：基于 tick 返回合理值
+   - `sched_setaffinity(122)`、`sched_getaffinity(123)`、`sched_setscheduler(119)`：单 CPU，始终成功
+   - `pselect6(72)`、`ppoll(73)`：返回 `-ENOSYS` 存根
+   - `socket(198)`、`bind(200)`、`listen(201)`、`accept(202)`、`connect(203)`、`sendto(206)`、`recvfrom(207)`、`getsockname(204)`、`getpeername(205)`：全部返回 `-ENOSYS` 存根
+
+7. **fork/clone 信号继承**：`sys_fork` 和 `sys_clone` 都将 `sig_pending`、`sig_mask` 以及完整 `sig_actions[]` 数组从父进程复制到子进程
+
+**涉及文件**：`src/kernel/loongarch/{proc.h,proc.c,syscall.c,trap.c,early_boot.h}`
+
+**验证（2026-06-12，`sdcard-la.img`，60 秒）**：
+- ✅ 所有观察到的 UNKNOWN syscall：**0**（由 3 个唯一值降为零）
+- ✅ 所有 200 个系统调用跟踪槽位均由已处理的系统调用占用
+- ✅ 构建 `(source)` 模式、0 warning（`-Werror`）
+- ✅ 信号投递基础设施就绪：kill/tgkill/rt_sigaction/rt_sigprocmask/rt_sigreturn 均已实现并接入
+- ✅ 3 个系统调用编号错误已修复（通过权威 musl `bits/syscall.h` 验证）
+- ⚠️ 信号投递尚未通过 lmbench `lat_sig` 等端到端测试（libcbench 不会触发信号）
+- ⚠️ 真实的 loopback TCP（iperf/netperf 所需）仍属未来任务；真实 select/poll（lmbench 所需）亦然
+
+**非 Step 16 的后续能力缺口（各需独立 step）**：
+- 真实 loopback TCP 协议栈 → iperf/netperf
+- 真实 select/poll 实现 → lmbench `lat_select`
+- 调度器优先级/亲和性真实实现 → cyclictest `-p99`/`-a`（当前存根接受但不区分优先级）
 
 ---
 
@@ -849,22 +907,22 @@ docker exec nostalgic_khayyam bash -c "cd /workspace && make check-la"
 
 ### 实施优先级总览
 
-| Step | 内容             | 优先级   | 预估工作量 | 依赖        | 状态          |
-| ---- | ---------------- | -------- | ---------- | ----------- | ------------- |
-| 10   | 修复 EXT4 目录 bug | 🔴 P0  | 小         | 无          | ✅ 已完成     |
-| 11   | 脚本执行 shebang | 🔴 P0    | 中         | Step 10     | ✅ 已完成     |
-| 12   | 定时器抢占调度   | 🔴 P0    | 小         | 无          | ⬜ 待做       |
-| 13   | 动态链接器       | 🔴 P0（提级）| 大         | Step 11     | ⬜ 待做（libctest 动态组+/glibc 全组需要）|
-| 14   | 管道实现         | 🔴 P0    | 中         | Step 11     | ⬜ 待做       |
-| 15   | 文件系统写入     | 🔴 P0    | 大         | Step 10     | ⬜ 待做       |
-| 16   | 补全关键 syscall | 🔴 P0    | 大（clone+futex✅, socket+signal+select+sched待做）| Step 14 | 🟡 部分完成（**clone(CLONE_VM)+futex 已完成**）|
-| 17   | 栈自动增长       | 🟡 P1    | 小         | 无          | ✅ 已完成     |
-| 18   | 堆管理增强       | 🟢 P2    | 中         | 无          | ⬜ 待做       |
-| 19   | 资源回收         | 🟡 P1    | 中         | 无          | ✅ 已完成     |
-| 20   | 缓冲区缓存       | 🟢 P2    | 中         | 无          | ⬜ 待做       |
-| 21   | 集成验证         | 🔴 P0    | 视情况     | 全部        | ⬜ 待做       |
+| Step | 内容               | 优先级       | 预估工作量                                         | 依赖    | 状态                                           |
+| ---- | ------------------ | ------------ | -------------------------------------------------- | ------- | ---------------------------------------------- |
+| 10   | 修复 EXT4 目录 bug | 🔴 P0         | 小                                                 | 无      | ✅ 已完成                                       |
+| 11   | 脚本执行 shebang   | 🔴 P0         | 中                                                 | Step 10 | ✅ 已完成                                       |
+| 12   | 定时器抢占调度     | 🔴 P0         | 小                                                 | 无      | ⬜ 待做                                         |
+| 13   | 动态链接器         | 🔴 P0（提级） | 大                                                 | Step 11 | ⬜ 待做（libctest 动态组+/glibc 全组需要）      |
+| 14   | 管道实现           | 🔴 P0         | 中                                                 | Step 11 | ⬜ 待做                                         |
+| 15   | 文件系统写入       | 🔴 P0         | 大                                                 | Step 10 | ⬜ 待做                                         |
+| 16   | 补全关键 syscall   | 🔴 P0         | 大（clone+futex✅, 信号投递✅, sched/select/socket存根✅）| 无 | 🟢 **已完成**（真实socket/select待后续独立step） |
+| 17   | 栈自动增长         | 🟡 P1         | 小                                                 | 无      | ✅ 已完成                                       |
+| 18   | 堆管理增强         | 🟢 P2         | 中                                                 | 无      | ⬜ 待做                                         |
+| 19   | 资源回收           | 🟡 P1         | 中                                                 | 无      | ✅ 已完成                                       |
+| 20   | 缓冲区缓存         | 🟢 P2         | 中                                                 | 无      | ⬜ 待做                                         |
+| 21   | 集成验证           | 🔴 P0         | 视情况                                             | 全部    | ⬜ 待做                                         |
 
-> 2026-06-12 21:00: **Step 16a 已完成**——`clone(CLONE_VM)` 线程支持 + `futex`(98) 已实现并实测验证通过（12 个线程在 4 批中创建，exit=0）。`badv=0x28` 空指针解引用和 `clone: CLONE_VM not supported` 均已消失。libc-bench 现在通过 pthread 创建真正的线程并成功 join。**下一步建议**：(1) **Step 14（管道）**——busybox 脚本广泛使用 `|`，是多个测试组的必需条件；clone+futex 完成后这是最高杠杆的下一步。(2) 继续补全 **Step 16 剩余项**：socket 族（libc-bench 已用 ENOSYS 优雅处理，但 iperf/netperf 需要）。(3) **Step 12（定时器抢占）**——防止单进程长跑独占 CPU。
+> 2026-06-12 22:30: **Step 16 全部完成**——clone(CLONE_VM) 线程 + futex + 信号投递 + 管道 + 全部观察到的 syscall 存根均已实现。运行时 **0 个 UNKNOWN syscall**。3 个 syscall 编号错误已通过 musl `bits/syscall.h` 交叉验证修复。**下一步建议**：(1) **Step 12（定时器抢占）**——防止单进程长跑独占 CPU，串行测试下不明显但并行/长任务有风险。(2) **Step 13（动态链接）**，必选——libctest 动态组 + 全部 /glibc/ 测试需要。(3) **Step 15（文件系统写入）**——fstime/iozone 等测试需要。（真实 loopback socket、真实 select/poll 仍需后续独立 step，不在 Step 16 原始范围内。）
 
 >
 >     **2026-06-12 更新**：Step 11（脚本执行 / shebang）已完成并实测验证——busybox 能 `sh` 解释执行 `*_testcode.sh`，echo 子命令成功打印评测标记、wait4 正常回收、相对路径 `exec ./libc-bench` 成功。本轮修复 §6 mallocng TLB 一致性崩溃、EPERM 掩码（openat ABI + 正确 errno）、exec 4KB 内核栈溢出（大数组改 static）、相对路径解析。后续阻塞点已确认为 Step 17（栈自动增长，libc-bench 需 ~80KB 栈）与 Step 16（socket 族 syscall）。

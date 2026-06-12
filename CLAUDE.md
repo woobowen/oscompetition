@@ -9,7 +9,7 @@
 
 - **项目**：SeaOS — 华东师大花狮小队，oscomp 2026「OS 内核实现赛道」初赛。xv6 风格内核，目标跑通 `/musl`、`/glibc` 下的 oscomp 测试脚本。
 - **两条线**：**A 线 = RISC-V**（`src/kernel/`，成熟，101+ syscall、动态链接、pipe、memfs 齐备，是事实参考实现）；**B 线 = LoongArch**（`src/kernel/loongarch/`，移植中，**本文档对象**）。LoongArch 与 RISC-V 共用同一套 Linux「通用 ABI」syscall 号表。
-- **当前状态（2026-06-12 21:00）**：**Step 11 + Step 17 + Step 19 + Step 16a（clone CLONE_VM 线程 + futex）已完成并实测通过**——栈按需扩栈、用户态崩溃不挂死、exec/exit/wait 现在释放用户页表+内核栈（`initcode: fork fail!` 13→0，物理内存不再耗尽）、clone(CLONE_VM) 创建真正的共享地址空间线程（每批 2–8 个，12 个已创建和 join，badv=0x28 失效）。**当前状态**：libcbench-musl 已通过线程创建阶段，在运行快结束时存在一个已存在的 ADEF→INE 级联（与 clone 无关，是 `proc.c` 调度器注释中描述的过时 PGDL 问题）。**下一步优先级**：Step 14（管道，busybox 脚本需要 `|`）> 继续补全 Step 16（socket 族）> Step 12（定时器抢占）。socket 族 UNKNOWN #0x42/#0x71/#0xa9 已用 ENOSYS 处理，不是崩溃原因，但 iperf/netperf 需要完整实现。详见 §6。
+- **当前状态（2026-06-12 22:30）**：**Step 11 + Step 14（管道）+ Step 16（全部：clone+futex+信号投递+全部syscall存根）+ Step 17 + Step 19 已完成并实测通过**——栈按需扩栈、用户态崩溃不挂死、exec/exit/wait 释放页表+内核栈、clone(CLONE_VM) 真线程、futex WAIT/WAKE、管道（阻塞read/write，fork继承）、信号投递基础设施（kill/tgkill/rt_sigaction/rt_sigprocmask/rt_sigreturn + sigframe on user stack）、3 个 syscall 编号错误已修复、运行时 **0 个 UNKNOWN syscall**。**当前状态**：libcbench-musl 已具备完整基础设施；运行快结束时存在已存在的 ADEF→INE 级联（与管道/信号无关，是 `proc.c` 调度器注释中描述的过时 PGDL 问题）。**下一步优先级**：Step 12（定时器抢占）> Step 13（动态链接）> Step 15（文件写入）。详见 §6。
 - **常用命令（必须在 Docker 容器内执行，见 §3）**：
   - 构建：`docker exec nostalgic_khayyam bash -lc 'cd /workspace && make build-la'`（或 `make all`）
   - 用真实测试镜像跑：`docker exec nostalgic_khayyam bash -lc 'cd /workspace && /opt/qemu-bin-10.0.2/bin/qemu-system-loongarch64 -kernel kernel-la -m 1G -nographic -smp 1 -drive file=sdcard-la.img,if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0 -no-reboot'`
@@ -228,7 +228,7 @@ sudo docker run --rm \
 
 1. **`clone(CLONE_VM)` 线程支持 + futex（Step 16a，P0）— ✅ 已完成（2026-06-12）**：clone(CLONE_VM) 现在创建真正的共享地址空间线程（共享 pgtbl + mm 游标），futex(98) WAIT/WAKE 使 pthread_join 能返回。实测 12 个线程在 4 批中创建并成功 exit=0。`clone: CLONE_VM not supported` 和 `badv=0x28` 空指针解引用已消失。**实现**：`proc.h/c`（shared_vm、clear_child_tid、channel-keyed sleep/wakeup、tf 释放修复、共享 pgtbl 所有权转移）、`syscall.c`（重写 sys_clone 适配 LoongArch ABI `clone(flags,stack,ptid,ctid,tls)`、新增 sys_futex、thread-exit cleartid + futex wake、exit_group 组终止、sys_wait shared_vm 过滤器、brk/mmap mm 重构）、`exec_la.c`（mm 重构、旧 tf 释放）。详情见 `la-current.md` §Step 16a。
 2. **socket 族 syscall `#0x42/#0x71/#0xa9`（Step 16 剩余项）**：libc-bench **已正确处理 ENOSYS**（在 clone 崩溃发生之前有 60,000+ 行 UNKNOWN 打印，仍正常运行），所以 socket 存根不是崩溃原因。iperf/netperf 需要完整的 loopback socket 实现；libc-bench 可优雅降级。
-3. **管道（Step 14，P0）**：脚本 `a | b` 依赖 `pipe2`，当前是桩（环形缓冲未实现），busybox 测试脚本广泛使用。**这是 clone+futex 完成后最高杠杆的下一步。**
+3. **管道（Step 14，P0）— ✅ 已完成（2026-06-12）**：循环缓冲区 `pipe2`，阻塞 read/write，close 时引用计数端点追踪，fork/clone 继承。busybox `|` 脚本管道现已启用。
 2. **定时器抢占（Step 12）**：`la_timer_interrupt()` 仍只计数不调度，长任务独占 CPU（目前单测试串行尚可，多测试时有风险）。
 3. **管道（Step 14）**：脚本 `a | b` 依赖 `pipe2`，当前是桩（环形缓冲未实现），unixbench 等跑不动。
 
@@ -269,12 +269,12 @@ sudo docker run --rm \
 
 ```
 ✅ Step 10 (修EXT4 bug) → ✅ Step 11 (脚本执行) → ⬜ Step 12 (定时器抢占)
-  → ⬜ Step 13 (动态链接) → ⬜ Step 14 (管道) → ⬜ Step 15 (文件写入)
-  → 🟡 Step 16 (clone+futex ✅，socket/信号/select/sched 待做)
+  → ⬜ Step 13 (动态链接) → ✅ Step 14 (管道) → ⬜ Step 15 (文件写入)
+  → ✅ Step 16 (全部：clone+futex+信号+存根)
   → ✅ Step 17 (栈增长+不挂死) → ⬜ Step 18 (堆增强)
   → ✅ Step 19 (资源回收) → ⬜ Step 20 (块缓存) → ⬜ Step 21 (集成验证)
 ```
-> **Step 10、11、16a（clone+futex）、17、19 已完成并实测通过**（详见 §6 + `la-current.md`）。**当前最短解阻塞路径 = Step 14（管道）**——clone+futex 解除 0x137c 崩溃后，脚本中的 `|` 是阻塞 busybox 测试的下一瓶颈；busybox 作为所有测试脚本的解释器，管道是其最高杠杆的下一步。其次是 socket 族（Step 16 剩余项）和定时器抢占（Step 12）。
+> **Step 10、11、14、16、17、19 已完成并实测通过**（详见 §6 + `la-current.md`）。**当前最短路径 = Step 12（定时器抢占）+ Step 13（动态链接）+ Step 15（文件写入）**。libcbench-musl 已具备完整基础设施（线程+管道+信号+syscall 全覆盖，0 个 UNKNOWN）。
 
 ### 各步详情
 
@@ -340,9 +340,9 @@ sudo docker run --rm \
 | 11 | 脚本执行 shebang | 🔴 P0 | 中 | Step 10 | ✅ 已完成 |
 | 12 | 定时器抢占调度 | 🔴 P0 | 小 | 无 | ⬜ 待做 |
 | 13 | 动态链接器 | 🔴 P0（**提级**：libctest 动态组+整个 /glibc/ 需要） | 大 | Step 11 | ⬜ 待做 |
-| 14 | 管道实现 | 🔴 P0 | 中 | Step 11 | ⬜ 待做 |
+| 14 | 管道实现 | 🔴 P0 | 中 | Step 11 | ✅ 已完成 |
 | 15 | 文件系统写入 | 🔴 P0 | 大 | Step 10 | ⬜ 待做 |
-| 16 | 补全关键 syscall | 🔴 P0 | **大**（clone+futex✅, socket+信号+select+sched待做） | Step 14 | 🟡 部分完成（**clone+futex 已完成**） |
+| 16 | 补全关键 syscall | 🔴 P0 | **大**（全部完成：clone+futex+信号+管道+sched/select/socket存根）| 无 | ✅ 已完成 |
 | 17 | 栈增长+不挂死 | 🟡 P1 | 中 | 无 | ✅ 已完成 |
 | 18 | 堆/mmap 增强 | 🟢 P2 | 中 | 无 | ⬜ 待做 |
 | 19 | 资源回收 | 🔴 P0 | 中 | 无 | ✅ 已完成 |

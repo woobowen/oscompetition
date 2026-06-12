@@ -107,7 +107,7 @@ void la_trap_dispatch(struct la_trap_frame *tf)
             la_uart_put_hex(tf->estat & 0xFFFF);
             la_uart_puts("\n");
         }
-        return;
+        goto check_signal;
     }
 
     /* ---- syscall (ecode == 0x0B) ---- */
@@ -115,7 +115,7 @@ void la_trap_dispatch(struct la_trap_frame *tf)
         uint64_t ret = la_syscall_dispatch(tf);
         tf->gpr[LA_GPR_A0] = ret;
         tf->era += LA_SYSCALL_INSN_SIZE;
-        return;
+        goto check_signal;
     }
 
     /* ---- unhandled exception → kill user proc / halt ----
@@ -141,5 +141,18 @@ void la_trap_dispatch(struct la_trap_frame *tf)
         la_uart_puts("\n");
         la_proc_exit(-11);   /* noreturn */
     }
-    for (;;) {}
+    for (;;) {}              /* kernel-mode unhandled exception → halt */
+
+check_signal:
+    /* After handling a syscall or timer interrupt, check whether a
+     * signal needs to be delivered to the current process before
+     * returning to user mode.  If one is pending and not blocked,
+     * la_signal_deliver rewrites the trap frame to jump to the
+     * signal handler; once the handler returns (via rt_sigreturn),
+     * the original context is restored. */
+    {
+        struct la_proc *cur = la_current_proc();
+        if (cur && cur->is_user && la_signal_pending(tf))
+            la_signal_deliver(tf);
+    }
 }
