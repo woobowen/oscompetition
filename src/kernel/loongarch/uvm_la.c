@@ -437,6 +437,17 @@ void la_uvm_free_pgtbl(uint64_t *root)
 {
     if (!root) return;
 
+    /* Drop every TLB entry BEFORE releasing the pages.  Even though fork
+     * deep-copies (no shared pages), the dying process's own TLB entries —
+     * which point at the very physical pages we are about to free — may still
+     * be live in the TLB.  Once those pages are reclaimed and reused for a
+     * different mapping, a stale entry translating the same VPPN would route a
+     * fetch/load through the reused page (garbage -> ADEF/INE).  Flushing here
+     * guarantees no translation outlives the pages it references, regardless
+     * of invtlb/G-bit corner cases.  Safe because the kernel runs off the DMW0
+     * identity window, not the user TLB, while doing the free. */
+    la_tlb_inval_all();
+
     for (int i = 0; i < LA_PT_ENTRIES; i++) {
         uint64_t e0 = root[i];
         if (!e0) continue;

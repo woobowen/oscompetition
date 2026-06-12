@@ -469,11 +469,14 @@ static uint64_t sys_fork(struct la_trap_frame *tf)
 
     /* Inherit other state */
     child->parent_pid = parent->pid;
-    child->heap_top   = parent->heap_top;
-    child->mmap_top   = parent->mmap_top;
+    child->__mm.heap_top   = parent->mm->heap_top;
+    child->__mm.mmap_top   = parent->mm->mmap_top;
     child->stack_bottom = parent->stack_bottom;   /* so forked children keep
                                                    * the grown stack floor */
     child->cwd_ino    = parent->cwd_ino;
+    child->shared_vm  = 0;
+    child->clear_child_tid = 0;
+    child->mm         = &child->__mm;
 
     return (uint64_t)child->pid;
 }
@@ -524,6 +527,13 @@ static uint64_t sys_wait(struct la_trap_frame *tf)
             struct la_proc *p = &procs[i];
             if (p->parent_pid != parent->pid || p->state == LA_PROC_UNUSED)
                 continue;
+            /* CLONE_VM threads are never collected via wait4 — they are
+             * reaped by the scheduler's parentless-zombie path when the
+             * group leader dies.  Skipping them here keeps initcode's
+             * wait4(leader_pid) clean: it only sees the leader, not the
+             * worker threads whose parent_pid is the leader itself. */
+            if (p->shared_vm)
+                continue;
             has_children = 1;
 
             /* Check PID filter */
@@ -564,7 +574,9 @@ static uint64_t sys_wait(struct la_trap_frame *tf)
     }
 }
 
-/* SYS_exit: terminate current process */
+/* SYS_exit: terminate current process (or thread if CLONE_VM).
+ * For threads with a clear_child_tid, zero the word and wake the futex
+ * channel so that pthread_join (which futex-waits on that address) returns. */
 static uint64_t __attribute__((noreturn)) sys_exit(struct la_trap_frame *tf)
 {
     uint32_t exit_code = (uint32_t)tf->gpr[LA_GPR_A0];
@@ -584,6 +596,16 @@ static uint64_t __attribute__((noreturn)) sys_exit(struct la_trap_frame *tf)
     la_uart_put_hex(me->pid);
     la_uart_puts("\n");
 
+    /* Thread-exit: clear *clear_child_tid and futex-wake anyone waiting
+     * on it (the pthread_join side).  Must happen BEFORE la_proc_exit
+     * because that switches away; the joiner would never be woken. */
+    if (me->clear_child_tid) {
+        uint32_t zero = 0;
+        la_copy_to_user((uint64_t)me->clear_child_tid, &zero, 4);
+        la_proc_wakeup_chan((void *)me->clear_child_tid);
+        me->clear_child_tid = 0;
+    }
+
     /* la_proc_exit clears ISTLBR, marks us ZOMBIE, wakes the parent, and
      * switches to the scheduler.  It never returns. */
     la_proc_exit((int)exit_code);
@@ -600,7 +622,7 @@ static uint64_t sys_brk(struct la_trap_frame *tf)
     if (!p) return (uint64_t)-1;
 
     if (addr == 0) {
-        return p->heap_top;
+        return p->mm->heap_top;
     }
 
     if (addr < LA_USER_BASE)
@@ -610,18 +632,18 @@ static uint64_t sys_brk(struct la_trap_frame *tf)
      * CRITICAL: Linux brk returns ZEROED pages. musl's malloc depends
      * on this — it interprets non-zero bytes in fresh heap as malloc
      * chunk headers, causing corruption and crashes. */
-    if (addr > p->heap_top && p->pgtbl) {
-        uint64_t old_page = (p->heap_top + LA_PGSIZE - 1) & ~((uint64_t)LA_PGSIZE - 1);
+    if (addr > p->mm->heap_top && p->pgtbl) {
+        uint64_t old_page = (p->mm->heap_top + LA_PGSIZE - 1) & ~((uint64_t)LA_PGSIZE - 1);
         uint64_t new_page = (addr + LA_PGSIZE - 1) & ~((uint64_t)LA_PGSIZE - 1);
         for (uint64_t va = old_page; va < new_page; va += LA_PGSIZE) {
             uint64_t pa = la_uvm_alloc_page(p->pgtbl, va, 0x19FUL);
             if (pa == 0)
-                return p->heap_top;  /* return current break on failure */
+                return p->mm->heap_top;  /* return current break on failure */
             /* la_uvm_alloc_page already zeroes (via la_pmem_alloc). */
         }
     }
 
-    p->heap_top = addr;
+    p->mm->heap_top = addr;
     return addr;
 }
 
@@ -662,8 +684,8 @@ static uint64_t sys_mmap(struct la_trap_frame *tf)
             used_hint = 1;
     }
     if (!used_hint) {
-        addr = (p->mmap_top + LA_PGSIZE - 1) & ~((uint64_t)LA_PGSIZE - 1);
-        p->mmap_top = addr + (uint64_t)npages * LA_PGSIZE;
+        addr = (p->mm->mmap_top + LA_PGSIZE - 1) & ~((uint64_t)LA_PGSIZE - 1);
+        p->mm->mmap_top = addr + (uint64_t)npages * LA_PGSIZE;
     }
 
     /* Allocate and map pages (skip already-mapped pages).
@@ -681,12 +703,6 @@ static uint64_t sys_mmap(struct la_trap_frame *tf)
         uint64_t pa = la_uvm_alloc_page(p->pgtbl, va, 0x19FUL);
         if (pa == 0)
             return (uint64_t)-1;  /* 0x19F = V|D|PLV3|P|W = user RWX */
-        /* Diagnostic: log VA→PA to detect physical-page aliasing. */
-        la_uart_puts("  mmap va=");
-        la_uart_put_hex(va);
-        la_uart_puts("->pa=");
-        la_uart_put_hex(pa);
-        la_uart_puts("\n");
         /* Zero the page — Linux guarantees anonymous mmap pages are zeroed */
         uint8_t *px = (uint8_t *)pa;
         for (uint32_t z = 0; z < LA_PGSIZE; z++)
@@ -710,18 +726,68 @@ static uint64_t sys_munmap(struct la_trap_frame *tf)
  * ================================================================ */
 
 /* SYS_set_tid_address: set clear-child-tid pointer.
- * Just return our pid (Linux returns tid). */
+ * Stores the user VA so the kernel can zero *tidptr and futex-wake it
+ * when the calling thread exits — this is how pthread_join finds out
+ * the thread terminated.  Returns the caller's tid (= pid in this model). */
 static uint64_t sys_set_tid_address(struct la_trap_frame *tf)
 {
-    (void)tf;
     struct la_proc *p = la_current_proc();
-    return p ? (uint64_t)p->pid : 1;
+    if (!p) return 1;
+    p->clear_child_tid = tf->gpr[LA_GPR_A0];
+    return (uint64_t)p->pid;
 }
 
 /* SYS_set_robust_list: register robust futex list (stub) */
 static uint64_t sys_set_robust_list(struct la_trap_frame *tf)
 {
     (void)tf;
+    return 0;
+}
+
+/* SYS_futex (98): fast userspace mutual exclusion.
+ *
+ * Minimal private-futex implementation covering the two operations
+ * musl/pthread needs: WAIT and WAKE.  The channel is the user VA of the
+ * futex word (same VA → same channel).  Under the cooperative single-CPU
+ * scheduler (no preemption, no timer-yield), the check-then-sleep in WAIT
+ * is observationally atomic — no other process runs between the val-compare
+ * and the swtch inside la_proc_sleep_chan, so there is no lost-wakeup race.
+ *
+ * Returns: WAKE → 1 (at least one waiter woken).  WAIT → 0 on wake,
+ *          -EAGAIN if *uaddr != val, -EFAULT on bad uaddr. */
+static uint64_t sys_futex(struct la_trap_frame *tf)
+{
+    uint64_t uaddr  = tf->gpr[LA_GPR_A0];
+    int      op     = (int)tf->gpr[LA_GPR_A1] & 0x7f;   /* strip private/realtime flags */
+    uint32_t val    = (uint32_t)tf->gpr[LA_GPR_A2];
+    /* timeout, uaddr2, val3 are ignored in minimal implementation */
+
+    if (uaddr == 0)
+        return (uint64_t)(-LA_EFAULT);
+
+    /* FUTEX_WAKE (op == 1): wake one or more waiters on this channel */
+    if (op == 1) {
+        la_proc_wakeup_chan((void *)uaddr);
+        return 1;
+    }
+
+    /* FUTEX_WAIT (op == 0): sleep if *uaddr still equals val */
+    if (op == 0) {
+        uint32_t cur = 0;
+        if (la_copy_from_user(&cur, uaddr, sizeof(cur)) != sizeof(cur))
+            return (uint64_t)(-LA_EFAULT);
+        if (cur != val)
+            return (uint64_t)(-LA_EAGAIN);
+
+        /* check-then-sleep is atomic under cooperative single-CPU scheduling:
+         * la_proc_sleep_chan sets wait_chan THEN state=SLEEPING with no
+         * intervening swtch, and only wakeup_chan flips futex sleepers back
+         * to RUNNABLE.  The caller (musl) re-validates *uaddr after wake. */
+        la_proc_sleep_chan((void *)uaddr);
+        return 0;
+    }
+
+    /* Unknown futex op — silently succeed (most callers treat ENOSYS as fatal) */
     return 0;
 }
 
@@ -919,9 +985,58 @@ static uint64_t sys_statx(struct la_trap_frame *tf)
     return 0;
 }
 
-/* SYS_exit_group: exit all threads (same as exit for single-threaded) */
+/* SYS_exit_group: exit the entire thread group.
+ *
+ * Before calling sys_exit on the leader, force-zombify every sibling that
+ * shares the same page table (i.e. is in the same thread group) so that no
+ * thread survives the leader.  Zombified threads stop running, their ctx
+ * is stale but safe — their kstacks are freed later by la_proc_free (either
+ * when the parent reaps the leader via wait4, or by the scheduler's
+ * parentless-zombie reaping).  Group membership is determined by shared
+ * pgtbl root (NOT parent_pid), which is the robust predicate.
+ *
+ * For each force-killed sibling, we also fire its cleartid to unblock any
+ * pthread_join call that might be waiting on it (unusual in a bench but
+ * correct). */
 static uint64_t __attribute__((noreturn)) sys_exit_group(struct la_trap_frame *tf)
 {
+    struct la_proc *me = la_current_proc();
+    uint32_t exit_code = (uint32_t)tf->gpr[LA_GPR_A0];
+
+    if (!me || !me->is_user) {
+        la_uart_puts("  exit_group: no current user proc — HALT\n");
+        for (;;) {}
+    }
+
+    /* Group-kill: zombify all siblings that share our page table.
+     * The predicate "pgtbl == me->pgtbl" catches every CLONE_VM thread
+     * regardless of parent_pid, state (RUNNABLE/RUNNING/SLEEPING), or
+     * whether they were created by the leader or by a sibling.  We do NOT
+     * touch the current proc (me) — sys_exit handles it below. */
+    if (me->pgtbl) {
+        struct la_proc *procs = la_proc_table();
+        for (int i = 0; i < LA_NPROC; i++) {
+            struct la_proc *q = &procs[i];
+            if (q == me) continue;
+            if (q->state == LA_PROC_UNUSED) continue;
+            if (q->state == LA_PROC_ZOMBIE) continue;
+            if (q->pgtbl != me->pgtbl) continue;  /* different address space */
+
+            /* This is a sibling thread — force-kill it. */
+            if (q->clear_child_tid) {
+                uint32_t zero = 0;
+                la_copy_to_user((uint64_t)q->clear_child_tid, &zero, 4);
+                la_proc_wakeup_chan((void *)q->clear_child_tid);
+                q->clear_child_tid = 0;
+            }
+            q->state     = LA_PROC_ZOMBIE;
+            q->exit_code = (int)(unsigned)exit_code;
+            la_uart_puts("  exit_group: killed sibling pid=");
+            la_uart_put_hex(q->pid);
+            la_uart_puts("\n");
+        }
+    }
+
     sys_exit(tf);
     __builtin_unreachable();
 }
@@ -962,29 +1077,116 @@ static uint64_t sys_waitid(struct la_trap_frame *tf)
     return sys_wait(tf);
 }
 
-/* SYS_clone: create a new process (simplified — act like fork) */
+/* SYS_clone: create a child process or CLONE_VM thread.
+ *
+ * LoongArch ABI: clone(flags=a0, stack=a1, ptid=a2, tls=a3, ctid=a4)
+ * Flag bits:
+ *   0x00000100  CLONE_VM      — share address space (pgtbl + mm)
+ *   0x00080000  CLONE_SETTLS  — set tp register to tls
+ *   0x00100000  CLONE_PARENT_SETTID — write child tid → *ptid
+ *   0x00200000  CLONE_CHILD_CLEARTID — store ctid, zero+WAKE on child exit
+ *   0x01000000  CLONE_CHILD_SETTID  — write child tid → *ctid
+ *
+ * CLONE_VM threads share the parent's pgtbl pointer (no deep copy) and mm
+ * (heap/mmap cursors).  This is a true shared-address-space thread — the
+ * child gets its own kernel stack, trap frame, pid, fds, cwd, and a new
+ * user stack / TLS.  Threads are invisible to the original parent's wait4
+ * (thread->parent_pid = caller's pid, and wait4 skips shared_vm procs).
+ * They are reaped by the scheduler's parentless-zombie path when the group
+ * leader dies. */
 static uint64_t sys_clone(struct la_trap_frame *tf)
 {
-    /* For simple cases, clone with SIGCHLD signal acts like fork */
-    /* flags = a0, stack = a1, parent_tid = a2, tls = a3, child_tid = a4 */
-    uint64_t flags = tf->gpr[LA_GPR_A0];
+    /* LoongArch asm-generic clone ABI is NOT the same as RISC-V.
+     * RV:  clone(flags, stack, ptid, tls, ctid)   a3=tls, a4=ctid
+     * LA:  clone(flags, stack, ptid, ctid, tls)   a3=ctid, a4=tls
+     * musl loongarch64 clone.s confirms this: it moves a6(ctid)→a3, a5(tls)→a4. */
+    uint64_t flags    = tf->gpr[LA_GPR_A0];
     uint64_t new_stack = tf->gpr[LA_GPR_A1];
+    uint64_t ptid     = tf->gpr[LA_GPR_A2];
+    uint64_t ctid     = tf->gpr[LA_GPR_A3];   /* a3 = child_tid */
+    uint64_t tls      = tf->gpr[LA_GPR_A4];   /* a4 = tls */
 
-    /* If CLONE_VM is set, that's threading — we don't support it */
-    if (flags & 0x00000100UL) {
-        la_uart_puts("  clone: CLONE_VM not supported\n");
-        return (uint64_t)-1;
+    /* ---- Non-CLONE_VM: act like fork ---- */
+    if ((flags & 0x00000100UL) == 0) {
+        if (new_stack == 0)
+            return sys_fork(tf);
+        /* Clone without VM sharing but with a new stack — fork semantics. */
+        uint64_t ret = sys_fork(tf);
+        if (ret == 0) {
+            /* Child: set new stack pointer */
+            struct la_proc *child = la_current_proc();
+            if (child && child->tf)
+                child->tf->gpr[LA_GPR_SP] = new_stack;
+        }
+        return ret;
     }
 
-    /* Treat as fork */
-    uint64_t ret = sys_fork(tf);
-    if (ret == 0) {
-        /* Child: set new stack pointer if provided */
-        struct la_proc *child = la_current_proc();
-        if (child && child->tf && new_stack)
-            child->tf->gpr[LA_GPR_SP] = new_stack;
+    /* ---- CLONE_VM: create a real thread (shared address space) ---- */
+    struct la_proc *parent = la_current_proc();
+    if (!parent) return (uint64_t)-1;
+
+    struct la_proc *child = la_proc_create_user("thread");
+    if (!child) return (uint64_t)(-LA_EAGAIN);
+
+    /* Share the parent's address space — same pgtbl root and same mm
+     * (heap/mmap cursors), so brk/mmap in any thread advances one cursor. */
+    child->pgtbl = parent->pgtbl;       /* SHARED, not a deep copy */
+    child->mm    = parent->mm;          /* SHARED cursor */
+    child->shared_vm = 1;
+    child->parent_pid = parent->pid;   /* invisible to original parent's wait4 */
+    child->stack_bottom = 0;            /* worker stacks are user-managed */
+
+    /* Own trap frame page (copy of parent's register state) */
+    struct la_trap_frame *ctf = (struct la_trap_frame *)la_pmem_alloc();
+    if (!ctf) {
+        child->state = LA_PROC_UNUSED;
+        return (uint64_t)(-LA_ENOMEM);
     }
-    return ret;
+    {
+        uint64_t *s = (uint64_t *)tf;
+        uint64_t *d = (uint64_t *)ctf;
+        uint64_t *e = (uint64_t *)(ctf + 1);
+        while (d < e) *d++ = *s++;
+    }
+    ctf->gpr[LA_GPR_A0] = 0;           /* child returns 0 */
+    ctf->era += LA_SYSCALL_INSN_SIZE;   /* resume past the syscall instruction */
+
+    /* Child stack pointer */
+    if (new_stack != 0)
+        ctf->gpr[LA_GPR_SP] = new_stack;
+
+    /* TLS register — musl's __clone calls clone with tls=td->self */
+    if ((flags & 0x00080000UL) && tls != 0)
+        ctf->gpr[LA_GPR_TP] = tls;
+
+    child->tf = ctf;
+
+    /* Copy file descriptors (CLONE_FILES semantics — shared table) */
+    for (int i = 0; i < LA_NFD; i++)
+        child->fds[i] = parent->fds[i];
+
+    child->cwd_ino = parent->cwd_ino;
+
+    /* tid pointers */
+    child->clear_child_tid = (flags & 0x00200000UL) ? ctid : 0;
+    if ((flags & 0x00100000UL) && ptid != 0) {
+        int cpid = child->pid;
+        la_copy_to_user(ptid, &cpid, sizeof(cpid));
+    }
+    if ((flags & 0x01000000UL) && ctid != 0) {
+        int cpid = child->pid;
+        la_copy_to_user(ctid, &cpid, sizeof(cpid));
+    }
+
+    la_uart_puts("  clone: thread pid=");
+    la_uart_put_hex(child->pid);
+    la_uart_puts(" sp=");
+    la_uart_put_hex(ctf->gpr[LA_GPR_SP]);
+    la_uart_puts(" parent=");
+    la_uart_put_hex(parent->pid);
+    la_uart_puts("\n");
+
+    return (uint64_t)child->pid;
 }
 
 /* SYS_ioctl: I/O control (stub — return -ENOTTY) */
@@ -1180,6 +1382,7 @@ uint64_t la_syscall_dispatch(struct la_trap_frame *tf)
     /* Threading / futex */
     case SYS_set_tid_address: return sys_set_tid_address(tf);
     case SYS_set_robust_list: return sys_set_robust_list(tf);
+    case SYS_futex:      return sys_futex(tf);
 
     /* File info */
     case SYS_statx:      return sys_statx(tf);

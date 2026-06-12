@@ -43,9 +43,14 @@ static struct la_proc *la_proc_alloc(void)
         p->entry  = 0;
         p->tf     = 0;
         p->pgtbl  = 0;
-        p->heap_top = 0;
+        p->__mm.heap_top = 0;
+        p->__mm.mmap_top = 0;
+        p->mm     = &p->__mm;
         p->stack_bottom = 0;
         p->is_user  = 0;
+        p->shared_vm = 0;
+        p->clear_child_tid = 0;
+        p->wait_chan = 0;
         p->parent_pid = 0;
         p->exit_code  = 0;
         p->cwd_ino    = 0;       /* caller must set to root ino */
@@ -76,27 +81,73 @@ static struct la_proc *la_proc_alloc(void)
 /* ---- release proc slot, kernel stack, and user page table ----
  *
  * Fully reclaims a zombie's resources: the user page table and every page it
- * maps (la_uvm_free_pgtbl), then the kernel stack.  Called by the scheduler
- * for parentless zombies AND by sys_wait when a parent collects a child.
- * Safe to call on a ZOMBIE that has already swtch'd away: its kstack is no
- * longer in use and the kernel runs off DMW0 identity mapping (not the user
- * page table), so freeing pgtbl cannot fault the kernel.  The scheduler
- * invalidates the whole TLB before the next user process runs, so freed pages
- * are not referenced by stale TLB entries. */
+ * maps (la_uvm_free_pgtbl), the kernel stack, and the trap frame page.
+ * Called by the scheduler for parentless zombies AND by sys_wait when a parent
+ * collects a child.  Safe to call on a ZOMBIE that has already swtch'd away:
+ * its kstack is no longer in use and the kernel runs off DMW0 identity mapping
+ * (not the user page table), so freeing pgtbl cannot fault the kernel.  The
+ * scheduler invalidates the whole TLB before the next user process runs, so
+ * freed pages are not referenced by stale TLB entries.
+ *
+ * CLONE_VM threads (shared_vm==1) share the leader's pgtbl; only the leader
+ * (shared_vm==0) owns and frees it.  If the leader is freed while a sibling
+ * still references its pgtbl, ownership transfers to the first found sibling.
+ * This is the backstop against the exact 0x137c "stale PGDL / freed pgtbl"
+ * cascade if a thread somehow outlives the leader. */
 void la_proc_free(struct la_proc *p)
 {
-    if (p->pgtbl) {
-        la_uvm_free_pgtbl(p->pgtbl);
+    /* ---- trap frame page ----
+     * In every live code path (initcode bootstrap, sys_fork,
+     * la_do_exec_syscall) the trap frame is a separately-allocated page,
+     * NOT embedded in the kernel stack.  The old la_do_exec kstack-tf
+     * path is dead code with no callers.  Freeing p->tf is therefore safe
+     * and fixes a per-process page leak that frequent clone/join cycles
+     * would rapidly re-exhaust. */
+    if (p->tf) {
+        la_pmem_free((void *)p->tf);
+        p->tf = 0;
+    }
+
+    /* ---- page table ----
+     * shared_vm threads never own the pgtbl.  The owner (shared_vm==0) frees
+     * it unless a sibling still needs it — then ownership transfers. */
+    if (p->shared_vm == 0 && p->pgtbl) {
+        /* Check whether any other live proc shares this root.
+         * If so, transfer ownership to the first found sibling
+         * so the page table is not freed out from under it. */
+        struct la_proc *procs = la_proc_table();
+        int shared_with_sibling = 0;
+        for (int i = 0; i < LA_NPROC; i++) {
+            if (&procs[i] == p) continue;
+            if (procs[i].state == LA_PROC_UNUSED) continue;
+            if (procs[i].state == LA_PROC_ZOMBIE) continue;
+            if (procs[i].pgtbl == p->pgtbl) {
+                shared_with_sibling = 1;
+                /* Transfer ownership: the first live sibling
+                 * becomes the new owner of the shared root. */
+                procs[i].shared_vm = 0;
+                break;
+            }
+        }
+        if (!shared_with_sibling) {
+            la_uvm_free_pgtbl(p->pgtbl);
+        }
+        p->pgtbl = 0;
+    } else if (p->shared_vm == 1) {
+        /* Thread: skip pgtbl free — the leader (or owner) owns it. */
         p->pgtbl = 0;
     }
+
     if (p->kstack) {
         la_pmem_free((void *)p->kstack);
         p->kstack = 0;
     }
     p->state   = LA_PROC_UNUSED;
     p->pid     = 0;
-    p->tf      = 0;
     p->is_user = 0;
+    p->shared_vm = 0;
+    p->clear_child_tid = 0;
+    p->wait_chan = 0;
 }
 
 /*
@@ -213,7 +264,9 @@ struct la_proc *la_proc_create_user(const char *name)
     p->is_user  = 1;
     p->tf       = 0;
     p->pgtbl    = 0;
-    p->heap_top = 0;
+    p->__mm.heap_top = 0;
+    p->__mm.mmap_top = 0;
+    p->mm       = &p->__mm;
     p->stack_bottom = 0;
 
     /*
@@ -304,11 +357,15 @@ void __attribute__((noreturn)) la_proc_exit(int code)
     for (;;) {}
 }
 
-/* ---- sleep: mark current proc SLEEPING, switch to scheduler ---- */
+/* ---- sleep: mark current proc SLEEPING, switch to scheduler ----
+ * The sleeper is woken by la_proc_wakeup_pid(parent_pid) when a child exits.
+ * wait_chan is cleared to 0 so a futex wakeup_chan never spuriously wakes
+ * a wait4-sleeper. */
 void la_proc_sleep(void)
 {
     struct la_proc *p = la_cpu.current;
     if (!p) return;
+    p->wait_chan = 0;          /* guard: never match a futex wakeup_chan */
     p->state = LA_PROC_SLEEPING;
     la_swtch(&p->ctx, &la_cpu.scheduler_ctx);
 
@@ -317,12 +374,45 @@ void la_proc_sleep(void)
     la_csr_write(crmd | LA_CRMD_IE, LA_CSR_CRMD);
 }
 
-/* ---- wakeup: wake all SLEEPING procs with matching pid ---- */
+/* ---- sleep_chan: futex channel-keyed sleep ----
+ * Sets wait_chan BEFORE state=SLEEPING so that under the non-preemptive
+ * single-CPU scheduler the check-then-sleep in FUTEX_WAIT is observationally
+ * atomic: no other proc can run between the val-compare and the swtch, and
+ * wakeup_chan only ever flips futex sleepers (never pid-sleepers). */
+void la_proc_sleep_chan(void *chan)
+{
+    struct la_proc *p = la_cpu.current;
+    if (!p) return;
+    p->wait_chan = chan;       /* order matters: set channel, then sleep */
+    p->state = LA_PROC_SLEEPING;
+    la_swtch(&p->ctx, &la_cpu.scheduler_ctx);
+
+    /* Re-enable interrupts after waking up */
+    uint64_t crmd = la_csr_read(LA_CSR_CRMD);
+    la_csr_write(crmd | LA_CRMD_IE, LA_CSR_CRMD);
+}
+
+/* ---- wakeup: wake all SLEEPING procs with matching pid ----
+ * Only wakes pid-keyed sleepers (wait_chan==0), never futex sleepers. */
 void la_proc_wakeup_pid(int pid)
 {
     for (int i = 0; i < LA_NPROC; i++) {
-        if (la_procs[i].pid == pid && la_procs[i].state == LA_PROC_SLEEPING)
+        if (la_procs[i].pid == pid
+            && la_procs[i].state == LA_PROC_SLEEPING
+            && la_procs[i].wait_chan == 0)   /* guard: never wake a futex sleeper */
             la_procs[i].state = LA_PROC_RUNNABLE;
+    }
+}
+
+/* ---- wakeup_chan: wake all SLEEPING procs waiting on a futex channel ---- */
+void la_proc_wakeup_chan(void *chan)
+{
+    for (int i = 0; i < LA_NPROC; i++) {
+        if (la_procs[i].state == LA_PROC_SLEEPING
+            && la_procs[i].wait_chan == chan) {
+            la_procs[i].state = LA_PROC_RUNNABLE;
+            la_procs[i].wait_chan = 0;   /* clear channel after wake */
+        }
     }
 }
 
@@ -384,7 +474,25 @@ void la_scheduler(void)
         if (p->is_user) {
             la_trap_ksp = p->kstack + LA_KSTACK_SIZE;
             if (p->pgtbl) {
+                /* Point BOTH address-space roots at this proc's table:
+                 *   - la_tlb_active_pgtbl drives the SOFTWARE TLB refill
+                 *     handler (tlb_la.c);
+                 *   - la_uvm_switch writes the PGDL CSR, which the HARDWARE
+                 *     page-table walker (HPTW) uses on a TLB miss.
+                 * We MUST call la_uvm_switch here, not only on the first-run
+                 * path (la_proc_return).  A process that slept (e.g. in
+                 * wait4) is resumed by THIS scheduler path, not by
+                 * la_proc_return; if PGDL is left stale, HPTW walks the LAST
+                 * table that la_uvm_switch set — frequently a child's table
+                 * that has since been freed by la_proc_free (Step 19 reaping).
+                 * The freed page is then reused/zeroed, so the resumed
+                 * process's first fetch resolves through a bogus root and
+                 * faults (INE/ADEF).  This was the root cause of the
+                 * initcode 0x137c INE cascade: clone(CLONE_VM) killed a
+                 * libc-bench worker; reaping freed its pgtbl root, and the
+                 * stale PGDL then killed pid4, pid2, and initcode in turn. */
                 la_tlb_active_pgtbl = (uint64_t)p->pgtbl;
+                la_uvm_switch(p->pgtbl);
                 /* Drop every global TLB entry.  Because all our mappings
                  * are global and untagged by ASID, entries belonging to a
                  * different process (or this one's pre-exec image) still

@@ -135,8 +135,24 @@ static int la_pte_lookup(uint64_t *root, uint64_t va,
     if (!(pte2 & 1)) return -1;
 
     *out_ppn  = (pte2 >> 12) & 0xFFFFFFFFFFFFFUL;
-    /* Override perm: force G (global, bypass ASID) and P (present) */
-    *out_perm = (pte2 & 0xFFUL & ~(0x40UL | 0x80UL)) | 0x40UL | 0x80UL;
+    /* Copy the PTE permission bits verbatim (V|D|PLV|MAT|G|P|W = bits [8:0]).
+     *
+     * Do NOT force the G (global) bit.  The leaf PTEs are built with G=0
+     * (LA_PTE_U_RWX = 0x19F), and this code formerly overrode them to G=1.
+     * That created GLOBAL TLB entries that `invtlb 0` — op 0 invalidates
+     * everything EXCEPT (G=1 && ASID!=0) — does not reliably drop in QEMU.
+     * Such stale global entries outlive the process that created them: once
+     * that process is reaped and its physical pages freed/reused, any other
+     * process mapping the same VPPN (even/odd pair) hits the stale global
+     * entry and translates through the freed page -> ADEF/INE.  This was the
+     * root cause of the libc-bench cascade (pid0b clone(CLONE_VM) segv ->
+     * pid4 ADEF -> pid2 ADEF -> initcode 0x137c INE).
+     *
+     * G=0 entries tagged ASID 0 (we never change ASID) still match every
+     * lookup, AND `invtlb 0` flushes them on every address-space switch, so
+     * the scheduler-resume path (which inval's but, unlike la_proc_return,
+     * does not re-fill_all) no longer inherits stale translations. */
+    *out_perm = pte2 & 0x1FFUL;
     return 0;
 }
 
@@ -237,13 +253,15 @@ int la_tlb_fill_all(uint64_t *pgtbl)
                 uint64_t vppn = va >> 13;
 
                 uint64_t ppn_e = 0, perm_e = 0, ppn_o = 0, perm_o = 0;
+                /* Use the PTE's own perm (bits [8:0], G=0) — see la_pte_lookup
+                 * for why we must NOT force G=1 here. */
                 if (have_even) {
                     ppn_e  = (pte2_even >> 12) & 0xFFFFFFFFFFFFFUL;
-                    perm_e = (pte2_even & 0xFFUL & ~(0x40UL | 0x80UL)) | 0x40UL | 0x80UL;
+                    perm_e = pte2_even & 0x1FFUL;
                 }
                 if (have_odd) {
                     ppn_o  = (pte2_odd >> 12) & 0xFFFFFFFFFFFFFUL;
-                    perm_o = (pte2_odd & 0xFFUL & ~(0x40UL | 0x80UL)) | 0x40UL | 0x80UL;
+                    perm_o = pte2_odd & 0x1FFUL;
                 }
 
                 la_tlb_do_fill_normal(vppn, ppn_e, perm_e, ppn_o, perm_o);

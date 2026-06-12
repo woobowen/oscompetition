@@ -632,17 +632,17 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
     /* Initialize heap_top to the end of the highest LOAD segment, page-aligned.
      * brk(0) returns this so busybox knows where heap starts. */
     if (max_vaddr > 0) {
-        p->heap_top = (max_vaddr + LA_PGSIZE - 1) & ~((uint64_t)LA_PGSIZE - 1);
+        p->mm->heap_top = (max_vaddr + LA_PGSIZE - 1) & ~((uint64_t)LA_PGSIZE - 1);
     } else {
-        p->heap_top = 0x400000ULL;  /* fallback: 4MB */
+        p->mm->heap_top = 0x400000ULL;  /* fallback: 4MB */
     }
     /* mmap uses a SEPARATE address region (high, growing up) so it never
      * collides with the brk heap (which grows up from heap_top).
      * Linux keeps brk and mmap in disjoint ranges; mapping mmap onto the
      * heap corrupts musl's malloc metadata. */
-    p->mmap_top = LA_MMAP_BASE;
+    p->mm->mmap_top = LA_MMAP_BASE;
     la_uart_puts("  exec: heap_top=");
-    la_uart_put_hex(p->heap_top);
+    la_uart_put_hex(p->mm->heap_top);
     la_uart_puts("\n");
 
     /* ---- Set up argv on the user stack ---- */
@@ -792,8 +792,12 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
     uint64_t argc64 = (uint64_t)argc;
     la_uvm_copy_in(new_pgtbl, sp, &argc64, 8);
 
-    /* ---- Update process ---- */
-    uint64_t *old_pgtbl = p->pgtbl;   /* freed once new_pgtbl is installed live */
+    /* ---- Update process ----
+     * The old address-space state is about to be freed; capture pointers
+     * before overwriting so we can safely release them after the new state
+     * is installed (never free anything the kernel is still using). */
+    uint64_t           *old_pgtbl = p->pgtbl;
+    struct la_trap_frame *old_tf = p->tf;     /* was a separate page — free it */
     p->pgtbl = new_pgtbl;
 
     /* Reset trap frame on separate page */
@@ -801,6 +805,18 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
     new_tf = (struct la_trap_frame *)la_pmem_alloc();
     if (!new_tf) goto exec_fail;
     p->tf = new_tf;
+    /* Free the OLD tf page now that the new one is assigned.
+     * In every live path (fork, sys_exec, initcode bootstrap) the trap
+     * frame is a separately-allocated page — never on the kernel stack. */
+    if (old_tf && old_tf != new_tf)
+        la_pmem_free((void *)old_tf);
+
+    /* exec replaces the entire process image, so the new image is always a
+     * standalone process (not a CLONE_VM thread).  Reset mm ownership and
+     * thread fields to their default values. */
+    p->mm         = &p->__mm;
+    p->shared_vm  = 0;
+    p->clear_child_tid = 0;
 
     uint64_t *d = (uint64_t *)new_tf;
     uint64_t *e = (uint64_t *)(new_tf + 1);

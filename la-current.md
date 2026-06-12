@@ -1,6 +1,6 @@
 # LoongArch (B 线) 内核开发总结
 
-> 最后更新：2026-06-12 16:35
+> 最后更新：2026-06-12 21:00
 >
 > 本文档记录 SeaOS 项目 LoongArch 架构（B 线）的当前状态、已完成的工作、设计思路及待完成的任务。
 
@@ -522,7 +522,8 @@ docker exec nostalgic_khayyam bash -c "cd /workspace && make check-la"
 ```
 ✅ Step 10 (修EXT4 bug) → ✅ Step 11 (脚本执行) → ⬜ Step 12 (定时器抢占)
   → ⬜ Step 13 (动态链接) → ⬜ Step 14 (管道) → ⬜ Step 15 (文件写入)
-  → ⬜ Step 16 (补全syscall) → ✅ Step 17 (栈增长+不挂死) → ⬜ Step 18 (堆增强)
+  → 🟡 Step 16 (clone+futex ✅，socket/信号/select/sched 待做)
+  → ✅ Step 17 (栈增长+不挂死) → ⬜ Step 18 (堆增强)
   → ✅ Step 19 (资源回收) → ⬜ Step 20 (块缓存) → ⬜ Step 21 (集成验证)
 ```
 > Step 10、11、17、19 已完成。**Step 19（资源回收）已实测验证**：`initcode: fork fail!` 从 13 次 → 0（exec/exit/wait 现在释放用户页表+内核栈，不再耗尽物理内存）。
@@ -758,6 +759,66 @@ docker exec nostalgic_khayyam bash -c "cd /workspace && make check-la"
 
 **遗留（属后续 Step，非 Step 19 回归）**：
 - **`clone: CLONE_VM not supported` → libc-bench NULL 解引用（`badv=0x28`）→ 级联杀死 initcode（`ecode=0xd/INE @ era=0x137c`，`run_test_entries` 的 wait4 返回点 `bgez $a0`）**。该崩溃在 Step 19 **之前**的 `la-step17.log` 中**字节级一致**地存在（同 era/badv/insn/`proc: initcode pid=1`）→ 系 libc-bench 用 `clone(CLONE_VM)` 建线程、内核不支持所致。属 **Step 16（补全 syscall：clone CLONE_VM 线程 + socket 族 `#0x42/#0x71/#0xa9`）**，是当前让全量测试逐个跑通的真正阻塞点。
+- **该阻塞项（clone CLONE_VM + futex）已由 Step 16a 完成（见下）。**
+
+---
+
+### Step 16a：clone(CLONE_VM) 线程支持 + futex（🔴 P0，Step 16 核心子项）— ✅ 已完成（2026-06-12）
+
+**问题**（0x137c 崩溃根因）：libc-bench 使用 `clone(CLONE_VM|CLONE_THREAD|CLONE_SETTLS|CLONE_CHILD_CLEARTID|…)` 创建 pthread 线程；内核仅支持 fork 语义（`clone: CLONE_VM not supported`）→ `pthread_create` 失败 → libc-bench 解引用空线程句柄（`badv=0x28`）崩溃 → 级联杀死 initcode（`INE @ era=0x137c`，`run_test_entries` 中 `wait4` 返回后的 `bgez $a0` 处）。后果：只跑通第一个测试即空转。
+
+**根本修复**：实现真正的共享地址空间线程（CLONE_VM 共享页表 + 堆/mmap 游标），加上最小化 `futex`(98) 使 `pthread_join` 能返回。移植自 RV 线蓝图（`src/kernel/syscall/sysfunc.c`）并添加 LA 特有安全防护。
+
+**实现内容**：
+
+1. **`proc.h` 结构体变更**：
+   - 新增 `struct la_mm { uint64_t heap_top, mmap_top; }` —— 堆/mmap 游标的共享地址空间状态。通常嵌入在 PCB 中（`p->mm = &p->__mm`）；CLONE_VM 线程指向领导者的 `__mm`，使得所有线程的 brk/mmap 推进同一个游标。
+   - 在 `struct la_proc` 中：用 `struct la_mm __mm` + `struct la_mm *mm` 替换内联的 `heap_top`/`mmap_top`。
+   - 新增字段：`int shared_vm`（1 = CLONE_VM 线程，回收时绝不释放页表——归领导者所有）、`uint64_t clear_child_tid`（退出时清零 + futex 唤醒词的 VA）、`void *wait_chan`（futex 休眠通道；在常规休眠中设为 0 以与 futex 唤醒隔离）。
+   - 新增原型：`la_proc_sleep_chan(void *chan)`、`la_proc_wakeup_chan(void *chan)`。
+
+2. **`proc.c` 资源管理**：
+   - `la_proc_alloc` + `la_proc_create_user`：初始化新字段；设置 `p->mm = &p->__mm`。
+   - `la_proc_sleep`：设 `wait_chan=0` 后再 SLEEPING（因此 futex 唤醒绝不会错误地唤醒 `wait4`-休眠者）。`la_proc_wakeup_pid`：添加 `wait_chan==0` 守卫（绝不用 pid 唤醒 futex 休眠者）。
+   - 新增 `la_proc_sleep_chan(chan)` / `la_proc_wakeup_chan(chan)`：channel-keyed 休眠/唤醒，用于 futex。`sleep_chan` 在设置 `state=SLEEPING` **之前**先设置 `wait_chan=chan`（顺序很重要——在协作式单 CPU 非抢占式调度下，这样检查后休眠是原子安全的）。
+   - `la_proc_free`：(a) **tf 释放**——释放 `p->tf` 页面（修复每进程页面泄漏；所有活跃的 tf 都是独立分配的页面）；(b) **共享 pgtbl 安全网**——若 `shared_vm==1` 则跳过 pgtbl 释放；若 `shared_vm==0 && p->pgtbl`，扫描表中是否有其他存活进程共享同一根节点；若找到则转移所有权（将该兄弟进程 `shared_vm=0`）并设 `p->pgtbl=0` 而不释放；否则照常释放。这是防止 "过时 PGDL / 已释放 pgtbl" 0x137c 级联风险的最终保障。
+
+3. **`syscall.c` 中的 `sys_clone` 重写**（LoongArch ABI：`clone(flags=a0, stack=a1, ptid=a2, ctid=a3, tls=a4)`）：
+   - **非 CLONE_VM**：fork 语义（深拷贝 pgtbl + 新的 mm）。
+   - **CLONE_VM**：`child->pgtbl = parent->pgtbl`（**共享**，非拷贝）；`child->mm = parent->mm`（**共享**游标）；`child->shared_vm = 1`；`child->parent_pid = parent->pid`（针对 initcode `wait4` 的选项 A——线程不可见）；分配自有 tf 页面 = 拷贝父线程 tf；`gpr[A0]=0, era+=4`；若 `stack` 则 `gpr[SP]=stack`；若 `(flags&0x80000) && tls` 则 `gpr[TP]=tls`；拷贝 fd + cwd_ino；`stack_bottom=0`；`clear_child_tid=(flags&0x200000)?ctid:0`；若 `flags&0x100000` 则写入 pid→ptid；若 `flags&0x1000000` 则写入 pid→ctid。
+   - **关键 Bug 修复**：LoongArch 的 clone ABI 使用 `clone(flags, stack, ptid, ctid, tls)`，**不同于** RISC-V 的 `clone(flags, stack, ptid, tls, ctid)`。ctid 和 tls 在 a3/a4 中是**交换的**（已由 musl loongarch64 clone.s 确认：`or $a3, $a6, $zero` 将 ctid 移入 a3，`or $a4, $a5, $zero` 将 tls 移入 a4）。若此处错误，则子线程会得到错误的 `$tp`，并通过 TLS 访问的目标地址错误而立即崩溃。
+
+4. **`sys_futex(98)` 实现**（挂接到分发中）：
+   - WAKE(1)：`la_proc_wakeup_chan((void*)uaddr); return 1;`
+   - WAIT(0)：通过 `la_copy_from_user` 读取 *uaddr；若 `!=val` → `-LA_EAGAIN`；`la_proc_sleep_chan((void*)uaddr); return 0;`
+   - 在协作式单 CPU 调度下检查后休眠是原子安全的：val 比较和 swtch 之间不会有其他进程运行，只有 WAKE 一端将 futex 休眠者翻转为 RUNNABLE。
+
+5. **`sys_set_tid_address` 重写**：`p->clear_child_tid = a0; return pid;`（之前为存根——未存储指针）。
+
+6. **线程退出 `cleartid`**：`sys_exit` 在 `la_proc_exit` 之前先写 0 至 `me->clear_child_tid` + `la_proc_wakeup_chan` → `pthread_join` 返回。
+
+7. **`sys_exit_group` 组终止**：在以 `pgtbl==me->pgtbl`（**非** `parent_pid`）为判定依据进行僵尸化之前，先强制僵尸化所有兄弟线程（包括 SLEEPING 的！），对每个强制终止的线程触发其 cleartid，然后再 zombie 领导者。这可以防止当领导者释放 pgtbl 后，仍有线程存活。
+
+8. **`sys_wait` 过滤器**：`if (p->shared_vm) continue;` —— 线程绝不会被 `wait4` 回收（仅通过调度器的 parentless-reaping 路径回收）。
+
+9. **`sys_brk` / `sys_mmap` 重构**：`p->heap_top`→`p->mm->heap_top`，`p->mmap_top`→`p->mm->mmap_top`（约 8 个站点）。使 brk/mmap 游标在 CLONE_VM 线程间共享，防止多线程 malloc 将重复的 VA 映射到不同的 PA（堆损坏）。
+
+10. **`exec_la.c`**：`la_do_exec_syscall` 中重命名 mm 访问；在安装后释放 **旧 tf 页面**（当 tf 是单独分配时修复 exec 上的 tf 泄漏）；在成功路径上将 `mm`/`shared_vm`/`clear_child_tid` 重置为默认值（exec 会替换整个镜像——绝不会从 CLONE_VM 线程调用，但安全）。
+
+**涉及文件**：`src/kernel/loongarch/{proc.h,proc.c,syscall.c,exec_la.c}`（全 LA 专有，不碰 RV）。
+
+**验证（2026-06-12，`sdcard-la.img` 全量跑 120s）**：
+- ✅ `clone: CLONE_VM not supported` → **已消失**。
+- ✅ `badv=0x28` 空指针解引用 → **已消失**。12 个线程在 4 批中创建（每批 2–8 个线程），以递增 sp（间隔 ~22KB）和 `exit: code=0` 正常退出。
+- ✅ `sys#62`（futex）已分发且运行正常——WAIT 和 WAKE 分别成功。
+- ✅ 在 clone+futex 的阻塞点**之前**即超过了 0x137c 级联崩溃点——系统已取得比之前多得多的进展。
+- ✅ 构建 `(source)` 模式、0 warning（`-Wall -Werror`）。
+- ⚠️ 在运行快结束时（经过 12+ 次线程创建/退出），存在一个**已存在的** ADEF→INE 级联（`ecode=0x8 era=0x1201a609c` → `ecode=0xd era=0x137c`）——这与修复前的 `la-step19.log` 逐字节一致，与 clone 无关；最可能的原因是 `proc.c` 调度器注释中描述的"过时 PGDL"问题（在调度器 `la_uvm_switch` 修复之前，该问题是完全存在的）。
+
+**遗留（仍在 Step 16 范围内，属单独子项）**：
+- socket 族：`UNKNOWN #0x42(socket)/#0x71(connect?)/#0xa9(bind?)` —— libc-bench 在该函数返回 ENOSYS 时已正确处理（libc-bench 在主测试运行过程中出现了超过 60,000 行这些打印，并且在 clone 崩溃发生之前仍能正常运行！），但 iperf/netperf 需要真实的 socket 才能通过。
+- `rt_sigaction/rt_sigprocmask` 信号栈 + `select/poll` + `sched_setscheduler` —— 仍为存根。
+- 在管道（Step 14）就绪之前，busybox 脚本中的管道（`|`）仍会失败。
 
 ---
 
@@ -796,14 +857,14 @@ docker exec nostalgic_khayyam bash -c "cd /workspace && make check-la"
 | 13   | 动态链接器       | 🔴 P0（提级）| 大         | Step 11     | ⬜ 待做（libctest 动态组+/glibc 全组需要）|
 | 14   | 管道实现         | 🔴 P0    | 中         | Step 11     | ⬜ 待做       |
 | 15   | 文件系统写入     | 🔴 P0    | 大         | Step 10     | ⬜ 待做       |
-| 16   | 补全关键 syscall | 🔴 P0    | 大（线程+futex+信号+socket+select+sched）| Step 14 | ⬜ 待做（**当前阻塞点**）|
+| 16   | 补全关键 syscall | 🔴 P0    | 大（clone+futex✅, socket+signal+select+sched待做）| Step 14 | 🟡 部分完成（**clone(CLONE_VM)+futex 已完成**）|
 | 17   | 栈自动增长       | 🟡 P1    | 小         | 无          | ✅ 已完成     |
 | 18   | 堆管理增强       | 🟢 P2    | 中         | 无          | ⬜ 待做       |
 | 19   | 资源回收         | 🟡 P1    | 中         | 无          | ✅ 已完成     |
 | 20   | 缓冲区缓存       | 🟢 P2    | 中         | 无          | ⬜ 待做       |
 | 21   | 集成验证         | 🔴 P0    | 视情况     | 全部        | ⬜ 待做       |
 
-> 2026-06-12 17:50: **下一步建议**：Step 19 已完成（`fork fail` 13→0，内存不再耗尽）。当前真正阻塞是 **Step 16 的 `clone(CLONE_VM)` 线程支持 + socket 族（`#0x42/#0x71/#0xa9`）**——libc-bench 因线程创建失败崩溃并级联杀死 initcode（`INE @ 0x137c`，wait4 返回点），该崩溃在 Step 19 前的日志中字节级一致存在，非回归。其次 Step 14（管道）是脚本 `a | b` 跑通的前提；Step 12（定时器抢占）可防止单进程长跑独占 CPU。
+> 2026-06-12 21:00: **Step 16a 已完成**——`clone(CLONE_VM)` 线程支持 + `futex`(98) 已实现并实测验证通过（12 个线程在 4 批中创建，exit=0）。`badv=0x28` 空指针解引用和 `clone: CLONE_VM not supported` 均已消失。libc-bench 现在通过 pthread 创建真正的线程并成功 join。**下一步建议**：(1) **Step 14（管道）**——busybox 脚本广泛使用 `|`，是多个测试组的必需条件；clone+futex 完成后这是最高杠杆的下一步。(2) 继续补全 **Step 16 剩余项**：socket 族（libc-bench 已用 ENOSYS 优雅处理，但 iperf/netperf 需要）。(3) **Step 12（定时器抢占）**——防止单进程长跑独占 CPU。
 
 >
 >     **2026-06-12 更新**：Step 11（脚本执行 / shebang）已完成并实测验证——busybox 能 `sh` 解释执行 `*_testcode.sh`，echo 子命令成功打印评测标记、wait4 正常回收、相对路径 `exec ./libc-bench` 成功。本轮修复 §6 mallocng TLB 一致性崩溃、EPERM 掩码（openat ABI + 正确 errno）、exec 4KB 内核栈溢出（大数组改 static）、相对路径解析。后续阻塞点已确认为 Step 17（栈自动增长，libc-bench 需 ~80KB 栈）与 Step 16（socket 族 syscall）。

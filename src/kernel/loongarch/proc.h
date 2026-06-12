@@ -51,6 +51,15 @@ struct la_fd {
     int writable;            /* 1 = write allowed */
 };
 
+/* Shared address-space state (heap + mmap cursors).
+ * Normally embedded in each proc (p->mm = &p->__mm).
+ * CLONE_VM threads point their mm at the leader's __mm so brk/mmap
+ * allocators advance a single cursor across the whole thread group. */
+struct la_mm {
+    uint64_t heap_top;         /* user heap top (brk grows up from here) */
+    uint64_t mmap_top;         /* mmap region (grows up, separate from heap) */
+};
+
 /* ---- Process control block ---- */
 struct la_proc {
     int pid;
@@ -61,13 +70,18 @@ struct la_proc {
     struct la_context ctx;     /* saved kernel context */
 
     /* User-mode state */
-    struct la_trap_frame *tf;  /* user trap frame (on kernel stack) */
+    struct la_trap_frame *tf;  /* user trap frame (separate page) */
     uint64_t *pgtbl;           /* user page table root */
-    uint64_t heap_top;         /* user heap top (brk grows up from here) */
-    uint64_t mmap_top;         /* mmap region (grows up, separate from heap) */
+    struct la_mm __mm;         /* inline address-space state (owned by leader) */
+    struct la_mm *mm;          /* points at &__mm normally; for CLONE_VM threads
+                                * points at the leader's __mm */
     uint64_t stack_bottom;     /* lowest mapped user-stack VA (grows down
                                 * from LA_USER_STACK; 0 = not a user proc) */
     int is_user;               /* 1 = user process, 0 = kernel thread */
+    int shared_vm;             /* 1 = CLONE_VM thread (shares pgtbl + mm; do NOT
+                                * free pgtbl on reap — owned by the leader) */
+    uint64_t clear_child_tid;  /* user VA of cleartid word (0 = none) */
+    void  *wait_chan;          /* futex sleep channel (0 = pid-wakeup sleeper) */
 
     /* Process relationships */
     int parent_pid;            /* parent's PID (0 for first process) */
@@ -105,7 +119,9 @@ struct la_proc *la_current_proc(void);
 
 /* ---- Sleep / wakeup ---- */
 void la_proc_sleep(void);
+void la_proc_sleep_chan(void *chan);    /* futex channel-keyed sleep */
 void la_proc_wakeup_pid(int pid);
+void la_proc_wakeup_chan(void *chan);   /* futex channel-keyed wake */
 
 /* ---- Process table accessor (for syscall.c) ---- */
 struct la_proc *la_proc_by_pid(int pid);
