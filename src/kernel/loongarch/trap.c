@@ -132,6 +132,46 @@ void la_trap_dispatch(struct la_trap_frame *tf)
     la_uart_put_hex(tf->estat);
     la_uart_puts("\n");
 
+    /* Diagnostic: for page-fault-like exceptions (PIL=0x1, PIS=0x2,
+     * PIF=0x3, PME=0x4, ADEF=0x8, ADEM=0x9), dump the PTE at badv
+     * so we can see whether the page-table mapping is corrupted or the
+     * TLB/HPTW delivered a stale translation. */
+    if ((ecode >= 0x1 && ecode <= 0x4) || ecode == 0x8 || ecode == 0x9) {
+        struct la_proc *cur = la_current_proc();
+        if (cur && cur->pgtbl) {
+            uint64_t dump_pa = la_uva_to_pa(cur->pgtbl, tf->badv);
+            if (dump_pa) {
+                /* Walk PTE explicitly to get perm bits (la_uva_to_pa
+                 * only returns the PA). */
+                uint64_t idx0 = (tf->badv >> 30) & 0x1FF;
+                uint64_t idx1 = (tf->badv >> 21) & 0x1FF;
+                uint64_t idx2 = (tf->badv >> 12) & 0x1FF;
+                uint64_t e0 = cur->pgtbl[idx0];
+                uint64_t pte = 0;
+                if (e0) {
+                    uint64_t *mid = (uint64_t *)e0;
+                    uint64_t e1 = mid[idx1];
+                    if (e1) {
+                        uint64_t *leaf = (uint64_t *)e1;
+                        pte = leaf[idx2];
+                    }
+                }
+                la_uart_puts("  diag: PTE=");
+                la_uart_put_hex(pte);
+                la_uart_puts(" PGDL=");
+                la_uart_put_hex(la_csr_read(LA_CSR_PGDL));
+                la_uart_puts(" active=");
+                la_uart_put_hex(la_tlb_active_pgtbl);
+                la_uart_puts(" pgtbl=");
+                la_uart_put_hex((uint64_t)cur->pgtbl);
+                la_uart_puts("\n");
+            } else {
+                la_uart_puts("  diag: PTE unmapped "
+                             "(no page table entry)\n");
+            }
+        }
+    }
+
     struct la_proc *p = la_current_proc();
     if (p && p->is_user) {
         la_uart_puts("trap: kill user proc (fault) pid=");

@@ -1,6 +1,6 @@
 # LoongArch (B 线) 内核开发总结
 
-> 最后更新：2026-06-12 22:30
+> 最后更新：2026-06-12 23:00
 >
 > 本文档记录 SeaOS 项目 LoongArch 架构（B 线）的当前状态、已完成的工作、设计思路及待完成的任务。
 
@@ -813,7 +813,7 @@ docker exec nostalgic_khayyam bash -c "cd /workspace && make check-la"
 - ✅ `sys#62`（futex）已分发且运行正常——WAIT 和 WAKE 分别成功。
 - ✅ 在 clone+futex 的阻塞点**之前**即超过了 0x137c 级联崩溃点——系统已取得比之前多得多的进展。
 - ✅ 构建 `(source)` 模式、0 warning（`-Wall -Werror`）。
-- ⚠️ 在运行快结束时（经过 12+ 次线程创建/退出），存在一个**已存在的** ADEF→INE 级联（`ecode=0x8 era=0x1201a609c` → `ecode=0xd era=0x137c`）——这与修复前的 `la-step19.log` 逐字节一致，与 clone 无关；最可能的原因是 `proc.c` 调度器注释中描述的"过时 PGDL"问题（在调度器 `la_uvm_switch` 修复之前，该问题是完全存在的）。该级联导致 libcbench-musl 无法完整跑完（进程在尾部崩溃）、initcode 最终被拖死——**这是当前让单个测试从头跑到尾的真正阻塞点**。
+- ⚠️ ~~ADEF→INE 级联~~ → **已修复**（2026-06-12，独立 bugfix）：根因是 `la_uvm_free_pgtbl` 释放物理页面后 QEMU 10.0.2 广播式 `invtlb` 不可靠，遗留重复 TLB 条目（同 VPPN，不同 PA，指向已释放页面）→ ADEF/INE。修复：在释放每个数据页之前调用 `la_tlb_inval_page(va)`（`invtlb 0x6`）逐 VA 失效。实测 180s 内 **0 次 crash**。
 
 ---
 
@@ -922,7 +922,7 @@ Step 16 的第二阶段——实现了完整的信号投递基础设施，并补
 | 20   | 缓冲区缓存         | 🟢 P2         | 中                                                 | 无      | ⬜ 待做                                         |
 | 21   | 集成验证           | 🔴 P0         | 视情况                                             | 全部    | ⬜ 待做                                         |
 
-> 2026-06-12 22:30: **Step 16 全部完成**——clone(CLONE_VM) 线程 + futex + 信号投递 + 管道 + 全部观察到的 syscall 存根均已实现。运行时 **0 个 UNKNOWN syscall**。3 个 syscall 编号错误已通过 musl `bits/syscall.h` 交叉验证修复。**下一步建议**：(1) **Step 12（定时器抢占）**——防止单进程长跑独占 CPU，串行测试下不明显但并行/长任务有风险。(2) **Step 13（动态链接）**，必选——libctest 动态组 + 全部 /glibc/ 测试需要。(3) **Step 15（文件系统写入）**——fstime/iozone 等测试需要。（真实 loopback socket、真实 select/poll 仍需后续独立 step，不在 Step 16 原始范围内。）
+> 2026-06-12 23:00: **Step 16 全部完成 + ADEF→INE 级联 bug 已修复**。clone+futex+信号投递+管道+syscall全覆盖。0 个 UNKNOWN syscall。**过时 TLB 条目级联（QEMU 10.0.2 `invtlb` 不可靠）已修复**——`la_uvm_free_pgtbl` 中逐 VA 的 `invtlb 0x6` 失效，180 秒内 0 次崩溃。**下一步建议**：(1) **Step 12（定时器抢占）**。(2) **Step 13（动态链接）**，必选——libctest 动态组 + /glibc/ 需要。(3) **Step 15（文件系统写入）**。
 
 >
 >     **2026-06-12 更新**：Step 11（脚本执行 / shebang）已完成并实测验证——busybox 能 `sh` 解释执行 `*_testcode.sh`，echo 子命令成功打印评测标记、wait4 正常回收、相对路径 `exec ./libc-bench` 成功。本轮修复 §6 mallocng TLB 一致性崩溃、EPERM 掩码（openat ABI + 正确 errno）、exec 4KB 内核栈溢出（大数组改 static）、相对路径解析。后续阻塞点已确认为 Step 17（栈自动增长，libc-bench 需 ~80KB 栈）与 Step 16（socket 族 syscall）。

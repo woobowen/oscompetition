@@ -184,10 +184,43 @@ int la_tlb_refill_one(uint64_t va)
     return 0;
 }
 
-/* ---- Invalidate all TLB entries ---- */
+/* ---- Invalidate all TLB entries (fast path) ----
+ * Called on every scheduler-to-user switch and inside exec before
+ * filling the new image's mappings.  Uses op 0x3 (all entries, all
+ * ASIDs) which is supposed to be a broadcast invalidation.  We add
+ * dbar on both sides as insurance against QEMU reordering. */
 void la_tlb_inval_all(void)
 {
-    asm volatile("invtlb 0, $r0, $r0" ::: "memory");
+    asm volatile("dbar 0" ::: "memory");
+    asm volatile("invtlb 0x3, $r0, $r0" ::: "memory");
+    asm volatile("dbar 0" ::: "memory");
+}
+
+/* ---- Invalidate all TLB entries (deep / page-table-free path) ----
+ *
+ * QEMU 10.0.2's broadcast invtlb 0x3 is NOT reliable when the physical
+ * pages underlying a page-table walk have already been freed and may be
+ * reused before the invalidation completes: duplicate TLB entries
+ * (same VPPN, different PA, one stale) survive broadcast inval and the
+ * CPU hits the wrong one, translating through freed/reused memory →
+ * ADEF/INE cascade.
+ *
+ * Workaround: iterate every STLB slot (2112 entries), read each valid
+ * entry via tlbrd, and individually invalidate the matching VPPN with
+ * invtlb 0x6 (VA-targeted, drops both G=0 and G=1).  This is O(N) —
+ * only called from la_uvm_free_pgtbl, not the hot scheduler path. */
+void la_tlb_inval_all_deep(void)
+{
+    for (int i = 0; i < 2112; i++) {
+        la_csr_write(i, 0x10);               /* TLBIDX = i */
+        asm volatile("tlbrd" ::: "memory");  /* read entry into CSRs */
+        uint64_t idx = la_csr_read(0x10);
+        if (!(idx & (1ULL << 63))) {         /* NE=0 → valid */
+            uint64_t ehi = la_csr_read(0x11); /* TLBEHI */
+            asm volatile("invtlb 0x6, $r0, %0" :: "r"(ehi) : "memory");
+        }
+    }
+    asm volatile("dbar 0" ::: "memory");
 }
 
 /* ---- Invalidate the TLB pair (even/odd) matching a single VA ----

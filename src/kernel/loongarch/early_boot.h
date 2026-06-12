@@ -116,6 +116,7 @@ int      la_copy_str_from_user(char *kdst, uint64_t usrc, uint32_t max);
 /* ---- TLB management ---- */
 void la_tlb_init(void);
 void la_tlb_inval_all(void);
+void la_tlb_inval_all_deep(void);            /* deep (O(2112)) — for pgtbl free only */
 void la_tlb_inval_page(uint64_t va);
 int  la_tlb_fill_all(uint64_t *pgtbl);
 int  la_tlb_refill_one(uint64_t va);

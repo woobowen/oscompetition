@@ -437,16 +437,20 @@ void la_uvm_free_pgtbl(uint64_t *root)
 {
     if (!root) return;
 
-    /* Drop every TLB entry BEFORE releasing the pages.  Even though fork
-     * deep-copies (no shared pages), the dying process's own TLB entries —
-     * which point at the very physical pages we are about to free — may still
-     * be live in the TLB.  Once those pages are reclaimed and reused for a
-     * different mapping, a stale entry translating the same VPPN would route a
-     * fetch/load through the reused page (garbage -> ADEF/INE).  Flushing here
-     * guarantees no translation outlives the pages it references, regardless
-     * of invtlb/G-bit corner cases.  Safe because the kernel runs off the DMW0
-     * identity window, not the user TLB, while doing the free. */
-    la_tlb_inval_all();
+    /* Walk the 3-level table and, for each mapped data page, inval
+     * the TLB entry for that VA BEFORE freeing the physical page.
+     *
+     * QEMU 10.0.2's broadcast invtlb (op 0x0/0x3) is not reliable:
+     * duplicate TLB entries for the same VPPN (one stale, one fresh)
+     * survive the broadcast and the CPU may hit the stale entry,
+     * translating through a now-freed/reused physical page → ADEF/INE
+     * cascade.  Per-VA invalidation (op 0x6 = "invalidate by VA, both
+     * G=0 and G=1") atomically drops the exact TLB pair that referenced
+     * the page we are about to free.
+     *
+     * This is O(pages) — ~500 invals for a typical process — which is
+     * much cheaper than the deep 2112-slot scan, and is called only at
+     * process teardown, not on the hot scheduler path. */
 
     for (int i = 0; i < LA_PT_ENTRIES; i++) {
         uint64_t e0 = root[i];
@@ -460,8 +464,16 @@ void la_uvm_free_pgtbl(uint64_t *root)
 
             for (int k = 0; k < LA_PT_ENTRIES; k++) {
                 uint64_t e2 = leaf[k];
-                if (e2 & LA_PTE_V)
-                    la_pmem_free((void *)LA_PTE_PPN(e2));   /* data page */
+                if (!(e2 & LA_PTE_V)) continue;
+
+                /* Invalidate the TLB entry for this VA before
+                 * freeing the backing page. */
+                uint64_t va = ((uint64_t)i << 30)
+                            | ((uint64_t)j << 21)
+                            | ((uint64_t)k << 12);
+                la_tlb_inval_page(va);
+
+                la_pmem_free((void *)LA_PTE_PPN(e2));   /* data page */
             }
             la_pmem_free(leaf);   /* leaf table page */
         }
