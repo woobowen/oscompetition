@@ -48,6 +48,7 @@ struct la_context {
 #define LA_FD_FILE    2   /* regular file on ext4/SeaFS (read-only) */
 #define LA_FD_PIPE    3   /* pipe (read end or write end) */
 #define LA_FD_MEMFS   4   /* writable file on memfs */
+#define LA_FD_SOCKET  5   /* loopback socket (TCP / UDP) */
 
 /* ---- Pipe ---- */
 #define LA_PIPE_SIZE   4096
@@ -68,6 +69,7 @@ struct la_fd {
     int type;                /* LA_FD_UNUSED/CONSOLE/FILE/PIPE */
     int writable;            /* 1 = write allowed */
     struct la_pipe *pipe;    /* pipe object (valid when type == LA_FD_PIPE) */
+    int sock_idx;            /* socket index (valid when type == LA_FD_SOCKET) */
 };
 
 /* Shared address-space state (heap + mmap cursors).
@@ -145,6 +147,7 @@ struct la_proc {
     int shared_vm;             /* 1 = CLONE_VM thread (shares pgtbl + mm; do NOT
                                 * free pgtbl on reap — owned by the leader) */
     int ticks;                 /* remaining timer ticks in this time slice */
+    int sched_priority;        /* RT priority (0 = normal, 1–99 = SCHED_FIFO) */
     uint64_t clear_child_tid;  /* user VA of cleartid word (0 = none) */
     void  *wait_chan;          /* futex sleep channel (0 = pid-wakeup sleeper) */
 

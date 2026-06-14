@@ -111,6 +111,24 @@ int      memfs_delete(const char *path);
 int      memfs_getdents(int dir_ino, void *buf, uint32_t len);
 uint32_t memfs_inode_size(int ino);
 int      memfs_path_prefix(const char *path, const char *prefix);
+const char *memfs_get_path(int ino);
+int      memfs_truncate(int ino);
+
+/* ---- Loopback socket layer ---- */
+void la_socket_init(void);
+int  la_sock_socket(int domain, int type, int protocol);
+int  la_sock_bind(int idx, uint32_t addr, uint16_t port);
+int  la_sock_listen(int idx, int backlog);
+int  la_sock_connect(int idx, uint32_t addr, uint16_t port);
+int  la_sock_accept(int idx, uint32_t *uaddr, uint16_t *uport);
+int  la_sock_send(int idx, const void *buf, uint32_t len);
+int  la_sock_recv(int idx, void *buf, uint32_t len);
+void la_sock_close(int idx);
+int  la_sock_sendto(int idx, const void *buf, uint32_t len,
+                    uint32_t addr, uint16_t port);
+int  la_sock_recvfrom(int idx, void *buf, uint32_t len,
+                      uint32_t *uaddr, uint16_t *uport);
+int  la_sock_getname(int idx, uint32_t *uaddr, uint16_t *uport, int peer);
 
 /* ---- User virtual memory ---- */
 uint64_t *la_uvm_create(void);

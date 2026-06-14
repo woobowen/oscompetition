@@ -509,4 +509,11 @@ void la_uvm_free_pgtbl(uint64_t *root)
         la_pmem_free(mid);   /* mid table page */
     }
     la_pmem_free(root);   /* root table page */
+
+    /* After freeing all PT pages and doing per-VA invals, fire one
+     * full TLB invalidation as insurance.  QEMU 10.0.2's broadcast
+     * invtlb is known to leak entries; a single extra full inval
+     * here costs ~zero (process teardown path, not hot) and prevents
+     * stale entries from outliving the freed page table. */
+    la_tlb_inval_all();
 }

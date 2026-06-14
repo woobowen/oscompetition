@@ -1,12 +1,14 @@
 loongarch boot start
 [init] pmem
-  pmem: region 0x0000000000219000 - 0x0000000010000000
-  pmem: 0x000000000000fde7 pages (0x00000000000000fd MB)
+  pmem: region 0x0000000000997000 - 0x0000000010000000
+  pmem: 0x000000000000f669 pages (0x00000000000000f6 MB)
 [init] kvm
   kvm: DMW0 identity-mapped for PLV0
 [init] paging
-  uvm: PWCL=0x0000000013e4d52c (expect 0x0000000053e4d52c)
+  uvm: PWCH=0x0000000001000000 (HPTW_EN expect 0x0000000001000000)
+  uvm: PWCL=0x0000000013e4d52c (expect 0x0000000013e4d52c)
 [init] tlb
+  tlb: STLBPS=0x000000000000000c (PS=12 for STLB)
 [init] timer
   timer: periodic 100 Hz enabled
 [init] proc
@@ -23,24 +25,25 @@ loongarch boot start
       io_val=0x0000000079006e54
     host_features=0x0000000079006e54
     queue_max=0x0000000000000100
-    vq_pages=0x0000000000212000 pfn=0x0000000000000212
+    vq_pages=0x0000000000990000 pfn=0x0000000000000990
     status=0x000000000000000f
   virtio: block device ready
+  bio: buffer cache (0x0000000000000100 blocks, 0x0000000000000400 KB)
 [init] fs
   fs: mounting...
   fs: SeaOS FS mounted! inodes=0x0000000000010000 data=0x000000000000042b+0x0000000000140000
 [init] fs: mounted
+  memfs: initialized (0x0000000000000080 inodes)
+  socket: pool initialized (0x0000000000000020 sockets)
 [init] creating first user process
 [initcode] creating first user process
   proc: created user 'initcode' pid=0x0000000000000001
 [initcode] trap frame at 0x000000000fff7000 era=0x0000000000001000 sp=0x0000007fffffe000
 [initcode] first user process ready
 [init] entering scheduler
-  ub: p=0x000000000020c090
-  ub: tf=0x000000000fff7000
-  proc_return: filled 0x0000000000000002 TLB entries
-  proc_return: switching DA=0 PG=1
-  proc_return: DA=0 PG=1 ok, entering userret
 initcode: started
+  open: lookup '/musl' FAILED
+  open: lookup '/glibc' FAILED
+  getdents: 0 entries
 initcode: no *_testcode.sh found
-shutdown: system halting
+[tick 0x0000000000000001 s] refills=0x000000000000000a

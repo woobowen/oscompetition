@@ -18,7 +18,7 @@
 /* ---- Configuration ---- */
 #define MEMFS_MAX_INODES      128
 #define MEMFS_MAX_NAME        256
-#define MEMFS_PAGES_PER_FILE  16    /* 64 KB max per file */
+#define MEMFS_PAGES_PER_FILE  2048  /* 8 MB max per file (covers fstime up to 32 MB across 4 files) */
 
 /* Inode types */
 #define MEMFS_TYPE_FREE  0
@@ -50,10 +50,14 @@ int      memfs_write(int ino, uint32_t offset,
 int      memfs_read(int ino, uint32_t offset,
                     void *buf, uint32_t len);
 int      memfs_delete(const char *path);        /* unlink / rmdir */
+int      memfs_truncate(int ino);              /* reset file size to 0, free all data pages */
 int      memfs_getdents(int dir_ino, void *buf, uint32_t len);
 uint32_t memfs_inode_size(int ino);
 
 /* Helper: does `path` start with the given prefix? */
 int      memfs_path_prefix(const char *path, const char *prefix);
+
+/* Return the stored absolute path of a memfs inode (for cwd resolution). */
+const char *memfs_get_path(int ino);
 
 #endif

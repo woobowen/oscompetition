@@ -163,6 +163,23 @@ int memfs_read(int ino, uint32_t offset, void *buf, uint32_t len)
     return (int)done;
 }
 
+int memfs_truncate(int ino)
+{
+    if (ino < 0 || ino >= MEMFS_MAX_INODES) return -1;
+    struct memfs_inode *inode = &memfs_inodes[ino];
+    if (inode->type != MEMFS_TYPE_FILE) return -1;
+
+    /* Free all data pages */
+    for (int j = 0; j < MEMFS_PAGES_PER_FILE; j++) {
+        if (inode->pages[j]) {
+            la_pmem_free(inode->pages[j]);
+            inode->pages[j] = 0;
+        }
+    }
+    inode->size = 0;
+    return 0;
+}
+
 int memfs_delete(const char *path)
 {
     int ino = memfs_lookup(path);
@@ -275,6 +292,13 @@ uint32_t memfs_inode_size(int ino)
 {
     if (ino < 0 || ino >= MEMFS_MAX_INODES) return 0;
     return memfs_inodes[ino].size;
+}
+
+const char *memfs_get_path(int ino)
+{
+    if (ino < 0 || ino >= MEMFS_MAX_INODES) return "/";
+    if (memfs_inodes[ino].type == MEMFS_TYPE_FREE) return "/";
+    return memfs_inodes[ino].path;
 }
 
 int memfs_path_prefix(const char *path, const char *prefix)

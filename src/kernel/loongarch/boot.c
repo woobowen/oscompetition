@@ -89,6 +89,9 @@ void la_boot_main(void)
     /* 8b  Initialise writable memory filesystem */
     memfs_init();
 
+    /* 8c  Initialise loopback socket layer */
+    la_socket_init();
+
     /* 9  Create first user process (initcode) */
     la_uart_puts("[init] creating first user process\n");
     la_proc_make_first();

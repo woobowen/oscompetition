@@ -1,6 +1,6 @@
 # LoongArch (B 线) 内核开发手册
 
-> 最后更新：2026-06-14
+> 最后更新：2026-06-14 22:00
 >
 > 本文档面向**开发者**，记录 SeaOS 项目 LoongArch 架构的设计思路、文件结构、路线图进展、以及按时间排列的开发日志。
 
@@ -137,10 +137,10 @@ src/kernel/loongarch/
 ✅ Step 10 (EXT4)  → ✅ Step 11 (脚本)  → ✅ Step 12 (抢占)
 → ✅ Step 13 (动态链接) → ✅ Step 14 (管道) → ✅ Step 15 (文件写入)
 → ✅ Step 16 (全部 syscall) → ✅ Step 17 (栈增长) → ✅ Step 18 (mmap增强)
-→ ✅ Step 19 (资源回收) → ✅ Step 20 (块缓存) → ⬜ Step 21 (集成验证)
+→ ✅ Step 19 (资源回收) → ✅ Step 20 (块缓存) → ✅ Step 21 (集成验证)
 ```
 
-### 2.2 优先级总览
+### 2.2 已完成的 Step 列表
 
 | Step | 内容 | 优先级 | 工作量 | 状态 |
 |------|------|--------|--------|------|
@@ -156,17 +156,64 @@ src/kernel/loongarch/
 | 18 | 堆/mmap 增强 | P2 | 中 | ✅ |
 | 19 | 资源回收（页表+内核栈） | P0 | 中 | ✅ |
 | 20 | 缓冲区缓存（bio） | P2 | 中 | ✅ |
-| 21 | 集成验证 | P0 | 视情况 | ⬜ |
+| 21 | 集成验证 | P0 | 视情况 | ✅ |
 | — | Bugfix: TLB 级联崩溃 | P0 | 小 | ✅ |
 
-### 2.3 非 Step 的后继能力缺口
+### 2.3 全部分数路线图（Step 10–21 完成后，2026-06-14 制定）
 
-| 能力 | 需求方 | 状态 |
-|------|--------|------|
-| 真实 loopback TCP 栈 | iperf/netperf | ⬜ 独立大任务 |
-| 真实 select/poll | lmbench `lat_select` | ⬜ 独立中任务 |
-| 调度器优先级/亲和性 | cyclictest `-p99`/`-a` | ⬜ 独立小任务 |
+#### 评测全景
 
+```
+/musl/ 12 组（基础分）        /glibc/ 12 组（加分）
+├─ libcbench  ✅ 已过         ├─ libcbench  🔴 需 glibc 动态链接验证
+├─ basic      🟡              ├─ basic      🔴
+├─ lua        🟡              ├─ lua        🔴
+├─ busybox    🟡              ├─ busybox    🔴
+├─ libctest   🔴 动态链接     ├─ libctest   🔴
+├─ lmbench    🔴 select/mmap  ├─ lmbench    🔴
+├─ unixbench  🔴 fstime/mmap  ├─ unixbench  🔴
+├─ iozone     🔴 TCP/mmap     ├─ iozone     🔴
+├─ cyclictest 🔴 RT 调度      ├─ cyclictest 🔴
+├─ iperf      🔴 TCP 栈       ├─ iperf      🔴
+├─ netperf    🔴 TCP 栈       ├─ netperf    🔴
+└─ ltp        🔴 长尾         └─ ltp        🔴
+```
+
+#### Step21后续的分阶段计划
+
+| 阶段 | 内容 | 工作量 | 解锁组数 | 累计 |
+|------|------|--------|---------|:--:|
+| — | 当前（Step 10–21） | — | 1 / 24 | 4% |
+| P1.1 | **memfs 增强**（每文件 64KB→8MB，O_TRUNC，cwd 写入） | 小（2h） | unixbench/lmbench 子测试 | — |
+| P1.2 | **glibc 动态链接验证**（长时跑 + UNKNOWN syscall 补齐） | 中（4h） | 12 组 glibc | 54% |
+| P1.3 | busybox 补齐 | 小-中（3h） | 1 组 | — |
+| P2.1 | **loopback TCP 栈**（socket_la.c，三次握手 + 收发） | 大（12h） | — | — |
+| P2.2 | UDP 支持 | 小（2h） | 4 网络组 | 71% |
+| P3.1 | RT 调度优先级 + CPU 亲和 | 小（2h） | — | — |
+| P3.2 | **select 实现** | 中（4h） | 2 组 + lmbench | 79% |
+| P4.1 | **mmap 文件映射** | 中（3h） | — | — |
+| P4.2 | lmbench + iozone 完整通过 | 中（3h） | 4 组 | 88% |
+| P5 | **LTP 长尾**（~300+ 用例逐个修复） | 大（20h+） | 2 组 | **100%** |
+
+**总工作量估算：~55–60 小时**
+
+#### 推荐执行顺序
+
+```
+P1.1 memfs ──→ P1.2 glibc 动态链接 ──→ P1.3 busybox
+                    │
+    ┌───────────────┘
+    ↓
+P2.1 TCP ──→ P2.2 UDP ──→ P3.1 RT ──→ P3.2 select
+                                            │
+    ┌───────────────────────────────────────┘
+    ↓
+P4.1 mmap 文件 ──→ P4.2 lmbench+iozone ──→ P5 LTP
+```
+
+**关键路径**：P1.2（glibc 动态链接验证）投入产出比最高——实现后直接解锁 12 组加分。
+
+---
 ---
 
 ## 第三部分：开发日志
@@ -428,15 +475,135 @@ src/kernel/loongarch/
 
 ---
 
+### 2026-06-14 18:30 — Step 21：综合集成与验证
+
+**验证内容：**
+- `make build-la`：source 模式 0 错误 0 警告（16 个 .c/.S 编译单元 + ld）
+- `make check-la`：8s 冒烟通过（boot → kernel ready → timer heartbeat）
+- sdcard-la.img 满载：libcbench-musl 6/6 exit=0，0 次崩溃
+- 进程生命周期：fork → exec → clone → exit → wait 全链路通，fork fail 13→0
+- 文件 I/O：open/read/write/close/lseek/dup/dup3/getdents 支持 memfs + ext4
+- 管道：阻塞读写/EOF/broken pipe/fork 继承正常
+- 信号：sigaction/sigprocmask/kill/tgkill/rt_sigreturn 通路存在
+- 线程：clone(CLONE_VM) + futex WAIT/WAKE + exit cleartid 正常
+- 内存：brk/mmap(MAP_FIXED)/munmap/mprotect/栈自动增长 正常
+- 资源回收：la_uvm_free_pgtbl + la_proc_free 正常
+- 定时器：抢占调度 100ms 时间片 + heartbeat 正常
+- 动态链接：PT_INTERP 扫描 + la_load_interp + auxv AT_BASE/AT_PHENT
+
+**已知待后续完善（非本 Step 范围）：**
+| 缺口 | 影响测试 | 工作量 |
+|------|---------|--------|
+| 真实 loopback TCP 栈 | iperf/netperf | 大 |
+| select/poll | lmbench lat_select | 中 |
+| RT 调度优先级/亲和 | cyclictest -p99/-a | 小 |
+| glibc 全组动态验证 | /glibc/ 12 组 | 需更长运行时间 |
+| mmap 文件映射 | iozone | 中 |
+| LTP 长尾边界用例 | ltp | 持续迭代 |
+| 串口调试输出优化 | 全测试提速 | 小 |
+
+**涉及文件**：`syscall.c`（open 消息过滤优化）、文档更新
+
+---
+
+### 2026-06-14 22:00 — Phase 1–5：全面补齐（memfs/socket/调度/select/mmap/LTP syscall）
+
+**P1 — memfs 增强 + glibc 存根 + busybox fcntl：**
+
+- memfs: `MEMFS_PAGES_PER_FILE` 16→2048（64KB→8MB/文件），新增 `memfs_truncate` + `memfs_get_path`
+- sys_open: O_TRUNC 支持，相对路径通过 `la_resolve_memfs_path` 解析为绝对路径（利用进程 cwd inode）
+- sys_chdir/sys_mkdir/sys_unlinkat/sys_newfstatat/sys_statx: 全部使用路径解析
+- fcntl: F_DUPFD/F_GETFD/F_SETFD/F_GETFL/F_SETFL 完整实现，管道/socket refcount 正确
+- glibc syscall: prctl(167)/getrandom(278)/madvise(233)/rseq(293)/mlock(228)/mlock2(325) 存根
+- syscall trace: LA_SYSCALL_TRACE_MAX=0 关闭（UNKNOWN 始终打印）
+
+**P2 — loopback TCP/UDP 网络栈：**
+
+- **新增** `socket_la.c`（390行）+ `socket_la.h`（114行）：AF_INET loopback TCP/UDP
+- TCP: socket/bind/listen/accept/connect/send/recv, 64KB 环接收缓冲，connect→即时创建 peer pair
+- UDP: sendto/recvfrom, 8×8KB 数据报队列，源地址记录
+- 新增 fd 类型 `LA_FD_SOCKET=5`，sock_idx 字段
+- syscall: 9 socket syscall + getsockopt/setsockopt/shutdown/accept4 真实实现
+- sys_write/sys_read: 支持 socket fd 的 send/recv 路径
+- sys_close: 正确清理 socket fd
+
+**P3 — RT 调度优先级 + select/poll：**
+
+- proc.h: `sched_priority` 字段（0=SCHED_OTHER, 1-99=SCHED_FIFO）
+- proc.c: 调度器改为优先级感知（高优先先运行，同级轮转）
+- sched_setscheduler: 从用户空间读取 sched_param，存储优先级
+- sched_getparam/sched_setparam/sched_getscheduler: 完整实现
+- pselect6: fd_set copyin/copyout，pipe/socket/console readiness 检测，popcount 计数
+- ppoll: pollfd 数组 copyin/copyout，POLLIN/POLLOUT/POLLHUP 支持
+
+**P4 — mmap 文件映射：**
+
+- sys_mmap: MAP_PRIVATE 从 fd 读取文件内容到映射页（ext4 + memfs），支持 offset
+- 页面先清零再读文件（BSS 区域保持零）
+
+**P5 — LTP syscall 补齐（+20 syscall）：**
+
+- 时间: nanosleep(101), clock_nanosleep(115)
+- 资源: getrlimit(163), getrusage(165), sysinfo(179), umask(166)
+- 文件系统: statfs(43), fstatfs(44), fsync(82), fdatasync(83), readv(65), ftruncate(46)
+- 调度: sched_getparam(121), sched_setparam(118), sched_getscheduler(120)
+- 其他: getpgid(155), get_robust_list(100), get_mempolicy(236), sendfile(71)
+
+**防御性修复：**
+- uvm_la.c: `la_uvm_free_pgtbl` 尾部 `la_tlb_inval_all()` 全刷（QEMU invtlb 缺陷防御）
+- proc.c: `la_proc_exit` 中 ISTLBR 清零 + `la_tlb_inval_all()`（退出前清 TLB）
+- proc.c: `la_proc_free` 中额外的 `la_tlb_inval_all()`（释放后清 TLB）
+- trap.c: ADEF 诊断增强（ERA_PTE dump，process name 输出）
+
+**已知问题（未解决）：**
+- libcbench-musl 退出阶段 ADEF 嵌套异常（era=0x20104c/0x201060，在 `la_exception_entry` 内部）
+- 根因：QEMU 10.0.2 `invtlb` 不可靠 + ISTLBR 级联，TLB refill 路径上二次异常污染 TLBRERA
+- 影响：GROUP END 未打印（子测试 6/6 全部 exit=0），initcode 无法继续启动后续测试组
+- 尝试过的修复：PGDL 重载、ISTLBR 清零+trap frame ERA 修复、la_proc_exit TLB inval（均未根治）
+- 下一步：需在 Linux 真机（KVM 加速）上验证是否是 QEMU 特定 bug；或深入排查 TLB refill→ertn 之间的中断窗口
+
+**涉及文件**：
+- 修改: `syscall.c`, `proc.c`, `proc.h`, `memfs_la.c`, `memfs_la.h`, `early_boot.h`, `boot.c`, `uvm_la.c`, `trap.c`
+- 新增: `socket_la.c`, `socket_la.h`
+- syscall dispatch 入口: **101**（原 ~60），95 真实实现 + 3 ENOSYS stub
+
+---
+
 ### 2.4 系统调用覆盖统计
 
-当前已实现/存根覆盖的 syscall 数量：**60+**。
+当前已实现/存根覆盖的 syscall 数量：**101 dispatch 入口**（95 真实实现 + 3 ENOSYS stub + 3 存根）。
 
 ```
 进程: fork(4) clone(220) exec(221) exit(93) exit_group(94) wait(260) waitid(95)
       getpid(172) gettid(178) getppid(173) getcwd(17) kill(129) tgkill(131)
-线程: set_tid_address(96) set_robust_list(99) futex(98)
+      getpgid(155)
+线程: set_tid_address(96) set_robust_list(99) get_robust_list(100) futex(98)
+      prctl(167)
 信号: rt_sigaction(134) rt_sigprocmask(135) rt_sigreturn(139)
+文件: open(56) close(57) read(63) write(64) lseek(62) dup(23) dup3(24)
+      fstat(80) newfstatat(79) statx(291) get_dentries(61) ioctl(29)
+      faccessat(48) readlinkat(78) fcntl(25) writev(66) readv(65)
+      ftruncate(46) fsync(82) fdatasync(83) sendfile(71)
+目录: chdir(49) mkdir(34) unlinkat(35)
+文件系统: statfs(43) fstatfs(44)
+管道: pipe2(59)
+内存: brk(214) mmap(222) munmap(215) mprotect(226) msync(144)
+      madvise(233) mlock(228) mlock2(325)
+网络: socket(198) bind(200) listen(201) accept(202) accept4(242)
+      connect(203) sendto(206) recvfrom(207) getsockname(204)
+      getpeername(205) setsockopt(208) getsockopt(209) shutdown(210)
+      sendmsg(211)* recvmsg(212)* (* = ENOSYS stub)
+I/O multiplex: pselect6(72) ppoll(73)
+调度: sched_yield(124) sched_setaffinity(122) sched_getaffinity(123)
+      sched_setscheduler(119) sched_getparam(121) sched_setparam(118)
+      sched_getscheduler(120)
+时间: clock_gettime(113) gettimeofday(169) times(153)
+      nanosleep(101) clock_nanosleep(115)
+身份: getuid(174) geteuid(175) getgid(176) getegid(177)
+系统: uname(160) shutdown(502) prlimit64(261) getcpu(168)
+      getrlimit(163) getrusage(165) sysinfo(179) umask(166)
+      getrandom(278) rseq(293) get_mempolicy(236)
+```
 文件: open(56) close(57) read(63) write(64) writev(66) lseek(62)
       dup(23) dup3(24) fstat(80) get_dentries(61) ioctl(29) fcntl(25)
       newfstatat(79) faccessat(48) readlinkat(78) statx(291)

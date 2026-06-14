@@ -16,6 +16,7 @@
 #include "trap.h"
 #include "proc.h"
 #include "memfs_la.h"
+#include "socket_la.h"
 
 /* ---- Syscall numbers (LoongArch asm-generic ABI) ---- */
 #define SYS_fork         4
@@ -39,6 +40,27 @@
 #define SYS_exec       221
 #define SYS_wait       260
 #define SYS_shutdown   502
+
+/* LTP / musl / glibc additional syscalls */
+#define SYS_statfs        43
+#define SYS_fstatfs       44
+#define SYS_ftruncate     46
+#define SYS_readv         65
+#define SYS_sendfile      71
+#define SYS_fsync         82
+#define SYS_fdatasync      83
+#define SYS_get_robust_list 100
+#define SYS_clock_nanosleep 115
+#define SYS_sched_setparam 118
+#define SYS_sched_getscheduler 120
+#define SYS_sched_getparam 121
+#define SYS_getpgid       155
+#define SYS_getrlimit     163
+#define SYS_getrusage     165
+#define SYS_umask         166
+#define SYS_sysinfo       179
+#define SYS_get_mempolicy 236
+
 /* Additional LoongArch syscalls needed by busybox */
 #define SYS_set_tid_address  96
 #define SYS_set_robust_list  99
@@ -89,7 +111,21 @@
 #define SYS_pselect6         72
 #define SYS_ppoll            73
 
-/* Socket family (198–207, return -ENOSYS stubs for now) */
+/* Memory advice / locking */
+#define SYS_madvise         233
+#define SYS_mlock           228
+#define SYS_mlock2          325
+
+/* Process control */
+#define SYS_prctl           167
+
+/* Random */
+#define SYS_getrandom       278
+
+/* Restartable sequences (glibc 2.35+) */
+#define SYS_rseq            293
+
+/* Socket family (real loopback implementations) */
 #define SYS_socket          198
 #define SYS_bind            200
 #define SYS_listen          201
@@ -99,6 +135,12 @@
 #define SYS_recvfrom        207
 #define SYS_getsockname     204
 #define SYS_getpeername     205
+#define SYS_setsockopt      208
+#define SYS_getsockopt      209
+#define SYS_shutdown_sock   210   /* socket shutdown – not the same as SYS_shutdown(502) */
+#define SYS_sendmsg         211
+#define SYS_recvmsg         212
+#define SYS_accept4         242
 
 #define LA_ENOSYS 38
 
@@ -125,6 +167,10 @@
 #define LA_ENOSPC  28
 #define LA_ESPIPE  29
 #define LA_ENAMETOOLONG 36
+#define LA_EPIPE   32
+#define LA_ECONNRESET  104
+#define LA_ECONNREFUSED 111
+#define LA_ENOTCONN    107
 
 /* ---- Root inode numbers (set by fs_la.c after mount) ---- */
 #define LA_ROOT_INO_SEA  0
@@ -184,6 +230,57 @@ static void la_pipe_dup_all(struct la_proc *child)
             child->fds[i].pipe->writeopen++;
         else
             child->fds[i].pipe->readopen++;
+    }
+}
+
+/* ================================================================
+ *  Path resolution helper for memfs (resolves relative paths using cwd)
+ * ================================================================ */
+
+/* Resolve a possibly-relative path to an absolute memfs path.
+ * - If path starts with '/', copy as-is.
+ * - If cwd is a memfs directory (high bit set), prepend cwd path.
+ * - Otherwise (ext4 cwd), use path as-is (memfs ops from ext4 cwd are uncommon).
+ * Always NUL-terminates. */
+static void la_resolve_memfs_path(struct la_proc *p, const char *upath,
+                                   char *out, int max_len)
+{
+    /* If the path is already absolute, use it directly */
+    if (upath[0] == '/') {
+        int i;
+        for (i = 0; upath[i] && i < max_len - 1; i++)
+            out[i] = upath[i];
+        out[i] = '\0';
+        return;
+    }
+
+    /* Check if cwd points to a memfs directory */
+    if (p && (p->cwd_ino & 0x80000000U)) {
+        int cwd_ino = (int)(p->cwd_ino & 0x7FFFFFFFU);
+        const char *cwd_path = memfs_get_path(cwd_ino);
+
+        /* Copy cwd path */
+        int i = 0;
+        while (cwd_path[i] && i < max_len - 1) {
+            out[i] = cwd_path[i];
+            i++;
+        }
+        /* Add separator if cwd doesn't end with '/' */
+        if (i > 0 && out[i - 1] != '/' && i < max_len - 1) {
+            out[i++] = '/';
+        }
+        /* Append relative path */
+        int j = 0;
+        while (upath[j] && i < max_len - 1) {
+            out[i++] = upath[j++];
+        }
+        out[i] = '\0';
+    } else {
+        /* ext4 cwd — just copy the relative path as-is */
+        int i;
+        for (i = 0; upath[i] && i < max_len - 1; i++)
+            out[i] = upath[i];
+        out[i] = '\0';
     }
 }
 
@@ -301,6 +398,19 @@ static uint64_t sys_write(struct la_trap_frame *tf)
         return done;
     }
 
+    /* Socket write (TCP send / UDP sendto without dest) */
+    if (fd >= 0 && fd < LA_NFD && p->fds[fd].type == LA_FD_SOCKET) {
+        if (!p->fds[fd].writable) return (uint64_t)-1;
+        /* Copy user data to kernel buffer and send */
+        static __attribute__((aligned(8))) char sbuf[65536];
+        uint32_t chunk = len;
+        if (chunk > 65536) chunk = 65536;
+        la_copy_from_user(sbuf, buf, chunk);
+        int n = la_sock_send(p->fds[fd].sock_idx, sbuf, chunk);
+        if (n < 0) return (uint64_t)(-LA_EPIPE);
+        return (uint64_t)n;
+    }
+
     /* memfs fd — write to in-memory file */
     if (fd >= 0 && fd < LA_NFD && p->fds[fd].type == LA_FD_MEMFS) {
         if (!p->fds[fd].writable) return (uint64_t)-1;
@@ -383,6 +493,17 @@ static uint64_t sys_read(struct la_trap_frame *tf)
         return chunk;
     }
 
+    /* Socket read (TCP recv) */
+    if (p->fds[fd].type == LA_FD_SOCKET) {
+        static __attribute__((aligned(8))) char rbuf[65536];
+        uint32_t chunk = len;
+        if (chunk > 65536) chunk = 65536;
+        int n = la_sock_recv(p->fds[fd].sock_idx, rbuf, chunk);
+        if (n < 0) return (uint64_t)(-LA_ECONNRESET);
+        if (n > 0) la_copy_to_user(buf, rbuf, (uint32_t)n);
+        return (uint64_t)n;
+    }
+
     /* memfs fd — read from in-memory file */
     if (p->fds[fd].type == LA_FD_MEMFS) {
         uint32_t ino    = p->fds[fd].ino;
@@ -452,6 +573,11 @@ static uint64_t sys_open(struct la_trap_frame *tf)
 
     int writable  = (flags & 1) != 0;      /* O_WRONLY=1 or O_RDWR=2 */
     int may_create = (flags & 0x40) != 0;   /* O_CREAT = 0x40 */
+    int truncate   = (flags & 0x200) != 0;  /* O_TRUNC = 0x200 */
+
+    /* Resolve relative path → absolute for memfs operations */
+    char abs_path[256];
+    la_resolve_memfs_path(p, path, abs_path, sizeof(abs_path));
 
     /* ---- memfs path ----
      * Route to the writable memory filesystem when:
@@ -459,10 +585,14 @@ static uint64_t sys_open(struct la_trap_frame *tf)
      *   2. O_CREAT is set (create in memfs).
      *   3. Opened for writing AND not found on ext4 (create on demand). */
     {
-        int mi = memfs_lookup(path);
+        int mi = memfs_lookup(abs_path);
 
         if (mi >= 0) {
-            /* Exists in memfs — open it */
+            /* Exists in memfs — open it.
+             * If O_TRUNC is set, reset the file (free pages, zero size). */
+            if (truncate)
+                memfs_truncate(mi);
+
             int fd = -1;
             for (int i = 0; i < LA_NFD; i++)
                 if (p->fds[i].type == LA_FD_UNUSED) { fd = i; break; }
@@ -478,7 +608,7 @@ static uint64_t sys_open(struct la_trap_frame *tf)
 
         if (may_create) {
             /* Create new file in memfs */
-            mi = memfs_create(path, MEMFS_TYPE_FILE);
+            mi = memfs_create(abs_path, MEMFS_TYPE_FILE);
             if (mi < 0) return (uint64_t)(-LA_ENOSPC);
 
             int fd = -1;
@@ -503,16 +633,14 @@ static uint64_t sys_open(struct la_trap_frame *tf)
     /* Resolve path to inode */
     uint32_t ino;
     if (la_fs_lookup(path, &ino) < 0) {
-        la_uart_puts("  open: lookup '");
-        la_uart_puts(path);
-        la_uart_puts("' FAILED\n");
+        /* Only log unexpected failures — /proc, /sys, /dev are expected */
+        if (path[0] != '/' || (path[1] != 'p' && path[1] != 's' && path[1] != 'd')) {
+            la_uart_puts("  open: lookup '");
+            la_uart_puts(path);
+            la_uart_puts("' FAILED\n");
+        }
         return (uint64_t)(-LA_ENOENT);
     }
-    la_uart_puts("  open: '");
-    la_uart_puts(path);
-    la_uart_puts("' -> ino=");
-    la_uart_put_hex(ino);
-    la_uart_puts("\n");
 
     /* Allocate fd */
     int fd = -1;
@@ -548,11 +676,16 @@ static uint64_t sys_close(struct la_trap_frame *tf)
     if (p->fds[fd].type == LA_FD_PIPE && p->fds[fd].pipe)
         la_pipe_close_end(p, fd);
 
+    /* Socket cleanup */
+    if (p->fds[fd].type == LA_FD_SOCKET)
+        la_sock_close(p->fds[fd].sock_idx);
+
     p->fds[fd].ino = 0;
     p->fds[fd].offset = 0;
     p->fds[fd].type = LA_FD_UNUSED;
     p->fds[fd].writable = 0;
     p->fds[fd].pipe = 0;
+    p->fds[fd].sock_idx = 0;
     return 0;
 }
 
@@ -698,8 +831,12 @@ static uint64_t sys_chdir(struct la_trap_frame *tf)
     if (la_copy_str_from_user(path, upath, sizeof(path) - 1) < 0)
         return (uint64_t)-1;
 
+    /* Resolve relative path → absolute for memfs */
+    char abs_path[256];
+    la_resolve_memfs_path(p, path, abs_path, sizeof(abs_path));
+
     /* Check memfs first */
-    int mi = memfs_lookup(path);
+    int mi = memfs_lookup(abs_path);
     if (mi >= 0) {
         /* memfs directories are type MEMFS_TYPE_DIR (2) */
         p->cwd_ino = (uint32_t)mi | 0x80000000U;  /* high bit = memfs marker */
@@ -707,7 +844,7 @@ static uint64_t sys_chdir(struct la_trap_frame *tf)
     }
 
     uint32_t ino;
-    if (la_fs_lookup(path, &ino) < 0)
+    if (la_fs_lookup(abs_path, &ino) < 0)
         return (uint64_t)-1;
 
     /* Verify it's a directory */
@@ -723,17 +860,23 @@ static uint64_t sys_mkdir(struct la_trap_frame *tf)
 {
     uint64_t upath = tf->gpr[LA_GPR_A0];   /* pathname */
     /* a1 = mode (ignored) */
+    struct la_proc *p = la_current_proc();
     char path[256];
 
+    if (!p) return (uint64_t)-1;
     if (la_copy_str_from_user(path, upath, sizeof(path) - 1) < 0)
         return (uint64_t)-1;
 
+    /* Resolve relative path → absolute for memfs */
+    char abs_path[256];
+    la_resolve_memfs_path(p, path, abs_path, sizeof(abs_path));
+
     /* Check if already exists in memfs */
-    if (memfs_lookup(path) >= 0)
+    if (memfs_lookup(abs_path) >= 0)
         return (uint64_t)-1;  /* -EEXIST */
 
     /* Create directory inode */
-    int ino = memfs_create(path, MEMFS_TYPE_DIR);
+    int ino = memfs_create(abs_path, MEMFS_TYPE_DIR);
     if (ino < 0) return (uint64_t)-1;
 
     return 0;
@@ -747,12 +890,18 @@ static uint64_t sys_unlinkat(struct la_trap_frame *tf)
     uint64_t upath = tf->gpr[LA_GPR_A1];   /* pathname */
     (void)tf->gpr[LA_GPR_A0];               /* dirfd — ignored */
     (void)tf->gpr[LA_GPR_A2];               /* flags  — ignored */
+    struct la_proc *p = la_current_proc();
     char path[256];
 
+    if (!p) return (uint64_t)-1;
     if (la_copy_str_from_user(path, upath, sizeof(path) - 1) < 0)
         return (uint64_t)-1;
 
-    if (memfs_delete(path) == 0)
+    /* Resolve relative path → absolute for memfs */
+    char abs_path[256];
+    la_resolve_memfs_path(p, path, abs_path, sizeof(abs_path));
+
+    if (memfs_delete(abs_path) == 0)
         return 0;
 
     /* ext4 is read-only — cannot unlink */
@@ -1007,7 +1156,10 @@ static uint64_t sys_mmap(struct la_trap_frame *tf)
 {
     uint64_t addr  = tf->gpr[LA_GPR_A0];
     uint32_t len   = (uint32_t)tf->gpr[LA_GPR_A1];
+    /* int prot  = (int)tf->gpr[LA_GPR_A2]; */
     int      flags = (int)tf->gpr[LA_GPR_A3];
+    int      fd    = (int)tf->gpr[LA_GPR_A4];
+    uint64_t off   = tf->gpr[LA_GPR_A5];
     struct la_proc *p = la_current_proc();
 
     if (!p || !p->pgtbl) return (uint64_t)-1;
@@ -1015,21 +1167,31 @@ static uint64_t sys_mmap(struct la_trap_frame *tf)
 
     uint32_t npages = (len + LA_PGSIZE - 1) / LA_PGSIZE;
     int fixed = (flags & LA_MAP_FIXED) != 0;
+    int anonymous = (flags & LA_MAP_ANONYMOUS) != 0;
 
-    /* ---- MAP_FIXED: exact address required ----
-     * The dynamic linker uses MAP_FIXED to place segments at precise VAs
-     * after performing relocations.  Existing pages in the target range
-     * must be unmapped first. */
+    /* Validate fd for file-backed mappings */
+    int has_fd = 0;
+    uint32_t fd_ino = 0;
+    int fd_is_memfs = 0;
+    if (!anonymous && fd >= 0 && fd < LA_NFD) {
+        if (p->fds[fd].type == LA_FD_FILE) {
+            has_fd = 1;
+            fd_ino = p->fds[fd].ino;
+        } else if (p->fds[fd].type == LA_FD_MEMFS) {
+            has_fd = 1;
+            fd_ino = p->fds[fd].ino;
+            fd_is_memfs = 1;
+        }
+    }
+
+    /* ---- MAP_FIXED: exact address required ---- */
     if (fixed && addr != 0) {
-        /* Unmap any existing pages in the target range */
         for (uint32_t i = 0; i < npages; i++) {
             uint64_t va = addr + (uint64_t)i * LA_PGSIZE;
             uint64_t old_pa = la_uva_to_pa(p->pgtbl, va);
-            if (old_pa) {
-                la_uvm_unmap_page(p->pgtbl, va, 1);  /* free old page */
-            }
+            if (old_pa)
+                la_uvm_unmap_page(p->pgtbl, va, 1);
         }
-        /* Map new pages at exact address */
         for (uint32_t i = 0; i < npages; i++) {
             uint64_t va = addr + (uint64_t)i * LA_PGSIZE;
             uint64_t pa = la_uvm_alloc_page(p->pgtbl, va, 0x19FUL);
@@ -1037,12 +1199,23 @@ static uint64_t sys_mmap(struct la_trap_frame *tf)
             uint8_t *px = (uint8_t *)pa;
             for (uint32_t z = 0; z < LA_PGSIZE; z++) px[z] = 0;
         }
+        /* ---- File-backed: read file content into mapped pages ---- */
+        if (has_fd) {
+            for (uint32_t i = 0; i < npages; i++) {
+                uint64_t va = addr + (uint64_t)i * LA_PGSIZE;
+                uint64_t pa = la_uva_to_pa(p->pgtbl, va);
+                if (!pa) continue;
+                uint64_t file_off = off + (uint64_t)i * LA_PGSIZE;
+                if (fd_is_memfs)
+                    memfs_read((int)fd_ino, (uint32_t)file_off, (void *)pa, LA_PGSIZE);
+                else
+                    la_fs_read_file(fd_ino, (uint32_t)file_off, (void *)pa, LA_PGSIZE);
+            }
+        }
         return addr;
     }
 
-    /* ---- Non-MAP_FIXED: addr is a hint ----
-     * Honour a non-zero hint only if the page is free, otherwise fall back
-     * to the mmap region (high address, separate from brk heap). */
+    /* ---- Non-MAP_FIXED ---- */
     int used_hint = 0;
     if (addr != 0) {
         if (la_uva_to_pa(p->pgtbl, addr) == 0)
@@ -1053,8 +1226,6 @@ static uint64_t sys_mmap(struct la_trap_frame *tf)
         p->mm->mmap_top = addr + (uint64_t)npages * LA_PGSIZE;
     }
 
-    /* Allocate and map pages (skip already-mapped pages).
-     * CRITICAL: Linux mmap(MAP_ANONYMOUS) returns ZEROED pages. */
     for (uint32_t i = 0; i < npages; i++) {
         uint64_t va = addr + (uint64_t)i * LA_PGSIZE;
         if (la_uva_to_pa(p->pgtbl, va) != 0)
@@ -1063,6 +1234,20 @@ static uint64_t sys_mmap(struct la_trap_frame *tf)
         if (pa == 0) return (uint64_t)-1;
         uint8_t *px = (uint8_t *)pa;
         for (uint32_t z = 0; z < LA_PGSIZE; z++) px[z] = 0;
+    }
+
+    /* ---- File-backed: read file content into mapped pages ---- */
+    if (has_fd) {
+        for (uint32_t i = 0; i < npages; i++) {
+            uint64_t va = addr + (uint64_t)i * LA_PGSIZE;
+            uint64_t pa = la_uva_to_pa(p->pgtbl, va);
+            if (!pa) continue;
+            uint64_t file_off = off + (uint64_t)i * LA_PGSIZE;
+            if (fd_is_memfs)
+                memfs_read((int)fd_ino, (uint32_t)file_off, (void *)pa, LA_PGSIZE);
+            else
+                la_fs_read_file(fd_ino, (uint32_t)file_off, (void *)pa, LA_PGSIZE);
+        }
     }
 
     return addr;
@@ -1470,18 +1655,32 @@ static uint64_t sys_statx(struct la_trap_frame *tf)
     /* Handle AT_FDCWD */
     (void)dirfd;
 
-    /* Resolve path to inode */
+    /* Resolve relative path → absolute for memfs lookup */
+    char abs_path[256];
+    la_resolve_memfs_path(p, path, abs_path, sizeof(abs_path));
+
+    /* Check memfs first, then ext4 */
+    int mi = memfs_lookup(abs_path);
+    int ftype;
+    uint64_t fsize;
     uint32_t ino;
-    if (la_fs_lookup(path, &ino) < 0) {
-        la_uart_puts("  statx: '");
-        la_uart_puts(path);
-        la_uart_puts("' not found\n");
-        return (uint64_t)-1;
+
+    if (mi >= 0) {
+        ftype = 0;  /* regular file (memfs dirs show as regular for statx simplicity) */
+        fsize = memfs_inode_size(mi);
+        ino   = (uint32_t)mi | 0x80000000U;  /* mark as memfs ino */
+    } else {
+        if (la_fs_lookup(abs_path, &ino) < 0) {
+            la_uart_puts("  statx: '");
+            la_uart_puts(path);
+            la_uart_puts("' not found\n");
+            return (uint64_t)-1;
+        }
+        ftype = la_fs_inode_type(ino);
+        fsize = la_fs_inode_size(ino);
     }
 
     /* Build a minimal statx struct matching Linux UAPI layout */
-    int ftype = la_fs_inode_type(ino);
-
     {
         char sbuf[256];
         for (int i = 0; i < 256; i++) sbuf[i] = 0;
@@ -1523,7 +1722,7 @@ static uint64_t sys_statx(struct la_trap_frame *tf)
         if (ftype == 1) psx->mode = 0040755;  /* directory */
         else psx->mode = 0100755;             /* regular file */
         psx->ino_lo = ino;
-        psx->size = la_fs_inode_size(ino);
+        psx->size = fsize;
         psx->blocks = (psx->size + 511) / 512;
         psx->dev = 1;
 
@@ -1822,8 +2021,12 @@ static uint64_t sys_newfstatat(struct la_trap_frame *tf)
     if (la_copy_str_from_user(path, upath, sizeof(path) - 1) < 0)
         return (uint64_t)-1;
 
+    /* Resolve relative path → absolute for memfs lookup */
+    char abs_path[256];
+    la_resolve_memfs_path(p, path, abs_path, sizeof(abs_path));
+
     /* Check memfs first */
-    int mi = memfs_lookup(path);
+    int mi = memfs_lookup(abs_path);
     int ftype;
     uint64_t fsize;
     uint32_t ino;
@@ -1874,11 +2077,68 @@ static uint64_t sys_readlinkat(struct la_trap_frame *tf)
     return (uint64_t)(-22); /* -EINVAL */
 }
 
-/* SYS_fcntl: file control (stub) */
+/* SYS_fcntl: file control.
+ *   a0 = fd, a1 = cmd, a2 = arg
+ * Supported commands: F_DUPFD(0), F_GETFD(1), F_SETFD(2), F_GETFL(3), F_SETFL(4) */
+#define LA_F_DUPFD  0
+#define LA_F_GETFD  1
+#define LA_F_SETFD  2
+#define LA_F_GETFL  3
+#define LA_F_SETFL  4
+#define LA_FD_CLOEXEC 1
+
 static uint64_t sys_fcntl(struct la_trap_frame *tf)
 {
-    (void)tf;
-    return 0;
+    int fd  = (int)tf->gpr[LA_GPR_A0];
+    int cmd = (int)tf->gpr[LA_GPR_A1];
+    uint64_t arg = tf->gpr[LA_GPR_A2];
+    struct la_proc *p = la_current_proc();
+
+    if (!p || fd < 0 || fd >= LA_NFD) return (uint64_t)(-LA_EBADF);
+    if (p->fds[fd].type == LA_FD_UNUSED) return (uint64_t)(-LA_EBADF);
+
+    switch (cmd) {
+    case LA_F_DUPFD: {
+        /* Duplicate fd to the lowest available fd >= arg */
+        int start = (int)arg;
+        if (start < 0) start = 0;
+        int newfd = -1;
+        for (int i = start; i < LA_NFD; i++) {
+            if (p->fds[i].type == LA_FD_UNUSED) { newfd = i; break; }
+        }
+        if (newfd < 0) return (uint64_t)(-LA_EMFILE);
+
+        p->fds[newfd] = p->fds[fd];
+
+        /* Bump pipe refcount if duplicating a pipe fd */
+        if (p->fds[newfd].type == LA_FD_PIPE && p->fds[newfd].pipe) {
+            if (p->fds[newfd].writable)
+                p->fds[newfd].pipe->writeopen++;
+            else
+                p->fds[newfd].pipe->readopen++;
+        }
+        return (uint64_t)newfd;
+    }
+    case LA_F_GETFD:
+        /* Return close-on-exec flag (we don't track it — always 0) */
+        return 0;
+    case LA_F_SETFD:
+        /* Accept but ignore FD_CLOEXEC (we don't track it) */
+        return 0;
+    case LA_F_GETFL: {
+        /* Return file access mode flags */
+        int fl = 0;
+        if (p->fds[fd].writable) fl |= 2;  /* O_RDWR */
+        else fl |= 0;  /* O_RDONLY */
+        return (uint64_t)fl;
+    }
+    case LA_F_SETFL:
+        /* Accept but ignore (O_NONBLOCK etc.) */
+        return 0;
+    default:
+        /* Unknown command — silently succeed (most callers treat ENOSYS as fatal) */
+        return 0;
+    }
 }
 
 /* SYS_sched_yield: yield CPU (stub) */
@@ -1980,13 +2240,652 @@ static uint64_t sys_getcpu(struct la_trap_frame *tf)
     return 0;
 }
 
-/* ---- Minimal stubs for socket / sched / select / times ----
- * These return -ENOSYS so programs degrade gracefully.  Real
- * implementations are planned for later steps (loopback socket
- * for iperf/netperf, select/poll for lmbench, scheduler for
- * cyclictest).  */
+/* ---- select / poll (real implementations) ---- */
+
+/* Count set bits in a 64-bit word (popcount). */
+static int la_popcount64(uint64_t x)
+{
+    x = x - ((x >> 1) & 0x5555555555555555ULL);
+    x = (x & 0x3333333333333333ULL) + ((x >> 2) & 0x3333333333333333ULL);
+    x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0FULL;
+    x = (x * 0x0101010101010101ULL) >> 56;
+    return (int)x;
+}
+
+/* Check if a single fd is readable.
+ * Returns 1 if readable, 0 if not, -1 if fd is invalid. */
+static int la_fd_is_readable(struct la_proc *p, int fd)
+{
+    if (fd < 0 || fd >= LA_NFD) return -1;
+    int type = p->fds[fd].type;
+    if (type == LA_FD_UNUSED) return -1;
+
+    /* Console: stdin never has data */
+    if (type == LA_FD_CONSOLE) {
+        if (fd == 0) return 0;   /* stdin — nothing */
+        return 1;                 /* stdout/stderr — always "readable" (write-only) */
+    }
+
+    /* Regular file / memfs: always readable */
+    if (type == LA_FD_FILE || type == LA_FD_MEMFS)
+        return 1;
+
+    /* Pipe: readable if data in buffer or write end closed */
+    if (type == LA_FD_PIPE && p->fds[fd].pipe && !p->fds[fd].writable)
+        return (p->fds[fd].pipe->nwrite > p->fds[fd].pipe->nread
+                || p->fds[fd].pipe->writeopen == 0) ? 1 : 0;
+
+    /* Socket (TCP connected): readable if recv buffer has data or EOF */
+    if (type == LA_FD_SOCKET) {
+        int idx = p->fds[fd].sock_idx;
+        if (idx < 0 || idx >= 32) return -1;
+        /* Access socket pool from socket_la.c — we check via the recv call:
+         * for simplicity, mark TCP connected sockets always ready to try recv. */
+        return 1;
+    }
+
+    return 0;
+}
+
+/* Check if a single fd is writable.
+ * Returns 1 if writable, 0 if not, -1 if fd is invalid. */
+static int la_fd_is_writable(struct la_proc *p, int fd)
+{
+    if (fd < 0 || fd >= LA_NFD) return -1;
+    int type = p->fds[fd].type;
+    if (type == LA_FD_UNUSED) return -1;
+
+    /* Console: stdout/stderr always writable */
+    if (type == LA_FD_CONSOLE) {
+        if (fd >= 1 && fd <= 2) return 1;
+        return 0;
+    }
+
+    /* File / memfs: always writable if opened for write */
+    if (type == LA_FD_FILE || type == LA_FD_MEMFS)
+        return p->fds[fd].writable ? 1 : 0;
+
+    /* Pipe: writable if space in buffer or read end closed */
+    if (type == LA_FD_PIPE && p->fds[fd].pipe && p->fds[fd].writable)
+        return (p->fds[fd].pipe->nwrite < p->fds[fd].pipe->nread + LA_PIPE_SIZE
+                || p->fds[fd].pipe->readopen == 0) ? 1 : 0;
+
+    /* Socket: writable if connected */
+    if (type == LA_FD_SOCKET)
+        return p->fds[fd].writable ? 1 : 0;
+
+    return 0;
+}
+
+/* SYS_pselect6(72): synchronous I/O multiplexing.
+ *   a0 = nfds, a1 = readfds, a2 = writefds, a3 = exceptfds,
+ *   a4 = timeout (struct timespec *), a5 = sigmask (ignored)
+ *
+ * Implementation: poll loop — scan all fds in each set, sleep if nothing
+ * is ready and timeout hasn't expired, then re-scan. */
+static uint64_t sys_pselect6(struct la_trap_frame *tf)
+{
+    int nfds           = (int)tf->gpr[LA_GPR_A0];
+    uint64_t ureadfds  = tf->gpr[LA_GPR_A1];
+    uint64_t uwritefds = tf->gpr[LA_GPR_A2];
+    uint64_t uexceptfds = tf->gpr[LA_GPR_A3];
+    uint64_t utimeout  = tf->gpr[LA_GPR_A4];
+    struct la_proc *p = la_current_proc();
+
+    if (!p) return (uint64_t)(-LA_EBADF);
+    if (nfds < 0 || nfds > LA_NFD) nfds = LA_NFD;
+
+    /* Read timeout if provided */
+    int has_timeout = 0;
+    uint64_t timeout_sec = 0, timeout_nsec = 0;
+    if (utimeout) {
+        uint64_t ts[2];
+        if (la_copy_from_user(ts, utimeout, 16) == 16) {
+            timeout_sec  = ts[0];
+            timeout_nsec = ts[1];
+            has_timeout = 1;
+        }
+    }
+
+    /* Size of fd_set in bytes: (nfds + 63) / 64 * 8 */
+    int fds_bytes = ((nfds + 63) / 64) * 8;
+
+    /* Copy fd_sets from user (max 32 fds → 8 bytes each) */
+    static __attribute__((aligned(8))) uint64_t readfds_bits[4];
+    static __attribute__((aligned(8))) uint64_t writefds_bits[4];
+    static __attribute__((aligned(8))) uint64_t exceptfds_bits[4];
+
+    for (int i = 0; i < 4; i++) {
+        readfds_bits[i]   = 0;
+        writefds_bits[i]  = 0;
+        exceptfds_bits[i] = 0;
+    }
+
+    if (ureadfds && fds_bytes > 0)
+        la_copy_from_user(readfds_bits, ureadfds, fds_bytes < 32 ? (uint32_t)fds_bytes : 32);
+    if (uwritefds && fds_bytes > 0)
+        la_copy_from_user(writefds_bits, uwritefds, fds_bytes < 32 ? (uint32_t)fds_bytes : 32);
+    if (uexceptfds && fds_bytes > 0)
+        la_copy_from_user(exceptfds_bits, uexceptfds, fds_bytes < 32 ? (uint32_t)fds_bytes : 32);
+
+    /* Poll loop */
+    int ready = 0;
+    while (!ready) {
+        /* Build result fd_sets */
+        uint64_t r_res[4] = {0}, w_res[4] = {0}, e_res[4] = {0};
+
+        for (int fd = 0; fd < nfds; fd++) {
+            int word = fd / 64;
+            int bit  = fd % 64;
+
+            /* Check readfds */
+            if (ureadfds && (readfds_bits[word] & (1ULL << bit))) {
+                int r = la_fd_is_readable(p, fd);
+                if (r == 1)
+                    r_res[word] |= (1ULL << bit);
+                else if (r < 0)
+                    r_res[word] |= (1ULL << bit);  /* bad fd → always ready */
+            }
+
+            /* Check writefds */
+            if (uwritefds && (writefds_bits[word] & (1ULL << bit))) {
+                int w = la_fd_is_writable(p, fd);
+                if (w == 1)
+                    w_res[word] |= (1ULL << bit);
+                else if (w < 0)
+                    w_res[word] |= (1ULL << bit);
+            }
+
+            /* exceptfds: always 0 (no exceptions in our model) */
+        }
+
+        /* Count total ready bits */
+        for (int i = 0; i < 4; i++)
+            ready += la_popcount64(r_res[i])
+                   + la_popcount64(w_res[i])
+                   + la_popcount64(e_res[i]);
+
+        if (ready > 0) {
+            /* Copy results back to user */
+            if (ureadfds && fds_bytes > 0)
+                la_copy_to_user(ureadfds, r_res, fds_bytes < 32 ? (uint32_t)fds_bytes : 32);
+            if (uwritefds && fds_bytes > 0)
+                la_copy_to_user(uwritefds, w_res, fds_bytes < 32 ? (uint32_t)fds_bytes : 32);
+            if (uexceptfds && fds_bytes > 0)
+                la_copy_to_user(uexceptfds, e_res, fds_bytes < 32 ? (uint32_t)fds_bytes : 32);
+            return (uint64_t)ready;
+        }
+
+        /* Nothing ready — check timeout */
+        if (has_timeout && timeout_sec == 0 && timeout_nsec == 0)
+            return 0;  /* immediate timeout */
+
+        /* Sleep for one tick (~10 ms) then re-scan.
+         * A full timeout implementation would track elapsed time,
+         * but for cooperative single-CPU scheduling a single sleep
+         * is sufficient for the common case (data arrives quickly). */
+        la_proc_sleep();
+    }
+
+    return 0;
+}
+
+/* SYS_ppoll(73): poll a set of file descriptors.
+ *   a0 = fds (struct pollfd *), a1 = nfds, a2 = timeout (struct timespec *),
+ *   a3 = sigmask (ignored), a4 = sigsetsize (ignored)
+ *
+ * struct pollfd: { fd(i4), events(i2), revents(i2) } — 8 bytes each. */
+static uint64_t sys_ppoll(struct la_trap_frame *tf)
+{
+    uint64_t ufds    = tf->gpr[LA_GPR_A0];
+    int nfds         = (int)tf->gpr[LA_GPR_A1];
+    uint64_t utimeout = tf->gpr[LA_GPR_A2];
+    struct la_proc *p = la_current_proc();
+
+    if (!p || !ufds || nfds < 0) return (uint64_t)(-LA_EBADF);
+    if (nfds > LA_NFD) nfds = LA_NFD;
+
+    /* Read timeout */
+    int has_timeout = 0;
+    uint64_t timeout_sec = 0, timeout_nsec = 0;
+    if (utimeout) {
+        uint64_t ts[2];
+        if (la_copy_from_user(ts, utimeout, 16) == 16) {
+            timeout_sec  = ts[0];
+            timeout_nsec = ts[1];
+            has_timeout = 1;
+        }
+    }
+
+    /* Read pollfd array from user */
+    static __attribute__((aligned(8))) struct { int fd; short events; short revents; } pfds[32];
+    if ((uint32_t)nfds > 32U) nfds = 32;
+    for (int i = 0; i < nfds; i++) {
+        uint8_t pfd[8];
+        if (la_copy_from_user(pfd, ufds + (uint64_t)i * 8, 8) != 8)
+            return (uint64_t)(-LA_EFAULT);
+        pfds[i].fd     = *(int *)&pfd[0];
+        pfds[i].events = *(short *)&pfd[4];
+        pfds[i].revents = 0;
+    }
+
+    /* Poll loop */
+    int ready = 0;
+    while (!ready) {
+        for (int i = 0; i < nfds; i++) {
+            int fd = pfds[i].fd;
+            if (fd < 0) continue;
+            short events = pfds[i].events;
+            pfds[i].revents = 0;
+
+            /* POLLIN (0x001): data available to read */
+            if (events & 0x001) {
+                int r = la_fd_is_readable(p, fd);
+                if (r == 1) pfds[i].revents |= 0x001;
+            }
+            /* POLLOUT (0x004): normal data may be written */
+            if (events & 0x004) {
+                int w = la_fd_is_writable(p, fd);
+                if (w == 1) pfds[i].revents |= 0x004;
+            }
+            /* POLLHUP (0x010): hangup — report for bad/invalid fds */
+            if (events & 0x010) {
+                if (fd < 0 || fd >= LA_NFD || p->fds[fd].type == LA_FD_UNUSED)
+                    pfds[i].revents |= 0x010;
+                else if (p->fds[fd].type == LA_FD_PIPE && p->fds[fd].pipe
+                         && p->fds[fd].pipe->writeopen == 0)
+                    pfds[i].revents |= 0x010;  /* pipe write end closed */
+            }
+
+            if (pfds[i].revents) ready++;
+        }
+
+        if (ready > 0) {
+            /* Write revents back to user */
+            for (int i = 0; i < nfds; i++) {
+                uint8_t pfd[8];
+                *(int *)&pfd[0]   = pfds[i].fd;
+                *(short *)&pfd[4] = pfds[i].events;
+                *(short *)&pfd[6] = pfds[i].revents;
+                la_copy_to_user(ufds + (uint64_t)i * 8, pfd, 8);
+            }
+            return (uint64_t)ready;
+        }
+
+        /* Timeout check */
+        if (has_timeout && timeout_sec == 0 && timeout_nsec == 0)
+            return 0;
+
+        la_proc_sleep();
+    }
+
+    return 0;
+}
 
 static uint64_t sys_stub_enosys(struct la_trap_frame *tf) { (void)tf; return (uint64_t)(-LA_ENOSYS); }
+
+/* ---- Socket syscalls (real loopback implementation) ---- */
+
+/* Copy a sockaddr_in from user space into kernel-space addr/port.
+ * Returns 0 on success, -1 on bad pointer or short copy. */
+static int la_copy_sockaddr_in(uint64_t usockaddr, uint32_t *addr, uint16_t *port)
+{
+    if (!usockaddr) return -1;
+
+    /* struct sockaddr_in: family(2) + port(2) + addr(4) + zero(8) = 16 bytes */
+    uint8_t sa[16];
+    if (la_copy_from_user(sa, usockaddr, 16) != 16) return -1;
+
+    uint16_t family = (uint16_t)sa[0] | ((uint16_t)sa[1] << 8);
+    if (family != LA_AF_INET) return -1;
+
+    *port = (uint16_t)sa[2] | ((uint16_t)sa[3] << 8);   /* network byte order */
+    *addr = (uint32_t)sa[4] | ((uint32_t)sa[5] << 8)
+          | ((uint32_t)sa[6] << 16) | ((uint32_t)sa[7] << 24);
+    return 0;
+}
+
+/* Write a sockaddr_in to user space (for accept / getsockname / getpeername). */
+static int la_put_sockaddr_in(uint64_t usockaddr, uint64_t uaddrlen,
+                               uint32_t addr, uint16_t port)
+{
+    if (!usockaddr) return 0;
+
+    /* Read the user addrlen to know how much space is available */
+    uint32_t addrlen = 0;
+    if (uaddrlen)
+        la_copy_from_user(&addrlen, uaddrlen, 4);
+    if (addrlen < 16) return 0;  /* not enough space */
+
+    uint8_t sa[16];
+    sa[0]  = (uint8_t)(LA_AF_INET);        /* sin_family */
+    sa[1]  = (uint8_t)(LA_AF_INET >> 8);
+    sa[2]  = (uint8_t)(port);              /* sin_port (net order) */
+    sa[3]  = (uint8_t)(port >> 8);
+    sa[4]  = (uint8_t)(addr);              /* sin_addr (net order) */
+    sa[5]  = (uint8_t)(addr >> 8);
+    sa[6]  = (uint8_t)(addr >> 16);
+    sa[7]  = (uint8_t)(addr >> 24);
+    for (int i = 8; i < 16; i++) sa[i] = 0;  /* sin_zero */
+
+    la_copy_to_user(usockaddr, sa, 16);
+    addrlen = 16;
+    if (uaddrlen) la_copy_to_user(uaddrlen, &addrlen, 4);
+    return 0;
+}
+
+/* SYS_socket(198): socket(domain, type, protocol) → fd */
+static uint64_t sys_socket(struct la_trap_frame *tf)
+{
+    int domain   = (int)tf->gpr[LA_GPR_A0];
+    int type     = (int)tf->gpr[LA_GPR_A1];
+    /* int protocol = (int)tf->gpr[LA_GPR_A2]; */
+    struct la_proc *p = la_current_proc();
+
+    if (!p) return (uint64_t)(-LA_EBADF);
+
+    int idx = la_sock_socket(domain, type, 0);
+    if (idx < 0) return (uint64_t)(-LA_EINVAL);
+
+    /* Find a free fd */
+    int fd = -1;
+    for (int i = 0; i < LA_NFD; i++)
+        if (p->fds[i].type == LA_FD_UNUSED) { fd = i; break; }
+    if (fd < 0) {
+        la_sock_close(idx);
+        return (uint64_t)(-LA_EMFILE);
+    }
+
+    p->fds[fd].type     = LA_FD_SOCKET;
+    p->fds[fd].sock_idx = idx;
+    p->fds[fd].writable = 1;
+    p->fds[fd].pipe     = 0;
+    return (uint64_t)fd;
+}
+
+/* SYS_bind(200): bind(fd, sockaddr, addrlen) */
+static uint64_t sys_bind(struct la_trap_frame *tf)
+{
+    int fd            = (int)tf->gpr[LA_GPR_A0];
+    uint64_t usockaddr = tf->gpr[LA_GPR_A1];
+    /* uint32_t addrlen = (uint32_t)tf->gpr[LA_GPR_A2]; */
+    struct la_proc *p = la_current_proc();
+
+    if (!p || fd < 0 || fd >= LA_NFD) return (uint64_t)(-LA_EBADF);
+    if (p->fds[fd].type != LA_FD_SOCKET) return (uint64_t)(-LA_EBADF);
+
+    uint32_t addr;
+    uint16_t port;
+    if (la_copy_sockaddr_in(usockaddr, &addr, &port) < 0)
+        return (uint64_t)(-LA_EINVAL);
+
+    if (la_sock_bind(p->fds[fd].sock_idx, addr, port) < 0)
+        return (uint64_t)(-LA_EINVAL);
+
+    return 0;
+}
+
+/* SYS_listen(201): listen(fd, backlog) */
+static uint64_t sys_listen(struct la_trap_frame *tf)
+{
+    int fd       = (int)tf->gpr[LA_GPR_A0];
+    int backlog  = (int)tf->gpr[LA_GPR_A1];
+    struct la_proc *p = la_current_proc();
+
+    if (!p || fd < 0 || fd >= LA_NFD) return (uint64_t)(-LA_EBADF);
+    if (p->fds[fd].type != LA_FD_SOCKET) return (uint64_t)(-LA_EBADF);
+
+    if (la_sock_listen(p->fds[fd].sock_idx, backlog) < 0)
+        return (uint64_t)(-LA_EINVAL);
+
+    return 0;
+}
+
+/* SYS_accept(202): accept(fd, sockaddr, addrlen) → new fd */
+static uint64_t sys_accept(struct la_trap_frame *tf)
+{
+    int fd            = (int)tf->gpr[LA_GPR_A0];
+    uint64_t uaddr    = tf->gpr[LA_GPR_A1];
+    uint64_t uaddrlen = tf->gpr[LA_GPR_A2];
+    struct la_proc *p = la_current_proc();
+
+    if (!p || fd < 0 || fd >= LA_NFD) return (uint64_t)(-LA_EBADF);
+    if (p->fds[fd].type != LA_FD_SOCKET) return (uint64_t)(-LA_EBADF);
+
+    uint32_t raddr = 0;
+    uint16_t rport = 0;
+    int child_idx = la_sock_accept(p->fds[fd].sock_idx, &raddr, &rport);
+    if (child_idx < 0) return (uint64_t)(-LA_EINVAL);
+
+    /* Allocate fd for the accepted connection */
+    int newfd = -1;
+    for (int i = 0; i < LA_NFD; i++)
+        if (p->fds[i].type == LA_FD_UNUSED) { newfd = i; break; }
+    if (newfd < 0) {
+        la_sock_close(child_idx);
+        return (uint64_t)(-LA_EMFILE);
+    }
+
+    p->fds[newfd].type     = LA_FD_SOCKET;
+    p->fds[newfd].sock_idx = child_idx;
+    p->fds[newfd].writable = 1;
+    p->fds[newfd].pipe     = 0;
+
+    /* Return remote address to caller */
+    la_put_sockaddr_in(uaddr, uaddrlen, raddr, rport);
+
+    return (uint64_t)newfd;
+}
+
+/* SYS_connect(203): connect(fd, sockaddr, addrlen) */
+static uint64_t sys_connect(struct la_trap_frame *tf)
+{
+    int fd            = (int)tf->gpr[LA_GPR_A0];
+    uint64_t usockaddr = tf->gpr[LA_GPR_A1];
+    /* uint32_t addrlen = (uint32_t)tf->gpr[LA_GPR_A2]; */
+    struct la_proc *p = la_current_proc();
+
+    if (!p || fd < 0 || fd >= LA_NFD) return (uint64_t)(-LA_EBADF);
+    if (p->fds[fd].type != LA_FD_SOCKET) return (uint64_t)(-LA_EBADF);
+
+    uint32_t addr;
+    uint16_t port;
+    if (la_copy_sockaddr_in(usockaddr, &addr, &port) < 0)
+        return (uint64_t)(-LA_EINVAL);
+
+    if (la_sock_connect(p->fds[fd].sock_idx, addr, port) < 0)
+        return (uint64_t)(-LA_ECONNREFUSED);
+
+    return 0;
+}
+
+/* SYS_sendto(206): sendto(fd, buf, len, flags, dest_addr, addrlen) */
+static uint64_t sys_sendto(struct la_trap_frame *tf)
+{
+    int fd         = (int)tf->gpr[LA_GPR_A0];
+    uint64_t ubuf  = tf->gpr[LA_GPR_A1];
+    uint32_t len   = (uint32_t)tf->gpr[LA_GPR_A2];
+    /* uint32_t flags = (uint32_t)tf->gpr[LA_GPR_A3]; */
+    uint64_t udest = tf->gpr[LA_GPR_A4];
+    uint32_t addrlen = (uint32_t)tf->gpr[LA_GPR_A5];
+    struct la_proc *p = la_current_proc();
+
+    if (!p || fd < 0 || fd >= LA_NFD) return (uint64_t)(-LA_EBADF);
+    if (p->fds[fd].type != LA_FD_SOCKET) return (uint64_t)(-LA_EBADF);
+
+    uint32_t addr = 0;
+    uint16_t port = 0;
+
+    /* For TCP: send ignores dest_addr (already connected), use peer.
+     * For UDP: dest_addr is required. */
+    if (addrlen >= 16 && udest) {
+        if (la_copy_sockaddr_in(udest, &addr, &port) < 0)
+            return (uint64_t)(-LA_EINVAL);
+    }
+
+    /* Copy user buffer to kernel temp buffer */
+    if (len > 65536) len = 65536;  /* cap */
+    static __attribute__((aligned(8))) char sbuf[65536];
+    if (la_copy_from_user(sbuf, ubuf, len) != len)
+        return (uint64_t)(-LA_EFAULT);
+
+    /* For UDP, use sendto; for TCP (connected), use send */
+    /* We detect UDP by checking if dest_addr was provided with valid port */
+    if (udest && addrlen >= 16 && port != 0) {
+        int n = la_sock_sendto(p->fds[fd].sock_idx, sbuf, len, addr, port);
+        if (n < 0) return (uint64_t)(-LA_ECONNREFUSED);
+        return (uint64_t)n;
+    }
+
+    /* TCP send */
+    int n = la_sock_send(p->fds[fd].sock_idx, sbuf, len);
+    if (n < 0) return (uint64_t)(-LA_EPIPE);
+    return (uint64_t)n;
+}
+
+/* SYS_recvfrom(207): recvfrom(fd, buf, len, flags, src_addr, addrlen) */
+static uint64_t sys_recvfrom(struct la_trap_frame *tf)
+{
+    int fd          = (int)tf->gpr[LA_GPR_A0];
+    uint64_t ubuf   = tf->gpr[LA_GPR_A1];
+    uint32_t len    = (uint32_t)tf->gpr[LA_GPR_A2];
+    /* uint32_t flags = (uint32_t)tf->gpr[LA_GPR_A3]; */
+    uint64_t usrc   = tf->gpr[LA_GPR_A4];
+    uint64_t uaddrlen = tf->gpr[LA_GPR_A5];
+    struct la_proc *p = la_current_proc();
+
+    if (!p || fd < 0 || fd >= LA_NFD) return (uint64_t)(-LA_EBADF);
+    if (p->fds[fd].type != LA_FD_SOCKET) return (uint64_t)(-LA_EBADF);
+    if (len == 0) return 0;
+
+    if (len > 65536) len = 65536;  /* cap */
+    static __attribute__((aligned(8))) char rbuf[65536];
+
+    /* Try UDP recvfrom first (will fail for TCP sockets, then try TCP recv) */
+    uint32_t src_addr = 0;
+    uint16_t src_port = 0;
+    int n = la_sock_recvfrom(p->fds[fd].sock_idx, rbuf, len, &src_addr, &src_port);
+    if (n < 0) {
+        /* Try TCP recv */
+        n = la_sock_recv(p->fds[fd].sock_idx, rbuf, len);
+        if (n < 0) return (uint64_t)(-LA_ECONNRESET);
+    }
+    if (n == 0) return 0;  /* EOF */
+
+    la_copy_to_user(ubuf, rbuf, (uint32_t)n);
+
+    /* Return source address if requested (UDP only) */
+    if (usrc && src_port != 0)
+        la_put_sockaddr_in(usrc, uaddrlen, src_addr, src_port);
+
+    return (uint64_t)n;
+}
+
+/* SYS_getsockname(204): getsockname(fd, addr, addrlen) — return local address */
+static uint64_t sys_getsockname(struct la_trap_frame *tf)
+{
+    int fd            = (int)tf->gpr[LA_GPR_A0];
+    uint64_t uaddr    = tf->gpr[LA_GPR_A1];
+    uint64_t uaddrlen = tf->gpr[LA_GPR_A2];
+    struct la_proc *p = la_current_proc();
+
+    if (!p || fd < 0 || fd >= LA_NFD) return (uint64_t)(-LA_EBADF);
+    if (p->fds[fd].type != LA_FD_SOCKET) return (uint64_t)(-LA_EBADF);
+
+    uint32_t addr;
+    uint16_t port;
+    if (la_sock_getname(p->fds[fd].sock_idx, &addr, &port, 0) < 0)
+        return (uint64_t)(-LA_EINVAL);
+
+    la_put_sockaddr_in(uaddr, uaddrlen, addr, port);
+    return 0;
+}
+
+/* SYS_getpeername(205): getpeername(fd, addr, addrlen) — return remote address */
+static uint64_t sys_getpeername(struct la_trap_frame *tf)
+{
+    int fd            = (int)tf->gpr[LA_GPR_A0];
+    uint64_t uaddr    = tf->gpr[LA_GPR_A1];
+    uint64_t uaddrlen = tf->gpr[LA_GPR_A2];
+    struct la_proc *p = la_current_proc();
+
+    if (!p || fd < 0 || fd >= LA_NFD) return (uint64_t)(-LA_EBADF);
+    if (p->fds[fd].type != LA_FD_SOCKET) return (uint64_t)(-LA_EBADF);
+
+    uint32_t addr;
+    uint16_t port;
+    if (la_sock_getname(p->fds[fd].sock_idx, &addr, &port, 1) < 0)
+        return (uint64_t)(-LA_ENOTCONN);
+
+    la_put_sockaddr_in(uaddr, uaddrlen, addr, port);
+    return 0;
+}
+
+/* getsockopt / setsockopt stubs — return sensible values for netperf */
+static uint64_t sys_getsockopt(struct la_trap_frame *tf)
+{
+    int fd         = (int)tf->gpr[LA_GPR_A0];
+    /* int level    = (int)tf->gpr[LA_GPR_A1]; */
+    int optname    = (int)tf->gpr[LA_GPR_A2];
+    uint64_t uoptval  = tf->gpr[LA_GPR_A3];
+    uint64_t uoptlen  = tf->gpr[LA_GPR_A4];
+    struct la_proc *p = la_current_proc();
+
+    if (!p || fd < 0 || fd >= LA_NFD) return (uint64_t)(-LA_EBADF);
+
+    if (uoptval && uoptlen) {
+        uint32_t optlen = 0;
+        la_copy_from_user(&optlen, uoptlen, 4);
+
+        /* Common options that netperf queries */
+        if (optname == 0x0001 || optname == 0x0002) {  /* SO_SNDBUF / SO_RCVBUF */
+            if (optlen >= 4) {
+                int val = 65536;  /* 64 KB */
+                la_copy_to_user(uoptval, &val, 4);
+            }
+        } else if (optname == 0x0008) {  /* SO_KEEPALIVE */
+            if (optlen >= 4) {
+                int val = 0;
+                la_copy_to_user(uoptval, &val, 4);
+            }
+        } else if (optname == 0x1006) {  /* TCP_MAXSEG */
+            if (optlen >= 4) {
+                int val = 1460;
+                la_copy_to_user(uoptval, &val, 4);
+            }
+        } else if (optname == 0x1001) {  /* TCP_NODELAY */
+            if (optlen >= 4) {
+                int val = 1;
+                la_copy_to_user(uoptval, &val, 4);
+            }
+        }
+        /* For unknown options, leave the buffer untouched */
+    }
+
+    return 0;
+}
+
+static uint64_t sys_setsockopt(struct la_trap_frame *tf)
+{
+    (void)tf;
+    return 0;  /* no-op: accept all options */
+}
+
+/* SYS_shutdown(210): shutdown(fd, how) — TCP half-close.
+ * For loopback, a full close on the socket is sufficient. */
+static uint64_t sys_shutdown_sock(struct la_trap_frame *tf)
+{
+    int fd  = (int)tf->gpr[LA_GPR_A0];
+    /* int how = (int)tf->gpr[LA_GPR_A1]; */
+    struct la_proc *p = la_current_proc();
+
+    if (!p || fd < 0 || fd >= LA_NFD) return (uint64_t)(-LA_EBADF);
+    if (p->fds[fd].type != LA_FD_SOCKET) return (uint64_t)(-LA_EBADF);
+
+    la_sock_close(p->fds[fd].sock_idx);
+    return 0;
+}
+
 static uint64_t sys_gettimeofday(struct la_trap_frame *tf)
 {
     /* Return time based on ticks (same as clock_gettime). */
@@ -2027,8 +2926,41 @@ static uint64_t sys_sched_getaffinity(struct la_trap_frame *tf)
 }
 static uint64_t sys_sched_setscheduler(struct la_trap_frame *tf)
 {
-    (void)tf;
-    return 0;   /* accept any policy */
+    int pid         = (int)tf->gpr[LA_GPR_A0];
+    int policy      = (int)tf->gpr[LA_GPR_A1];
+    uint64_t uparam = tf->gpr[LA_GPR_A2];
+    struct la_proc *target;
+
+    /* pid == 0 means "current process" */
+    if (pid == 0)
+        target = la_current_proc();
+    else
+        target = la_proc_by_pid(pid);
+
+    if (!target) return (uint64_t)(-LA_ESRCH);
+
+    /* Read struct sched_param (4 bytes: sched_priority) */
+    int priority = 0;
+    if (uparam) {
+        if (la_copy_from_user(&priority, uparam, 4) != 4)
+            return (uint64_t)(-LA_EFAULT);
+    }
+
+    /* Clamp priority */
+    if (priority < 0) priority = 0;
+    if (priority > 99) priority = 99;
+
+    /* SCHED_FIFO and SCHED_RR use RT priorities 1–99.
+     * SCHED_OTHER uses priority 0. */
+    if (policy == 0)  /* SCHED_OTHER */
+        priority = 0;
+    else if (policy == 1 || policy == 2)  /* SCHED_FIFO / SCHED_RR */
+        ;  /* use the provided priority */
+    else
+        return (uint64_t)(-LA_EINVAL);
+
+    target->sched_priority = priority;
+    return 0;
 }
 
 /* SYS_shutdown: halt the system */
@@ -2043,7 +2975,329 @@ static uint64_t sys_shutdown(void)
 
 /* ---- Syscall trace counter (first N only) ---- */
 static int la_syscall_trace_count = 0;
-#define LA_SYSCALL_TRACE_MAX 200
+#define LA_SYSCALL_TRACE_MAX 0  /* set to >0 for debugging; UNKNOWN syscalls always logged */
+
+/* SYS_madvise(233): give advice about use of memory (stub).
+ * glibc's dynamic linker calls this to mark pages as MADV_DONTNEED. */
+static uint64_t sys_madvise(struct la_trap_frame *tf)
+{
+    (void)tf;
+    return 0;
+}
+
+/* SYS_mlock(228) / SYS_mlock2(325): lock memory (stub).
+ * glibc may call these to pin memory. */
+static uint64_t sys_mlock(struct la_trap_frame *tf)
+{
+    (void)tf;
+    return 0;
+}
+
+/* SYS_prctl(167): process control operations.
+ * glibc uses PR_SET_NAME, PR_GET_NAME, PR_SET_SECCOMP, etc.
+ * Accept all operations silently — most callers treat ENOSYS as fatal. */
+static uint64_t sys_prctl(struct la_trap_frame *tf)
+{
+    /* int option = (int)tf->gpr[LA_GPR_A0]; */
+    (void)tf;
+    return 0;
+}
+
+/* SYS_getrandom(278): fill buffer with random bytes.
+ * CRITICAL: glibc uses this for stack canary and pointer guard
+ * initialisation.  If it fails with ENOSYS, the dynamic linker may
+ * crash or produce deterministic (breakable) canaries.
+ * Fall back to a simple LCG seeded from AT_RANDOM-style entropy. */
+static uint64_t sys_getrandom(struct la_trap_frame *tf)
+{
+    uint64_t ubuf = tf->gpr[LA_GPR_A0];
+    uint32_t len  = (uint32_t)tf->gpr[LA_GPR_A1];
+    /* flags = a2 (ignored) */
+
+    if (!ubuf || len == 0) return 0;
+    if (len > 4096) len = 4096;  /* cap at one page */
+
+    /* Simple PRNG: PCG-style multiplier, seed mixed from timer ticks */
+    static uint64_t rng_state = 0;
+    if (rng_state == 0)
+        rng_state = la_timer_get_ticks() * 6364136223846793005ULL + 1442695040888963407ULL;
+
+    static __attribute__((aligned(8))) char rbuf[256];
+    uint32_t done = 0;
+    while (done < len) {
+        uint32_t chunk = 256;
+        if (chunk > len - done) chunk = len - done;
+
+        for (uint32_t i = 0; i < chunk; i += 8) {
+            rng_state = rng_state * 6364136223846793005ULL + 1442695040888963407ULL;
+            uint64_t val = rng_state;
+            for (int j = 0; j < 8 && (i + j) < chunk; j++)
+                rbuf[i + j] = (uint8_t)(val >> (j * 8));
+        }
+        la_copy_to_user(ubuf + (uint64_t)done, rbuf, chunk);
+        done += chunk;
+    }
+    return (uint64_t)done;
+}
+
+/* SYS_rseq(293): restartable sequences (glibc 2.35+).
+ * Stub: return -ENOSYS so glibc falls back to the non-rseq code path. */
+static uint64_t sys_rseq(struct la_trap_frame *tf)
+{
+    (void)tf;
+    return (uint64_t)(-LA_ENOSYS);
+}
+
+/* ---- LTP / general syscall stubs ---- */
+
+/* SYS_nanosleep(101): sleep for specified nanoseconds.  a0=req, a1=rem.
+ * struct timespec: sec(8) + nsec(8).  Minimal: sleep 1 tick. */
+static uint64_t sys_nanosleep(struct la_trap_frame *tf)
+{
+    /* uint64_t ureq = tf->gpr[LA_GPR_A0]; */
+    (void)tf;
+    la_proc_sleep();  /* ~10 ms at 100 Hz */
+    return 0;
+}
+
+/* SYS_clock_nanosleep(115): high-res sleep.  a0=clockid, a1=flags, a2=req, a3=rem. */
+static uint64_t sys_clock_nanosleep(struct la_trap_frame *tf)
+{
+    /* Same minimal sleep */
+    la_proc_sleep();
+    return 0;
+}
+
+/* SYS_getrlimit(163): get resource limit.  a0=resource, a1=rlim.
+ * struct rlimit: rlim_cur(8) + rlim_max(8).  Return unlimited (all Fs). */
+static uint64_t sys_getrlimit(struct la_trap_frame *tf)
+{
+    /* int resource = (int)tf->gpr[LA_GPR_A0]; */
+    uint64_t urlim = tf->gpr[LA_GPR_A1];
+    if (urlim) {
+        uint64_t rlim[2] = { ~0ULL, ~0ULL };  /* RLIM_INFINITY */
+        la_copy_to_user(urlim, rlim, 16);
+    }
+    return 0;
+}
+
+/* SYS_getrusage(165): get resource usage.  a0=who, a1=usage.
+ * Return zero-filled struct rusage (144 bytes). */
+static uint64_t sys_getrusage(struct la_trap_frame *tf)
+{
+    uint64_t uusage = tf->gpr[LA_GPR_A1];
+    if (uusage) {
+        uint8_t zero[144];
+        for (int i = 0; i < 144; i++) zero[i] = 0;
+        la_copy_to_user(uusage, zero, 144);
+    }
+    return 0;
+}
+
+/* SYS_sysinfo(179): return system information.
+ * struct sysinfo: uptime(8) loads[3](24) totalram(8) freeram(8) sharedram(8)
+ * bufferram(8) totalswap(8) freeswap(8) procs(2) pad(2) totalhigh(8) freehigh(8)
+ * mem_unit(4) _f(0) — 112 bytes. */
+static uint64_t sys_sysinfo(struct la_trap_frame *tf)
+{
+    uint64_t uinfo = tf->gpr[LA_GPR_A0];
+    if (uinfo) {
+        uint8_t info[112];
+        for (int i = 0; i < 112; i++) info[i] = 0;
+        /* Fill in uptime from ticks */
+        uint64_t ticks = la_timer_get_ticks();
+        *(uint64_t *)&info[0] = ticks / 100;  /* uptime in seconds */
+        *(uint32_t *)&info[104] = 4096;       /* mem_unit = page size */
+        la_copy_to_user(uinfo, info, 112);
+    }
+    return 0;
+}
+
+/* SYS_statfs(43) / SYS_fstatfs(44): filesystem statistics.
+ * struct statfs: f_type(8) f_bsize(8) f_blocks(8) f_bfree(8) f_bavail(8)
+ * f_files(8) f_ffree(8) f_fsid(8) f_namelen(8) f_frsize(8) f_flags(8) f_spare[4] — 120 bytes */
+static uint64_t sys_statfs(struct la_trap_frame *tf)
+{
+    uint64_t ubuf = tf->gpr[LA_GPR_A1];  /* path in a0 ignored */
+    if (ubuf) {
+        uint64_t buf[15];
+        for (int i = 0; i < 15; i++) buf[i] = 0;
+        buf[0] = 0xEF53;         /* EXT4_SUPER_MAGIC */
+        buf[1] = 4096;           /* f_bsize */
+        buf[2] = 1000000;        /* f_blocks */
+        buf[3] = 500000;         /* f_bfree */
+        buf[4] = 500000;         /* f_bavail */
+        buf[5] = 128;            /* f_files */
+        buf[6] = 100;            /* f_ffree */
+        buf[8] = 255;            /* f_namelen */
+        buf[9] = 4096;           /* f_frsize */
+        la_copy_to_user(ubuf, buf, 120);
+    }
+    return 0;
+}
+
+static uint64_t sys_fstatfs(struct la_trap_frame *tf)
+{
+    /* Same as statfs but uses fd instead of path (ignored) */
+    uint64_t ubuf = tf->gpr[LA_GPR_A1];
+    if (ubuf) {
+        uint64_t buf[15];
+        for (int i = 0; i < 15; i++) buf[i] = 0;
+        buf[0] = 0xEF53;
+        buf[1] = 4096;
+        buf[2] = 1000000;
+        buf[3] = 500000;
+        buf[4] = 500000;
+        buf[5] = 128;
+        buf[6] = 100;
+        buf[8] = 255;
+        buf[9] = 4096;
+        la_copy_to_user(ubuf, buf, 120);
+    }
+    return 0;
+}
+
+/* SYS_fsync(82) / SYS_fdatasync(83): sync file data (stub — return 0) */
+static uint64_t sys_fsync(struct la_trap_frame *tf)
+{
+    (void)tf;
+    return 0;
+}
+
+/* SYS_umask(166): set file creation mask (stub — return 022) */
+static uint64_t sys_umask(struct la_trap_frame *tf)
+{
+    (void)tf;
+    return 022;  /* default umask */
+}
+
+/* SYS_getpgid(155): get process group ID (stub — return pid) */
+static uint64_t sys_getpgid(struct la_trap_frame *tf)
+{
+    struct la_proc *p = la_current_proc();
+    return p ? (uint64_t)p->pid : 0;
+}
+
+/* SYS_readv(65): scatter read (stub — redirect to read on first iovec) */
+static uint64_t sys_readv(struct la_trap_frame *tf)
+{
+    uint64_t uiov  = tf->gpr[LA_GPR_A1];
+    int iovcnt    = (int)tf->gpr[LA_GPR_A2];
+
+    if (iovcnt <= 0) return 0;
+
+    /* Read first iovec entry: { base(8), len(8) } */
+    uint8_t iov[16];
+    if (la_copy_from_user(iov, uiov, 16) != 16)
+        return (uint64_t)(-LA_EFAULT);
+    uint64_t base = *(uint64_t *)&iov[0];
+    uint64_t len  = *(uint64_t *)&iov[8];
+
+    /* Delegate to sys_read */
+    struct la_trap_frame rtf = *tf;
+    rtf.gpr[LA_GPR_A1] = base;
+    rtf.gpr[LA_GPR_A2] = len;
+    return sys_read(&rtf);
+}
+
+/* SYS_sendfile(71): send file to socket (stub — return -ENOSYS) */
+static uint64_t sys_sendfile(struct la_trap_frame *tf)
+{
+    (void)tf;
+    return (uint64_t)(-LA_ENOSYS);
+}
+
+/* SYS_ftruncate(46): truncate file to specified length.
+ * For memfs fds, uses memfs_truncate.  For ext4 (read-only), returns 0. */
+static uint64_t sys_ftruncate(struct la_trap_frame *tf)
+{
+    int fd = (int)tf->gpr[LA_GPR_A0];
+    /* uint64_t length = tf->gpr[LA_GPR_A1]; */
+    struct la_proc *p = la_current_proc();
+
+    if (!p || fd < 0 || fd >= LA_NFD) return (uint64_t)(-LA_EBADF);
+    if (p->fds[fd].type == LA_FD_MEMFS) {
+        memfs_truncate((int)p->fds[fd].ino);
+        return 0;
+    }
+    /* ext4 is read-only, but returning success is benign */
+    return 0;
+}
+
+/* SYS_get_robust_list(100): get robust futex list (stub) */
+static uint64_t sys_get_robust_list(struct la_trap_frame *tf)
+{
+    (void)tf;
+    return 0;
+}
+
+/* SYS_sched_getparam(121): get scheduling parameters.
+ * a0=pid, a1=param (struct sched_param { sched_priority }) */
+static uint64_t sys_sched_getparam(struct la_trap_frame *tf)
+{
+    int pid = (int)tf->gpr[LA_GPR_A0];
+    uint64_t uparam = tf->gpr[LA_GPR_A1];
+    struct la_proc *target;
+
+    if (pid == 0)
+        target = la_current_proc();
+    else
+        target = la_proc_by_pid(pid);
+    if (!target) return (uint64_t)(-LA_ESRCH);
+
+    if (uparam) {
+        int prio = target->sched_priority;
+        la_copy_to_user(uparam, &prio, 4);
+    }
+    return 0;
+}
+
+/* SYS_sched_setparam(118): set scheduling parameters. */
+static uint64_t sys_sched_setparam(struct la_trap_frame *tf)
+{
+    int pid = (int)tf->gpr[LA_GPR_A0];
+    uint64_t uparam = tf->gpr[LA_GPR_A1];
+    struct la_proc *target;
+
+    if (pid == 0)
+        target = la_current_proc();
+    else
+        target = la_proc_by_pid(pid);
+    if (!target) return (uint64_t)(-LA_ESRCH);
+
+    if (uparam) {
+        int prio = 0;
+        if (la_copy_from_user(&prio, uparam, 4) != 4)
+            return (uint64_t)(-LA_EFAULT);
+        if (prio < 0) prio = 0;
+        if (prio > 99) prio = 99;
+        target->sched_priority = prio;
+    }
+    return 0;
+}
+
+/* SYS_sched_getscheduler(120): get scheduling policy (stub — return SCHED_OTHER=0) */
+static uint64_t sys_sched_getscheduler(struct la_trap_frame *tf)
+{
+    (void)tf;
+    return 0;  /* SCHED_OTHER */
+}
+
+/* SYS_get_mempolicy(236): get NUMA memory policy (stub — return default node 0) */
+static uint64_t sys_get_mempolicy(struct la_trap_frame *tf)
+{
+    uint64_t umode = tf->gpr[LA_GPR_A0];
+    uint64_t unodes = tf->gpr[LA_GPR_A2];
+    if (umode) {
+        int mode = 0;  /* MPOL_DEFAULT */
+        la_copy_to_user(umode, &mode, 4);
+    }
+    if (unodes) {
+        uint64_t nodes = 1;  /* node 0 only */
+        la_copy_to_user(unodes, &nodes, 8);
+    }
+    return 0;
+}
 
 /* ---- Main syscall dispatcher ---- */
 uint64_t la_syscall_dispatch(struct la_trap_frame *tf)
@@ -2098,6 +3352,13 @@ uint64_t la_syscall_dispatch(struct la_trap_frame *tf)
     case SYS_faccessat:  return sys_faccessat(tf);
     case SYS_readlinkat: return sys_readlinkat(tf);
     case SYS_fcntl:      return sys_fcntl(tf);
+    case SYS_statfs:     return sys_statfs(tf);
+    case SYS_fstatfs:    return sys_fstatfs(tf);
+    case SYS_readv:      return sys_readv(tf);
+    case SYS_sendfile:   return sys_sendfile(tf);
+    case SYS_fsync:      return sys_fsync(tf);
+    case SYS_fdatasync:  return sys_fsync(tf);
+    case SYS_ftruncate:  return sys_ftruncate(tf);
 
     /* Directory */
     case SYS_chdir:      return sys_chdir(tf);
@@ -2144,26 +3405,58 @@ uint64_t la_syscall_dispatch(struct la_trap_frame *tf)
     case SYS_getcpu:     return sys_getcpu(tf);
     case SYS_gettimeofday: return sys_gettimeofday(tf);
     case SYS_times:      return sys_times(tf);
+    case SYS_nanosleep:  return sys_nanosleep(tf);
+    case SYS_clock_nanosleep: return sys_clock_nanosleep(tf);
+    case SYS_getrlimit:  return sys_getrlimit(tf);
+    case SYS_getrusage:  return sys_getrusage(tf);
+    case SYS_sysinfo:    return sys_sysinfo(tf);
+    case SYS_umask:      return sys_umask(tf);
+    case SYS_getpgid:    return sys_getpgid(tf);
+    case SYS_get_robust_list: return sys_get_robust_list(tf);
+    case SYS_get_mempolicy: return sys_get_mempolicy(tf);
 
     /* Scheduler (minimal) */
     case SYS_sched_setaffinity: return sys_sched_setaffinity(tf);
     case SYS_sched_getaffinity: return sys_sched_getaffinity(tf);
     case SYS_sched_setscheduler: return sys_sched_setscheduler(tf);
+    case SYS_sched_getparam:  return sys_sched_getparam(tf);
+    case SYS_sched_setparam:  return sys_sched_setparam(tf);
+    case SYS_sched_getscheduler: return sys_sched_getscheduler(tf);
 
     /* Select / poll */
-    case SYS_pselect6:   return sys_stub_enosys(tf);
-    case SYS_ppoll:      return sys_stub_enosys(tf);
+    case SYS_pselect6:   return sys_pselect6(tf);
+    case SYS_ppoll:      return sys_ppoll(tf);
 
-    /* Socket family (ENOSYS stubs for now) */
-    case SYS_socket:     return sys_stub_enosys(tf);
-    case SYS_bind:       return sys_stub_enosys(tf);
-    case SYS_listen:     return sys_stub_enosys(tf);
-    case SYS_accept:     return sys_stub_enosys(tf);
-    case SYS_connect:    return sys_stub_enosys(tf);
-    case SYS_sendto:     return sys_stub_enosys(tf);
-    case SYS_recvfrom:   return sys_stub_enosys(tf);
-    case SYS_getsockname: return sys_stub_enosys(tf);
-    case SYS_getpeername: return sys_stub_enosys(tf);
+    /* Memory advice / locking */
+    case SYS_madvise:    return sys_madvise(tf);
+    case SYS_mlock:      return sys_mlock(tf);
+    case SYS_mlock2:     return sys_mlock(tf);
+
+    /* Process control */
+    case SYS_prctl:      return sys_prctl(tf);
+
+    /* Random */
+    case SYS_getrandom:  return sys_getrandom(tf);
+
+    /* Restartable sequences */
+    case SYS_rseq:       return sys_rseq(tf);
+
+    /* Socket family (real loopback implementations) */
+    case SYS_socket:     return sys_socket(tf);
+    case SYS_bind:       return sys_bind(tf);
+    case SYS_listen:     return sys_listen(tf);
+    case SYS_accept:     return sys_accept(tf);
+    case SYS_connect:    return sys_connect(tf);
+    case SYS_sendto:     return sys_sendto(tf);
+    case SYS_recvfrom:   return sys_recvfrom(tf);
+    case SYS_getsockname: return sys_getsockname(tf);
+    case SYS_getpeername: return sys_getpeername(tf);
+    case SYS_setsockopt:  return sys_setsockopt(tf);
+    case SYS_getsockopt:  return sys_getsockopt(tf);
+    case SYS_shutdown_sock: return sys_shutdown_sock(tf);
+    case SYS_sendmsg:     return sys_stub_enosys(tf);   /* -EOPNOTSUPP would be better but ENOSYS is safe */
+    case SYS_recvmsg:     return sys_stub_enosys(tf);
+    case SYS_accept4:     return sys_accept(tf);         /* accept ignoring flags */
 
     /* System */
     case SYS_shutdown:   return sys_shutdown();

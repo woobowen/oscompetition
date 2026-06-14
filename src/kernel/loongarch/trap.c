@@ -138,23 +138,51 @@ void la_trap_dispatch(struct la_trap_frame *tf)
      * Minimal report only: a verbose dump here blows the 4 KB kernel
      * stack (one page) and corrupts the neighbouring physical page,
      * which itself cascades into ADEF/INE in unrelated processes. */
+    struct la_proc *fault_proc = la_current_proc();
     la_uart_puts("trap: ecode=");
     la_uart_put_hex(ecode);
     la_uart_puts(" era=");
     la_uart_put_hex(tf->era);
     la_uart_puts(" badv=");
     la_uart_put_hex(tf->badv);
-    la_uart_puts(" estat=");
-    la_uart_put_hex(tf->estat);
+    la_uart_puts(" name=");
+    if (fault_proc) la_uart_puts(fault_proc->name);
     la_uart_puts("\n");
 
     /* Diagnostic: for page-fault-like exceptions (PIL=0x1, PIS=0x2,
      * PIF=0x3, PME=0x4, ADEF=0x8, ADEM=0x9), dump the PTE at badv
      * so we can see whether the page-table mapping is corrupted or the
-     * TLB/HPTW delivered a stale translation. */
+     * TLB/HPTW delivered a stale translation.
+     *
+     * ALSO dump the PTE at ERA — for ADEF, ERA itself may be the
+     * problematic address. */
     if ((ecode >= 0x1 && ecode <= 0x4) || ecode == 0x8 || ecode == 0x9) {
-        struct la_proc *cur = la_current_proc();
+        struct la_proc *cur = fault_proc;
         if (cur && cur->pgtbl) {
+            /* Dump PTE for ERA (useful for ADEF) */
+            {
+                uint64_t eva = tf->era;
+                uint64_t eidx0 = (eva >> 30) & 0x1FF;
+                uint64_t eidx1 = (eva >> 21) & 0x1FF;
+                uint64_t eidx2 = (eva >> 12) & 0x1FF;
+                uint64_t ee0 = cur->pgtbl[eidx0];
+                uint64_t epte = 0;
+                if (ee0) {
+                    uint64_t *emid = (uint64_t *)ee0;
+                    uint64_t ee1 = emid[eidx1];
+                    if (ee1) {
+                        uint64_t *eleaf = (uint64_t *)ee1;
+                        epte = eleaf[eidx2];
+                    }
+                }
+                la_uart_puts("  diag: ERA_PTE=");
+                la_uart_put_hex(epte);
+                la_uart_puts(" at era=");
+                la_uart_put_hex(eva);
+                la_uart_puts(epte ? " (mapped)" : " (UNMAPPED)");
+                la_uart_puts("\n");
+            }
+
             uint64_t dump_pa = la_uva_to_pa(cur->pgtbl, tf->badv);
             if (dump_pa) {
                 /* Walk PTE explicitly to get perm bits (la_uva_to_pa

@@ -140,6 +140,11 @@ void la_proc_free(struct la_proc *p)
         }
         if (!shared_with_sibling) {
             la_uvm_free_pgtbl(p->pgtbl);
+            /* la_uvm_free_pgtbl already calls la_tlb_inval_all(),
+             * but fire one more here on the current ASID to be
+             * absolutely sure no stale entries survive into the
+             * next scheduled process (QEMU invtlb erratum). */
+            la_tlb_inval_all();
         }
         p->pgtbl = 0;
     } else if (p->shared_vm == 1) {
@@ -349,15 +354,27 @@ void la_sched_switch(struct la_context *old_ctx)
 void __attribute__((noreturn)) la_proc_exit(int code)
 {
     struct la_proc *me = la_current_proc();
-    /* Callers (sys_exit guards on is_user; trap guards on is_user) must
-     * ensure me != NULL && me->is_user.  If we ever get here without a
-     * current user process, that is a kernel bug — halt. */
     if (!me || !me->is_user) {
         la_uart_puts("la_proc_exit: no current user proc — HALT\n");
         for (;;) {}
     }
 
-    la_csr_write(la_csr_read(LA_CSR_TLBRERA) & ~1ULL, LA_CSR_TLBRERA);  /* clear ISTLBR */
+    /* Clear ISTLBR BEFORE touching any memory.  If a spurious TLB
+     * refill exception fires while the exiting process's page table
+     * is still in PGDL, and the ISTLBR bit is set from a previous
+     * trap, the CPU misroutes the exception and corrupts
+     * TLBRERA/TLBRPRMD.  The resulting cascade kills the NEXT
+     * process instead of this one. */
+    la_csr_write(la_csr_read(LA_CSR_TLBRERA) & ~1ULL, LA_CSR_TLBRERA);
+
+    /* Also invalidate all TLB entries now — they belong to this
+     * address space, which is about to become zombie.  The scheduler
+     * will inval again before the next process, but doing it here
+     * too prevents HPTW from walking our (still live but about to
+     * be reaped) page table, which could create TLB entries that
+     * alias the next process's VAs. */
+    la_tlb_inval_all();
+
     me->exit_code = (int)(unsigned)code;
     me->state     = LA_PROC_ZOMBIE;
     if (me->parent_pid > 0)
@@ -451,16 +468,33 @@ void la_scheduler(void)
         uint64_t crmd = la_csr_read(LA_CSR_CRMD);
         la_csr_write(crmd | LA_CRMD_IE, LA_CSR_CRMD);
 
-        /* round-robin: start searching from next_idx */
+        /* Priority-aware scheduling:
+         * - First pass: find the RUNNABLE process with highest sched_priority.
+         * - Within the same priority tier, round-robin from next_idx.
+         * - Priority 0 = normal (SCHED_OTHER), 1–99 = SCHED_FIFO. */
         struct la_proc *p = 0;
+        int best_prio = -1;
+        int best_idx  = 0;
+        int found_any = 0;
+
         for (int i = 0; i < LA_NPROC; i++) {
             int idx = (next_idx + i) % LA_NPROC;
-            if (la_procs[idx].state == LA_PROC_RUNNABLE) {
-                p = &la_procs[idx];
-                next_idx = idx + 1;
-                break;
+            if (la_procs[idx].state != LA_PROC_RUNNABLE)
+                continue;
+            found_any = 1;
+            int prio = la_procs[idx].sched_priority;
+            if (prio > best_prio) {
+                best_prio = prio;
+                best_idx  = idx;
+            } else if (prio == best_prio && !p) {
+                /* First match at this priority — take it (round-robin via next_idx) */
+                best_idx = idx;
             }
         }
+
+        if (found_any)
+            p = &la_procs[best_idx];
+        next_idx = best_idx + 1;
 
         if (!p) {
             /* nothing to run — wait for interrupt */
