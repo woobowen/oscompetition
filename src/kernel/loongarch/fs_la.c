@@ -5,7 +5,7 @@
  *   1. SeaOS custom FS  (magic 0x12341234 at block 0)
  *   2. EXT4             (magic 0xEF53   at block 0 + 1024)
  *
- * All reads via la_virtio_blk_read() — no buffer cache, no locks.
+ * All reads via bio buffer cache — LRU eviction, no locks.
  */
 #include "early_boot.h"
 
@@ -61,12 +61,9 @@ static char *la_path_elem(char *p, char *name)
 #define LA_BLKSIZE       4096
 #define LA_MAXNAME       255
 
-static __attribute__((aligned(4096))) uint8_t la_blkbuf[LA_BLKSIZE];
-
 static uint8_t *la_blk_read(uint32_t blk)
 {
-    if (la_virtio_blk_read(blk, la_blkbuf) != 0) return 0;
-    return la_blkbuf;
+    return (uint8_t *)bio_read(blk);
 }
 
 /* ================================================================
@@ -162,8 +159,6 @@ static uint32_t sea_read_file(uint32_t inum, uint32_t off,
 
     uint8_t *d = (uint8_t *)dst;
     uint32_t done = 0;
-    uint8_t *tmp = (uint8_t *)la_pmem_alloc();
-    if (!tmp) return 0;
 
     while (done < len) {
         uint32_t cur  = off + done;
@@ -173,11 +168,11 @@ static uint32_t sea_read_file(uint32_t inum, uint32_t off,
         if (take > len - done) take = len - done;
         uint32_t pb = sea_map_block(&ip, lbn);
         if (!pb) break;
-        if (la_virtio_blk_read(pb, tmp) != 0) break;
-        la_memmove(d + done, tmp + boff, take);
+        uint8_t *blk = bio_read(pb);
+        if (!blk) break;
+        la_memmove(d + done, blk + boff, take);
         done += take;
     }
-    la_pmem_free(tmp);
     return done;
 }
 
@@ -187,8 +182,6 @@ static int sea_dir_lookup(uint32_t dir_ino, const char *name, uint32_t *out)
     sea_inode_t ip;
     if (sea_read_inode(dir_ino, &ip) < 0 || ip.type != SEA_TYPE_DIR) return -1;
     uint32_t total = ip.size / sizeof(sea_dentry_t);
-    uint8_t *tmp = (uint8_t *)la_pmem_alloc();
-    if (!tmp) return -1;
 
     for (uint32_t i = 0; i < total; i++) {
         uint32_t pos  = i * sizeof(sea_dentry_t);
@@ -196,18 +189,17 @@ static int sea_dir_lookup(uint32_t dir_ino, const char *name, uint32_t *out)
         uint32_t boff = pos % LA_BLKSIZE;
         uint32_t pb = sea_map_block(&ip, lbn);
         if (!pb) break;
-        if (la_virtio_blk_read(pb, tmp) != 0) break;
+        uint8_t *blk = bio_read(pb);
+        if (!blk) break;
         sea_dentry_t de;
-        la_memmove(&de, tmp + boff, sizeof(de));
+        la_memmove(&de, blk + boff, sizeof(de));
         if (de.inode_num == 0 || de.name[0] == 0) continue;
         if (la_strncmp(de.name, name, la_strlen(name)) == 0
             && la_strlen(de.name) == la_strlen(name)) {
             *out = de.inode_num;
-            la_pmem_free(tmp);
             return 0;
         }
     }
-    la_pmem_free(tmp);
     return -1;
 }
 
@@ -245,22 +237,20 @@ static void sea_list_dir(uint32_t dir_ino)
     la_uart_puts(" n="); la_uart_put_hex(total);
     la_uart_puts(" size="); la_uart_put_hex(ip.size); la_uart_puts("]\n");
 
-    uint8_t *tmp = (uint8_t *)la_pmem_alloc();
-    if (!tmp) return;
     int shown = 0;
     for (uint32_t i = 0; i < total && shown < 64; i++) {
         uint32_t pos = i * sizeof(sea_dentry_t);
         uint32_t pb = sea_map_block(&ip, pos / LA_BLKSIZE);
         if (!pb) break;
-        if (la_virtio_blk_read(pb, tmp) != 0) break;
+        uint8_t *blk = bio_read(pb);
+        if (!blk) break;
         sea_dentry_t de;
-        la_memmove(&de, tmp + pos % LA_BLKSIZE, sizeof(de));
+        la_memmove(&de, blk + pos % LA_BLKSIZE, sizeof(de));
         if (de.inode_num == 0 || de.name[0] == 0) continue;
         la_uart_puts("    "); la_uart_puts(de.name);
         la_uart_puts(" ino="); la_uart_put_hex(de.inode_num); la_uart_puts("\n");
         shown++;
     }
-    la_pmem_free(tmp);
     la_uart_puts("  ["); la_uart_put_hex(shown); la_uart_puts(" shown]\n");
 }
 
@@ -333,8 +323,9 @@ static uint32_t e4_read_bytes(uint64_t off, void *dst, uint32_t len)
         uint32_t boff = (uint32_t)((off + done) % LA_BLKSIZE);
         uint32_t take = LA_BLKSIZE - boff;
         if (take > len - done) take = len - done;
-        if (la_virtio_blk_read(blk, la_blkbuf) != 0) break;
-        la_memmove(d + done, la_blkbuf + boff, take);
+        uint8_t *blk_data = bio_read(blk);
+        if (!blk_data) break;
+        la_memmove(d + done, blk_data + boff, take);
         done += take;
     }
     return done;
@@ -376,7 +367,7 @@ static uint64_t e4_isize(const e4_inode_t *ip) { return ((uint64_t)ip->size_high
 static int e4_lbn2pb(const e4_inode_t *ip, uint32_t lbn, uint64_t *pb)
 {
     if (!(ip->flags & E4_EXTENTS_FL)) return -1;
-    uint8_t *sc = la_blkbuf;
+    uint8_t *sc = 0;
     const uint8_t *nd = ip->block;
     int r = -1, cnt = 0;
     for (;;) {
@@ -402,7 +393,8 @@ static int e4_lbn2pb(const e4_inode_t *ip, uint32_t lbn, uint64_t *pb)
         for (uint32_t i = 0; i < eh->entries; i++) { if (lbn < ix[i].block) break; c = (int)i; }
         if (c < 0) break;
         uint64_t child = ((uint64_t)ix[c].leaf_hi << 32) | ix[c].leaf_lo;
-        if (e4_read_bytes(child * (uint64_t)e4.bsz, sc, e4.bsz) != e4.bsz) break;
+        sc = bio_read((uint32_t)child);
+        if (!sc) break;
         nd = sc;
     }
     return r;
@@ -631,18 +623,16 @@ static uint32_t sea_get_dentries(uint32_t dir_ino, void *dst, uint32_t len)
     uint8_t *out = (uint8_t *)dst;
     uint32_t written = 0;
 
-    uint8_t *tmp = (uint8_t *)la_pmem_alloc();
-    if (!tmp) return 0;
-
     for (uint32_t i = 0; i < total; i++) {
         uint32_t pos = i * sizeof(sea_dentry_t);
         uint32_t lbn = pos / LA_BLKSIZE;
         uint32_t boff = pos % LA_BLKSIZE;
         uint32_t pb = sea_map_block(&ip, lbn);
         if (!pb) break;
-        if (la_virtio_blk_read(pb, tmp) != 0) break;
+        uint8_t *blk = bio_read(pb);
+        if (!blk) break;
         sea_dentry_t de;
-        la_memmove(&de, tmp + boff, sizeof(de));
+        la_memmove(&de, blk + boff, sizeof(de));
         if (de.inode_num == 0 || de.name[0] == 0) continue;
 
         /* Compute name length */
@@ -672,7 +662,6 @@ static uint32_t sea_get_dentries(uint32_t dir_ino, void *dst, uint32_t len)
 
         written += reclen;
     }
-    la_pmem_free(tmp);
     return written;
 }
 

@@ -76,6 +76,14 @@ uint64_t la_timer_get_ticks(void);     /* monotonic tick counter (100 Hz) */
 void *la_pmem_alloc(void);
 void  la_pmem_free(void *page);
 
+/* ---- Block buffer cache ---- */
+void  bio_init(void);
+void *bio_read(uint32_t block_num);
+void *bio_write(uint32_t block_num);
+void  bio_release(uint32_t block_num);
+void  bio_sync(void);
+void  bio_invalidate(uint32_t block_num);
+
 /* ---- VirtIO PCI block device ---- */
 void la_virtio_init(void);
 int  la_virtio_blk_read(uint32_t block_num, void *buf);
@@ -107,6 +115,7 @@ int      memfs_path_prefix(const char *path, const char *prefix);
 /* ---- User virtual memory ---- */
 uint64_t *la_uvm_create(void);
 int      la_uvm_map_page(uint64_t *root, uint64_t va, uint64_t pa, uint64_t perm);
+int      la_uvm_unmap_page(uint64_t *root, uint64_t va, int free_page);
 uint64_t la_uvm_alloc_page(uint64_t *root, uint64_t va, uint64_t perm);
 /* Grow the current proc's user stack down to cover fault_addr.
  * Returns 0 on success (pages now mapped), -1 if fault_addr is outside the

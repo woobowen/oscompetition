@@ -76,6 +76,9 @@ void la_boot_main(void)
     la_uart_puts("[init] virtio\n");
     la_virtio_init();
 
+    /* 7b  Initialise buffer cache (before filesystem) */
+    bio_init();
+
     /* 8  Mount filesystem (needed for exec) */
     la_uart_puts("[init] fs\n");
     if (la_fs_init() != 0)

@@ -992,37 +992,57 @@ static uint64_t sys_brk(struct la_trap_frame *tf)
     return addr;
 }
 
-/* SYS_mmap: map anonymous memory (simplified).
- * Handles MAP_ANONYMOUS mappings for malloc/TLS.
- * If addr hint is non-zero and page is already mapped, skip it. */
+/* SYS_mmap: map anonymous memory.
+ * Handles MAP_ANONYMOUS and MAP_FIXED for malloc/TLS and the dynamic linker.
+ *
+ * mmap(addr, len, prot, flags, fd, off)
+ *   a0=addr, a1=len, a2=prot, a3=flags, a4=fd, a5=off
+ *
+ * MAP_FIXED (0x10): place mapping at exact addr, replacing any existing pages.
+ * MAP_ANONYMOUS (0x20): ignore fd, map zeroed anonymous memory. */
+#define LA_MAP_FIXED     0x10
+#define LA_MAP_ANONYMOUS 0x20
+
 static uint64_t sys_mmap(struct la_trap_frame *tf)
 {
     uint64_t addr  = tf->gpr[LA_GPR_A0];
     uint32_t len   = (uint32_t)tf->gpr[LA_GPR_A1];
-    /* int prot     = (int)tf->gpr[LA_GPR_A2]; */
-    /* int flags    = (int)tf->gpr[LA_GPR_A3]; */
-    /* int fd       = (int)tf->gpr[LA_GPR_A4]; */
-    /* uint64_t off = tf->gpr[LA_GPR_A5]; */
+    int      flags = (int)tf->gpr[LA_GPR_A3];
     struct la_proc *p = la_current_proc();
 
-    if (!p || !p->pgtbl)
-        return (uint64_t)-1;
+    if (!p || !p->pgtbl) return (uint64_t)-1;
+    if (len == 0) return (uint64_t)-1;
 
-    /* Linux returns -EINVAL for len==0 */
-    if (len == 0)
-        return (uint64_t)-1;
-
-    /* Round up to page size */
     uint32_t npages = (len + LA_PGSIZE - 1) / LA_PGSIZE;
+    int fixed = (flags & LA_MAP_FIXED) != 0;
 
-    /* Pick the mapping address.
-     * Linux keeps the brk heap and the mmap region in DISJOINT parts of the
-     * address space.  We previously allocated mmap from heap_top, which made
-     * anonymous mmap pages collide with brk growth and corrupt musl's malloc
-     * metadata.  Now mmap always comes from a separate high region.
-     *
-     * A non-zero addr is treated as a hint: honour it only if the page is
-     * free, otherwise fall back to the mmap region. */
+    /* ---- MAP_FIXED: exact address required ----
+     * The dynamic linker uses MAP_FIXED to place segments at precise VAs
+     * after performing relocations.  Existing pages in the target range
+     * must be unmapped first. */
+    if (fixed && addr != 0) {
+        /* Unmap any existing pages in the target range */
+        for (uint32_t i = 0; i < npages; i++) {
+            uint64_t va = addr + (uint64_t)i * LA_PGSIZE;
+            uint64_t old_pa = la_uva_to_pa(p->pgtbl, va);
+            if (old_pa) {
+                la_uvm_unmap_page(p->pgtbl, va, 1);  /* free old page */
+            }
+        }
+        /* Map new pages at exact address */
+        for (uint32_t i = 0; i < npages; i++) {
+            uint64_t va = addr + (uint64_t)i * LA_PGSIZE;
+            uint64_t pa = la_uvm_alloc_page(p->pgtbl, va, 0x19FUL);
+            if (pa == 0) return (uint64_t)-1;
+            uint8_t *px = (uint8_t *)pa;
+            for (uint32_t z = 0; z < LA_PGSIZE; z++) px[z] = 0;
+        }
+        return addr;
+    }
+
+    /* ---- Non-MAP_FIXED: addr is a hint ----
+     * Honour a non-zero hint only if the page is free, otherwise fall back
+     * to the mmap region (high address, separate from brk heap). */
     int used_hint = 0;
     if (addr != 0) {
         if (la_uva_to_pa(p->pgtbl, addr) == 0)
@@ -1034,33 +1054,39 @@ static uint64_t sys_mmap(struct la_trap_frame *tf)
     }
 
     /* Allocate and map pages (skip already-mapped pages).
-     * CRITICAL: Linux mmap(MAP_ANONYMOUS) returns ZEROED pages.
-     * musl's malloc depends on this — it interprets non-zero bytes
-     * in fresh mmap'd memory as malloc chunk headers, causing
-     * corruption and crashes. */
+     * CRITICAL: Linux mmap(MAP_ANONYMOUS) returns ZEROED pages. */
     for (uint32_t i = 0; i < npages; i++) {
         uint64_t va = addr + (uint64_t)i * LA_PGSIZE;
-        /* Check if already mapped using VA-to-PA translation */
-        if (la_uva_to_pa(p->pgtbl, va) != 0) {
-            continue;  /* page already mapped, skip */
-        }
-        /* Allocate new page */
+        if (la_uva_to_pa(p->pgtbl, va) != 0)
+            continue;
         uint64_t pa = la_uvm_alloc_page(p->pgtbl, va, 0x19FUL);
-        if (pa == 0)
-            return (uint64_t)-1;  /* 0x19F = V|D|PLV3|P|W = user RWX */
-        /* Zero the page — Linux guarantees anonymous mmap pages are zeroed */
+        if (pa == 0) return (uint64_t)-1;
         uint8_t *px = (uint8_t *)pa;
-        for (uint32_t z = 0; z < LA_PGSIZE; z++)
-            px[z] = 0;
+        for (uint32_t z = 0; z < LA_PGSIZE; z++) px[z] = 0;
     }
 
     return addr;
 }
 
-/* SYS_munmap: unmap memory (stub — just return success) */
+/* SYS_munmap: unmap memory.
+ * munmap(addr, len) — a0=addr, a1=len.
+ * Walks the page range, frees physical pages, clears PTEs, and
+ * invalidates TLB entries. */
 static uint64_t sys_munmap(struct la_trap_frame *tf)
 {
-    (void)tf;
+    uint64_t addr  = tf->gpr[LA_GPR_A0];
+    uint32_t len   = (uint32_t)tf->gpr[LA_GPR_A1];
+    struct la_proc *p = la_current_proc();
+
+    if (!p || !p->pgtbl) return (uint64_t)-1;
+    if (addr & (LA_PGSIZE - 1)) return (uint64_t)-1;  /* must be page-aligned */
+    if (len == 0) return 0;
+
+    uint32_t npages = (len + LA_PGSIZE - 1) / LA_PGSIZE;
+    for (uint32_t i = 0; i < npages; i++) {
+        uint64_t va = addr + (uint64_t)i * LA_PGSIZE;
+        la_uvm_unmap_page(p->pgtbl, va, 1);  /* free the physical page */
+    }
     return 0;
 }
 
@@ -1360,9 +1386,67 @@ static uint64_t sys_getcwd(struct la_trap_frame *tf)
 }
 
 /* SYS_mprotect: set memory protection (stub — all pages are RWX) */
+/* SYS_mprotect: change page protection.
+ * mprotect(addr, len, prot) — a0=addr, a1=len, a2=prot.
+ * Prot flags: PROT_READ=1, PROT_WRITE=2, PROT_EXEC=4.
+ * The dynamic linker calls this to make text segments read-only after
+ * applying relocations.  Since we map everything RWX, the only
+ * meaningful change is making pages RX-only (drop D|W). */
+#define LA_PROT_READ  1
+#define LA_PROT_WRITE 2
+#define LA_PROT_EXEC  4
+
+/* PTE bit definitions (mirrored from uvm_la.c for mprotect) */
+#define SYS_PTE_V        (1UL << 0)
+#define SYS_PTE_D        (1UL << 1)
+#define SYS_PTE_PLV_USER (3UL << 2)
+#define SYS_PTE_MAT_CC   (1UL << 4)
+#define SYS_PTE_P        (1UL << 7)
+#define SYS_PTE_W        (1UL << 8)
+#define SYS_PTE_NX       (1UL << 62)
+#define SYS_PTE_NR       (1UL << 61)
+
 static uint64_t sys_mprotect(struct la_trap_frame *tf)
 {
-    (void)tf;
+    uint64_t addr = tf->gpr[LA_GPR_A0];
+    uint32_t len  = (uint32_t)tf->gpr[LA_GPR_A1];
+    int      prot = (int)tf->gpr[LA_GPR_A2];
+    struct la_proc *p = la_current_proc();
+
+    if (!p || !p->pgtbl) return (uint64_t)-1;
+    if (len == 0) return 0;
+
+    /* Build the target PTE permission mask */
+    uint64_t perm = SYS_PTE_V | SYS_PTE_PLV_USER | SYS_PTE_MAT_CC | SYS_PTE_P;
+    if (prot & LA_PROT_WRITE) perm |= SYS_PTE_D | SYS_PTE_W;
+    if (!(prot & LA_PROT_EXEC)) perm |= SYS_PTE_NX;
+    if (!(prot & LA_PROT_READ))  perm |= SYS_PTE_NR;
+
+    uint32_t npages = (len + LA_PGSIZE - 1) / LA_PGSIZE;
+    for (uint32_t i = 0; i < npages; i++) {
+        uint64_t va = addr + (uint64_t)i * LA_PGSIZE;
+
+        /* Walk page table to find the leaf PTE */
+        uint64_t idx0 = (va >> 30) & 0x1FF;
+        uint64_t e0 = p->pgtbl[idx0];
+        if (!e0) continue;
+        uint64_t *mid = (uint64_t *)e0;
+        uint64_t idx1 = (va >> 21) & 0x1FF;
+        uint64_t e1 = mid[idx1];
+        if (!e1) continue;
+        uint64_t *leaf = (uint64_t *)e1;
+        uint64_t idx2 = (va >> 12) & 0x1FF;
+        uint64_t old = leaf[idx2];
+
+        if (!(old & SYS_PTE_V)) continue;
+
+        /* Preserve the PA, replace the permission bits */
+        uint64_t pa = old & ~0xFFFUL;
+        leaf[idx2] = pa | perm;
+
+        /* Invalidate TLB so the new permissions take effect */
+        la_tlb_inval_page(va);
+    }
     return 0;
 }
 

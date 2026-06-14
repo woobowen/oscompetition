@@ -149,6 +149,35 @@ int la_uvm_map_page(uint64_t *root, uint64_t va, uint64_t pa, uint64_t perm)
     return 0;
 }
 
+/* ---- Unmap a page (clear PTE, free physical page, invalidate TLB) ----
+ * Returns 0 on success, -1 if the page wasn't mapped.  If free_page is
+ * non-zero, the physical page is returned to the allocator. */
+int la_uvm_unmap_page(uint64_t *root, uint64_t va, int free_page)
+{
+    uint64_t idx0 = LA_VA_DIR2(va);
+    uint64_t idx1 = LA_VA_DIR1(va);
+    uint64_t idx2 = LA_VA_PT(va);
+
+    uint64_t e0 = root[idx0];
+    if (!e0) return -1;
+    uint64_t *mid = (uint64_t *)e0;
+    uint64_t e1 = mid[idx1];
+    if (!e1) return -1;
+    uint64_t *leaf = (uint64_t *)e1;
+    uint64_t pte = leaf[idx2];
+
+    if (!(pte & LA_PTE_V)) return -1;
+
+    if (free_page) {
+        uint64_t pa = LA_PTE_PPN(pte);
+        la_pmem_free((void *)pa);
+    }
+
+    leaf[idx2] = 0;
+    la_tlb_inval_page(va);
+    return 0;
+}
+
 /* ---- Allocate a new page and map it ---- */
 uint64_t la_uvm_alloc_page(uint64_t *root, uint64_t va, uint64_t perm)
 {

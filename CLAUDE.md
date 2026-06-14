@@ -9,7 +9,7 @@
 
 - **项目**：SeaOS — 华东师大花狮小队，oscomp 2026「OS 内核实现赛道」初赛。xv6 风格内核，目标跑通 `/musl`、`/glibc` 下的 oscomp 测试脚本。
 - **两条线**：**A 线 = RISC-V**（`src/kernel/`，成熟，101+ syscall、动态链接、pipe、memfs 齐备，是事实参考实现）；**B 线 = LoongArch**（`src/kernel/loongarch/`，移植中，**本文档对象**）。LoongArch 与 RISC-V 共用同一套 Linux「通用 ABI」syscall 号表。
-- **当前状态（2026-06-14）**：**Step 10、11、12（定时器抢占）、13（动态链接）、14（管道）、15（文件写入/memfs）、16（全部）、17、19 已完成并实测通过**。**已修复 ADEF→INE 级联（过时 TLB 条目 bug）**——QEMU 10.0.2 的广播 `invtlb` 在页面释放后无法可靠地清除重复的 TLB 条目（相同 VPPN、不同 PA）；修复方法为在 `la_uvm_free_pgtbl` 中在释放页面之前针对每个映射的 VA 进行 `invtlb 0x6` 逐 VA 失效，已验证 180 秒内 0 次崩溃。运行时 **0 个 UNKNOWN syscall**。libcbench-musl 具备完整基础设施，稳定运行。**Step 12（定时器抢占）**：每 10 tick 用户进程时间片到期 → `la_proc_yield()`。**Step 13（动态链接）**：PT_INTERP 扫描 + ld.so 加载。**Step 15（文件写入）**：memfs 内存文件系统（128 inodes，每文件最多 64KB），接管 O_CREAT/open/write/read/mkdir/unlinkat/getdents，与只读 ext4 并存。**下一步优先级**：Step 18（堆/mmap 增强）> Step 20（块缓存）> Step 21（集成验证）。详见 §6。
+- **当前状态（2026-06-14）**：**Step 10–20 全部已完成并实测通过**。**已修复 ADEF→INE 级联（过时 TLB 条目 bug）**。运行时 **0 个 UNKNOWN syscall**。libcbench-musl 全部 6 个子测试 exit=0。**Step 12（定时器抢占）**：100ms 时间片。**Step 13（动态链接）**：PT_INTERP + ld.so。**Step 15（文件写入）**：memfs。**Step 18（mmap 增强）**：MAP_FIXED + munmap/mprotect。**Step 20（块缓存）**：256 块 LRU 缓存（1MB），fs_la.c 全链路接入 bio_read。**下一步**：Step 21（集成验证）。详见 §6。
 - **常用命令（必须在 Docker 容器内执行，见 §3）**：
   - 构建：`docker exec nostalgic_khayyam bash -lc 'cd /workspace && make build-la'`（或 `make all`）
   - 用真实测试镜像跑：`docker exec nostalgic_khayyam bash -lc 'cd /workspace && /opt/qemu-bin-10.0.2/bin/qemu-system-loongarch64 -kernel kernel-la -m 1G -nographic -smp 1 -drive file=sdcard-la.img,if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0 -no-reboot'`
@@ -271,11 +271,11 @@ sudo docker run --rm \
 ✅ Step 10 (修EXT4 bug) → ✅ Step 11 (脚本执行) → ✅ Step 12 (定时器抢占)
   → ✅ Step 13 (动态链接) → ✅ Step 14 (管道) → ✅ Step 15 (文件写入)
   → ✅ Step 16 (全部：clone+futex+信号+存根)
-  → ✅ Step 17 (栈增长+不挂死) → ⬜ Step 18 (堆增强)
-  → ✅ Step 19 (资源回收) → ⬜ Step 20 (块缓存) → ⬜ Step 21 (集成验证)
+  → ✅ Step 17 (栈增长+不挂死) → ✅ Step 18 (mmap增强)
+  → ✅ Step 19 (资源回收) → ✅ Step 20 (块缓存) → ⬜ Step 21 (集成验证)
 ```
-> **Bugfix：ADEF→INE 级联（TLB）已修复**（`uvm_la.c`：`la_uvm_free_pgtbl` 中逐 VA 失效，180 秒内 0 次崩溃）。
-> **Step 10、11、12、13、14、15、16、17、19 已完成并实测通过**。**当前最短路径 = Step 18（堆/mmap 增强）+ Step 20（块缓存）+ Step 21（集成验证）**。libcbench-musl 已具备完整基础设施且稳定运行（线程+管道+信号+全覆盖 syscall，0 个 UNKNOWN，无级联崩溃）。
+> **Bugfix：ADEF→INE 级联（TLB）已修复**。
+> **Step 10–20 全部已完成并实测通过**。**最后一步 = Step 21（集成验证）**。libcbench-musl 已具备完整基础设施且稳定运行（线程+管道+信号+全覆盖 syscall，0 个 UNKNOWN，无级联崩溃）。
 
 ### 各步详情
 
@@ -330,14 +330,23 @@ sudo docker run --rm \
 - `la_proc_exit`（proc.c）：清 ISTLBR（**最关键**，防 swtch 走后下一个 trap 被误判为 TLB 重填）+ ZOMBIE + 唤醒父 + `la_sched_switch`。`sys_exit`/`exit_group` 复用之；fork 复制 `stack_bottom`；exec 设 `stack_bottom = stack_top - 8*PGSIZE + PGSIZE`（=最低映射页，**勿 off-by-one**，否则预映射区下方留永久空洞）。
 - 涉及 `proc.h early_boot.h proc.c syscall.c trap.c uvm_la.c exec_la.c`。验证：libcbench-musl 完整跑通、0 崩溃 0 挂死，initcode 继续进 `/glibc/` 组（`/tmp/la-step17c.log`）。
 
-#### Step 18：堆/mmap 增强（🟢 P2）
-- mmap 支持 `MAP_ANONYMOUS/MAP_FIXED`；fork 正确复制/共享 mmap。涉及 `syscall.c uvm_la.c`。
+#### Step 18：堆/mmap 增强（🟢 P2）— ✅ 已完成
+- `sys_mmap`：支持 `MAP_FIXED`(0x10)——精确地址映射，先解映射旧页面再映射新页面；`MAP_ANONYMOUS`(0x20) 已隐式支持。
+- `sys_munmap`：真实实现——释放物理页 + 清零 PTE + TLB 失效。
+- `sys_mprotect`：真实实现——按 PROT_READ/PROT_WRITE/PROT_EXEC 修改 PTE 权限位（D/W/NX/NR）。
+- `la_uvm_unmap_page`（新增于 `uvm_la.c`）：叶 PTE 清零 + 可选释放物理页 + TLB 失效。
+- fork 已通过深拷贝页表自动复制 mmap 区域；CLONE_VM 线程共享页表自然共享 mmap。
+- 涉及：`syscall.c`、`uvm_la.c`、`early_boot.h`。
 
 #### Step 19：资源回收与稳定性（🟡 P1）— ✅ 已完成
 - 实现：`la_uvm_free_pgtbl`（`uvm_la.c`，整表释放数据页+表页）；`la_proc_free`（`proc.c` 改 public，释放 pgtbl+kstack）；`sys_wait` 回收改 `la_proc_free(child)`；exec 在 argv 拷贝完成+装新表+TLB 清填后释放 `old_pgtbl`。安全前提=fork 深拷贝（无共享页）。验证：`fork fail!` 13→0、构建 0 warning、无 use-after-free。（`LA_NPROC` 暂未上调，留待集成期。）涉及 `uvm_la.c early_boot.h proc.c proc.h syscall.c exec_la.c`。
 
-#### Step 20：缓冲区缓存（🟢 P2）
-- LRU 块缓存（如 256 块=1MB），读先查缓存，未命中再 VirtIO。涉及新增 `bio_la.c` 或并入 `fs_la.c`。
+#### Step 20：缓冲区缓存（🟢 P2）— ✅ 已完成
+- 新增 `bio_la.c`/`bio_la.h`：256 块 × 4KB = 1MB LRU 缓存。
+- 轮转时钟淘汰算法：跳过 pinned 条目，淘汰前写回脏块。
+- `bio_read`/`bio_write`/`bio_sync`/`bio_invalidate` 接口。
+- `fs_la.c` 全链路接入：移除静态 `la_blkbuf` 和所有直接 `la_virtio_blk_read` 调用，统一走 `bio_read`；消除 SeaFS 中的临时页分配（`la_pmem_alloc`/`free` 配对）。
+- 涉及：`bio_la.c`（新增）、`bio_la.h`（新增）、`fs_la.c`、`early_boot.h`、`boot.c`。
 
 #### Step 21：综合集成与验证
 - `sdcard-la.img` 全量跑；逐个验证 unixbench/busybox/cyclictest musl 子测试；`make all` + 本地评测复现全过。
@@ -355,9 +364,9 @@ sudo docker run --rm \
 | 16 | 补全关键 syscall | 🔴 P0 | **大**（全部完成）| 无 | ✅ 已完成 |
 | -- | **Bugfix: TLB 级联** | 🔴 P0 | 小 | 无 | ✅ 已修复（`uvm_la.c` 逐 VA 失效） |
 | 17 | 栈增长+不挂死 | 🟡 P1 | 中 | 无 | ✅ 已完成 |
-| 18 | 堆/mmap 增强 | 🟢 P2 | 中 | 无 | ⬜ 待做 |
+| 18 | 堆/mmap 增强 | 🟢 P2 | 中 | 无 | ✅ 已完成 |
 | 19 | 资源回收 | 🔴 P0 | 中 | 无 | ✅ 已完成 |
-| 20 | 缓冲区缓存 | 🟢 P2 | 中 | 无 | ⬜ 待做 |
+| 20 | 缓冲区缓存（bio）| 🟢 P2 | 中 | 无 | ✅ 已完成 |
 | 21 | 集成验证 | 🔴 P0 | 视情况 | 全部 | ⬜ 待做 |
 
 ---

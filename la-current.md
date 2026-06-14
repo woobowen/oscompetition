@@ -136,8 +136,8 @@ src/kernel/loongarch/
 ```
 ✅ Step 10 (EXT4)  → ✅ Step 11 (脚本)  → ✅ Step 12 (抢占)
 → ✅ Step 13 (动态链接) → ✅ Step 14 (管道) → ✅ Step 15 (文件写入)
-→ ✅ Step 16 (全部 syscall) → ✅ Step 17 (栈增长) → ⬜ Step 18 (堆增强)
-→ ✅ Step 19 (资源回收) → ⬜ Step 20 (块缓存) → ⬜ Step 21 (集成验证)
+→ ✅ Step 16 (全部 syscall) → ✅ Step 17 (栈增长) → ✅ Step 18 (mmap增强)
+→ ✅ Step 19 (资源回收) → ✅ Step 20 (块缓存) → ⬜ Step 21 (集成验证)
 ```
 
 ### 2.2 优先级总览
@@ -153,9 +153,9 @@ src/kernel/loongarch/
 | 15 | 文件系统写入（memfs） | P0 | 大 | ✅ |
 | 16 | 补全 syscall（线程+信号+存根） | P0 | 大 | ✅ |
 | 17 | 栈自动增长 + 不挂死 | P1 | 中 | ✅ |
-| 18 | 堆/mmap 增强 | P2 | 中 | ⬜ |
+| 18 | 堆/mmap 增强 | P2 | 中 | ✅ |
 | 19 | 资源回收（页表+内核栈） | P0 | 中 | ✅ |
-| 20 | 缓冲区缓存 | P2 | 中 | ⬜ |
+| 20 | 缓冲区缓存（bio） | P2 | 中 | ✅ |
 | 21 | 集成验证 | P0 | 视情况 | ⬜ |
 | — | Bugfix: TLB 级联崩溃 | P0 | 小 | ✅ |
 
@@ -380,6 +380,51 @@ src/kernel/loongarch/
 **涉及文件**：`memfs_la.c`（新增）、`memfs_la.h`（新增）、`syscall.c`、`proc.h`、`early_boot.h`、`boot.c`
 
 **遗留**：memfs 与 ext4 并存于同一命名空间（memfs 优先），但无 copy-on-write 叠加层——对 ext4 已有文件进行写打开会返回 ENOENT。每文件最大 64KB（16 页），若测试需要更大文件需上调 `MEMFS_PAGES_PER_FILE`。不实现文件扩展属性、时间戳、权限位（均返回默认值）。`sys_faccessat` 仍为桩（全部允许）。
+
+---
+
+### 2026-06-14 — Step 18：堆/mmap 增强（MAP_FIXED + munmap + mprotect）
+
+**完成内容**：
+- `uvm_la.c`：新增 `la_uvm_unmap_page(root, va, free_page)`——三级页表遍历找叶 PTE，清零 PTE + 可选释放物理页 + `la_tlb_inval_page`
+- `sys_mmap` 增强：
+  - `MAP_FIXED`(0x10)：精确地址映射——先对整个目标范围 `la_uvm_unmap_page`（释放旧物理页），再分配新页面
+  - `MAP_ANONYMOUS`(0x20)：定义宏（已隐式支持，所有 mmap 均为匿名）
+  - 非 MAP_FIXED 时保留原有逻辑（hint 优先 → mmap_top 回退）
+- `sys_munmap` 真实实现：遍历页范围，对每页调用 `la_uvm_unmap_page` 释放物理页 + 清零 PTE
+- `sys_mprotect` 真实实现：
+  - 解析 `PROT_READ`(1)/`PROT_WRITE`(2)/`PROT_EXEC`(4)
+  - 构建目标 PTE 权限（RWX → 置位 D|W，NX → 置位 NX 等）
+  - 遍历页范围，保留 PA 替换权限位，TLB 逐页失效
+  - 本地 `SYS_PTE_*` 常量（因 PTE 位定义在 `uvm_la.c` 内，未导出到头文件）
+- fork 深拷贝页表自动复制 mmap 区域；CLONE_VM 线程共享页表自然共享 mmap（无需额外 tracking）
+
+**涉及文件**：`syscall.c`、`uvm_la.c`、`early_boot.h`
+
+**遗留**：mmap 地址分配未跟踪已释放区域（`mmap_top` 单调增长），长时间运行可能耗尽地址空间。未实现文件映射（`fd != -1` 时返回 -1）。未实现 `MAP_SHARED`。mprotect 权限常量与 uvm_la.c 重复定义——后续应统一到公共头文件。
+
+---
+
+### 2026-06-14 — Step 20：缓冲区缓存（bio）
+
+**完成内容**：
+- 新增 `bio_la.h`/`bio_la.c`（~140 行）：256 块 × 4KB = 1MB LRU 缓存
+  - 轮转时钟（clock-hand）淘汰算法：跳过 pinned 条目，淘汰前脏块写回
+  - `bio_read(blk)`：缓存命中直接返回指针；未命中 → 淘汰 → VirtIO 读入
+  - `bio_write(blk)`：标记脏（用于 memfs 写回）
+  - `bio_sync()`：遍历全部脏块写回 VirtIO
+  - `bio_invalidate(blk)`：丢弃指定块
+- `fs_la.c` 全面接入（~13 处修改）：
+  - 移除静态 `la_blkbuf[4096]` 和 `la_blk_read()` 中的直接 VirtIO 调用
+  - `la_blk_read` 改为 `return bio_read(blk)` 一行
+  - 所有直接 `la_virtio_blk_read(pb, tmp)` → `bio_read(pb)` 模式
+  - 消除 SeaFS 中 4 处临时页分配/释放配对（`la_pmem_alloc`+`la_pmem_free`），节省物理内存
+  - EXT4 `e4_lbn2pb` 中 `la_blkbuf` 引用 → `bio_read` 直接返回
+- `early_boot.h`/`boot.c`：声明 + `bio_init()` 调用（在 fs_init 之前）
+
+**涉及文件**：`bio_la.c`（新增）、`bio_la.h`（新增）、`fs_la.c`、`early_boot.h`、`boot.c`
+
+**遗留**：脏块写回仅在淘汰时触发；`bio_sync` 未在任何关机路径调用（当前内核无正式关机流程，VM 直接终止）。缓存大小固定 256 块，无运行时调整。无预读/回写优化。
 
 ---
 
