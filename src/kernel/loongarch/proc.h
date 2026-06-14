@@ -7,6 +7,9 @@
 #define LA_NPROC        16
 #define LA_KSTACK_SIZE  4096   /* one page per kernel stack */
 
+/* Scheduler time slice in timer ticks (100 Hz → 10 ticks = 100 ms). */
+#define LA_TIME_SLICE   10
+
 /* Maximum user-stack size (pages).  exec pre-maps 8 pages; deeper stacks
  * (libc-bench needs ~80 KB ≈ 20 pages) are grown on demand up to this cap. */
 #define LA_MAX_STACK_PAGES 512
@@ -42,8 +45,9 @@ struct la_context {
 /* fd types */
 #define LA_FD_UNUSED  0
 #define LA_FD_CONSOLE 1   /* stdin/stdout/stderr → UART */
-#define LA_FD_FILE    2   /* regular file on filesystem */
+#define LA_FD_FILE    2   /* regular file on ext4/SeaFS (read-only) */
 #define LA_FD_PIPE    3   /* pipe (read end or write end) */
+#define LA_FD_MEMFS   4   /* writable file on memfs */
 
 /* ---- Pipe ---- */
 #define LA_PIPE_SIZE   4096
@@ -140,6 +144,7 @@ struct la_proc {
     int is_user;               /* 1 = user process, 0 = kernel thread */
     int shared_vm;             /* 1 = CLONE_VM thread (shares pgtbl + mm; do NOT
                                 * free pgtbl on reap — owned by the leader) */
+    int ticks;                 /* remaining timer ticks in this time slice */
     uint64_t clear_child_tid;  /* user VA of cleartid word (0 = none) */
     void  *wait_chan;          /* futex sleep channel (0 = pid-wakeup sleeper) */
 

@@ -20,13 +20,28 @@
  */
 #define EXE_PTE_U_RWX  0x19FUL
 
+/* ---- Minimal memset for compiler-generated calls ---- */
+static void *la_memset_impl(void *d, int c, unsigned long n)
+{
+    unsigned char *p = (unsigned char *)d;
+    while (n--) *p++ = (unsigned char)c;
+    return d;
+}
+void *memset(void *d, int c, unsigned long n) __attribute__((alias("la_memset_impl")));
+
 /* ---- LoongArch ELF header constants ---- */
 #define LA_ELF_MAGIC   0x464C457FUL   /* "\x7fELF" */
 #define LA_ELF_CLASS64 2
 #define LA_ELF_DATA2LSB 1
 #define LA_ELF_EXEC    2
 #define LA_EM_LOONGARCH 0x102         /* EM_LOONGARCH */
-#define LA_ELF_PROG_LOAD 1
+#define LA_ELF_PROG_LOAD   1
+#define LA_ELF_PROG_INTERP 3
+#define LA_ELF_PROG_PHDR   6
+
+/* Fixed base address for loading the dynamic linker (1 GB).
+ * Must not overlap the main executable (loaded at 0x120000000+). */
+#define LA_INTERP_LOAD_BASE 0x40000000ULL
 
 /* ELF header (64-bit, little-endian) */
 struct la_elf_ehdr {
@@ -251,6 +266,143 @@ void la_proc_make_first(void)
     la_uart_puts("\n");
 
     la_uart_puts("[initcode] first user process ready\n");
+}
+
+/*
+ * Load the ELF dynamic linker (ld.so) at a fixed base address.
+ *
+ * Musl:  the interpreter path is /lib64/ld-musl-loongarch-lp64d.so.1, but
+ *        the actual file is usually /musl/lib/libc.so (musl's monolithic libc
+ *        IS the dynamic linker — it contains both the ld and the libc).
+ * Glibc: interpreter is /lib64/ld-linux-loongarch-lp64d.so.1, actual file
+ *        at /glibc/lib/ld-linux-loongarch-lp64d.so.1.
+ *
+ * Fallback chain: requested path → extract basename, try /musl/lib/<name>
+ * and /glibc/lib/<name> → /musl/lib/libc.so → /glibc/lib/ld-linux-*.so.1.
+ *
+ * Returns the interpreter entry point (base + e_entry), or -1 on failure.
+ */
+static uint64_t la_load_interp(uint64_t *pgtbl, const char *interp_path)
+{
+    /* Resolve the interpreter to an inode, with fallbacks */
+    uint32_t ino;
+    char path_buf[128];
+
+    /* 1. Try the path as-is */
+    if (la_fs_lookup((char *)interp_path, &ino) < 0) {
+        /* 2. Extract basename, try /musl/lib/<name> and /glibc/lib/<name> */
+        const char *basename = interp_path;
+        for (int i = 0; interp_path[i]; i++)
+            if (interp_path[i] == '/') basename = interp_path + i + 1;
+
+        int j = 0;
+        path_buf[j++] = '/'; path_buf[j++] = 'm'; path_buf[j++] = 'u';
+        path_buf[j++] = 's'; path_buf[j++] = 'l'; path_buf[j++] = '/';
+        path_buf[j++] = 'l'; path_buf[j++] = 'i'; path_buf[j++] = 'b';
+        path_buf[j++] = '/';
+        for (int k = 0; basename[k] && j < 120; k++) path_buf[j++] = basename[k];
+        path_buf[j] = '\0';
+        if (la_fs_lookup(path_buf, &ino) < 0) {
+            path_buf[0] = '/'; path_buf[1] = 'g'; path_buf[2] = 'l';
+            path_buf[3] = 'i'; path_buf[4] = 'b'; path_buf[5] = 'c';
+            path_buf[6] = '/'; path_buf[7] = 'l'; path_buf[8] = 'i';
+            path_buf[9] = 'b'; path_buf[10] = '/';
+            for (int k = 0; basename[k] && j < 120; k++) { int p = 11 + k; path_buf[p] = basename[k]; path_buf[p+1] = '\0'; }
+            if (la_fs_lookup(path_buf, &ino) < 0) {
+                /* 3. Musl fallback: libc.so IS the dynamic linker */
+                if (la_fs_lookup("/musl/lib/libc.so", &ino) < 0) {
+                    /* 4. Glibc fallback */
+                    if (la_fs_lookup("/glibc/lib/ld-linux-loongarch-lp64d.so.1",
+                                     &ino) < 0) {
+                        la_uart_puts("  load_interp: cannot find ");
+                        la_uart_puts((char *)interp_path);
+                        la_uart_puts(" or fallbacks\n");
+                        return (uint64_t)-1;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Read ELF header */
+    struct la_elf_ehdr eh;
+    uint32_t n = la_fs_read_file(ino, 0, &eh, sizeof(eh));
+    if (n != sizeof(eh) || *(uint32_t *)eh.e_ident != LA_ELF_MAGIC
+        || eh.e_machine != LA_EM_LOONGARCH) {
+        la_uart_puts("  load_interp: not a valid LoongArch ELF\n");
+        return (uint64_t)-1;
+    }
+
+    la_uart_puts("  load_interp: loading phnum=");
+    la_uart_put_hex(eh.e_phnum);
+    la_uart_puts(" entry=");
+    la_uart_put_hex(eh.e_entry);
+    la_uart_puts("\n");
+
+    /* Load PT_LOAD segments at base + p_vaddr */
+    for (int i = 0; i < eh.e_phnum; i++) {
+        struct la_elf_phdr ph;
+        uint64_t ph_off = eh.e_phoff + i * eh.e_phentsize;
+        n = la_fs_read_file(ino, ph_off, &ph, sizeof(ph));
+        if (n != sizeof(ph)) return (uint64_t)-1;
+
+        if (ph.p_type != LA_ELF_PROG_LOAD || ph.p_memsz == 0)
+            continue;
+
+        uint64_t seg_va = LA_INTERP_LOAD_BASE + ph.p_vaddr;
+        uint64_t va     = seg_va & ~0xFFFUL;
+        uint64_t va_end = (seg_va + ph.p_memsz + 0xFFF) & ~0xFFFUL;
+
+        la_uart_puts("  load_interp: LOAD va=");
+        la_uart_put_hex(seg_va);
+        la_uart_puts(" filesz=");
+        la_uart_put_hex(ph.p_filesz);
+        la_uart_puts(" memsz=");
+        la_uart_put_hex(ph.p_memsz);
+        la_uart_puts("\n");
+
+        /* Map and zero pages */
+        for (; va < va_end; va += LA_PGSIZE) {
+            /* Skip if already mapped (could overlap with main binary) */
+            if (la_uva_to_pa(pgtbl, va) == 0) {
+                if (la_uvm_alloc_page(pgtbl, va, EXE_PTE_U_RWX) == 0)
+                    return (uint64_t)-1;
+            }
+        }
+
+        /* Zero BSS (all pages, then load segment data on top) */
+        {
+            uint64_t zva = seg_va & ~0xFFFUL;
+            while (zva < va_end) {
+                uint64_t pa = la_uva_to_pa(pgtbl, zva);
+                if (pa) {
+                    uint8_t *zp = (uint8_t *)pa;
+                    for (int zi = 0; zi < (int)LA_PGSIZE; zi++)
+                        zp[zi] = 0;
+                }
+                zva += LA_PGSIZE;
+            }
+        }
+
+        /* Read segment data */
+        if (ph.p_filesz > 0) {
+            uint64_t seg_off = 0;
+            while (seg_off < ph.p_filesz) {
+                uint32_t chunk = 512;
+                if (chunk > ph.p_filesz - seg_off)
+                    chunk = (uint32_t)(ph.p_filesz - seg_off);
+
+                static __attribute__((aligned(8))) char ibuf[512];
+                n = la_fs_read_file(ino, ph.p_offset + seg_off, ibuf, chunk);
+                if (n != chunk) return (uint64_t)-1;
+
+                la_uvm_copy_in(pgtbl, seg_va + seg_off, ibuf, chunk);
+                seg_off += chunk;
+            }
+        }
+    }
+
+    return LA_INTERP_LOAD_BASE + eh.e_entry;
 }
 
 /*
@@ -527,11 +679,37 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
 
     uint64_t ph_first_vaddr = 0;
     uint64_t max_vaddr = 0;  /* track highest VA+memsz for heap_top init */
+    uint64_t phdr_addr = 0;  /* AT_PHDR value: VA of program headers in user memory */
+    char     interp_path[128];
+    interp_path[0] = '\0';
+    uint64_t interp_entry = 0;
+
     for (int i = 0; i < eh.e_phnum; i++) {
         struct la_elf_phdr ph;
         uint64_t ph_off = eh.e_phoff + i * eh.e_phentsize;
         n = la_fs_read_file(ino, ph_off, &ph, sizeof(ph));
         if (n != sizeof(ph)) goto exec_fail;
+
+        /* ---- PT_PHDR: record VA of the program header table ---- */
+        if (ph.p_type == LA_ELF_PROG_PHDR) {
+            phdr_addr = ph.p_vaddr;
+            continue;
+        }
+
+        /* ---- PT_INTERP: read the dynamic linker path ---- */
+        if (ph.p_type == LA_ELF_PROG_INTERP) {
+            uint32_t path_len = ph.p_filesz < 127 ? (uint32_t)ph.p_filesz : 127;
+            n = la_fs_read_file(ino, ph.p_offset, interp_path, path_len);
+            if (n != path_len) goto exec_fail;
+            interp_path[path_len] = '\0';
+            /* Trim trailing newline if present */
+            if (path_len > 0 && interp_path[path_len - 1] == '\n')
+                interp_path[path_len - 1] = '\0';
+            la_uart_puts("  exec: PT_INTERP=");
+            la_uart_puts(interp_path);
+            la_uart_puts("\n");
+            continue;
+        }
 
         if (ph.p_type != LA_ELF_PROG_LOAD || ph.p_memsz == 0)
             continue;
@@ -606,6 +784,26 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
             }
         }
     }
+    /* ---- Load the dynamic linker (if PT_INTERP was found) ----
+     * Must happen AFTER the main binary's LOAD segments are mapped (so the
+     * page table already has the main binary's pages) and BEFORE the stack
+     * setup (so AT_BASE/AT_ENTRY auxv entries are correct). */
+    if (interp_path[0] != '\0') {
+        interp_entry = la_load_interp(new_pgtbl, interp_path);
+        if (interp_entry == (uint64_t)-1)
+            goto exec_fail;
+        la_uart_puts("  exec: interp_entry=");
+        la_uart_put_hex(interp_entry);
+        la_uart_puts("\n");
+    }
+
+    /* Compute AT_PHDR if not explicitly provided by PT_PHDR.
+     * Fallback: first LOAD segment VA + offset of phdrs within the file.
+     * This is valid because the kernel maps the entire first LOAD segment
+     * including the ELF header and program headers at the start. */
+    if (phdr_addr == 0 && ph_first_vaddr != 0)
+        phdr_addr = ph_first_vaddr + eh.e_phoff;
+
     /* Allocate stack (8 pages, including top page for busybox argv/envp scan) */
     uint64_t stack_top = LA_USER_STACK;
     for (int si = 0; si < 8; si++) {
@@ -697,8 +895,10 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
      * high address until they hit AT_NULL. */
     #define AT_NULL   0
     #define AT_PHDR   3
+    #define AT_PHENT  4
     #define AT_PHNUM  5
     #define AT_PAGESZ 6
+    #define AT_BASE   7
     #define AT_ENTRY  9
     #define AT_UID    11
     #define AT_EUID   12
@@ -757,10 +957,12 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
     sp -= 16; { uint64_t a[2] = { AT_UID,   0 };            la_uvm_copy_in(new_pgtbl, sp, a, 16); }
     sp -= 16; { uint64_t a[2] = { AT_ENTRY, eh.e_entry };   la_uvm_copy_in(new_pgtbl, sp, a, 16); }
     sp -= 16; { uint64_t a[2] = { AT_PHNUM, eh.e_phnum };   la_uvm_copy_in(new_pgtbl, sp, a, 16); }
-    {
-        uint64_t at_phdr = ph_first_vaddr + eh.e_phoff;
-        sp -= 16; { uint64_t a[2] = { AT_PHDR, at_phdr };   la_uvm_copy_in(new_pgtbl, sp, a, 16); }
-    }
+    sp -= 16; { uint64_t a[2] = { AT_PHENT, sizeof(struct la_elf_phdr) }; la_uvm_copy_in(new_pgtbl, sp, a, 16); }
+    sp -= 16; { uint64_t a[2] = { AT_PHDR,  phdr_addr };    la_uvm_copy_in(new_pgtbl, sp, a, 16); }
+    /* AT_BASE: base address of the interpreter (only when dynamically linked).
+     * musl's ldso uses this to self-relocate — without it ldso crashes. */
+    if (interp_entry != 0)
+        sp -= 16, ({ uint64_t a[2] = { AT_BASE, LA_INTERP_LOAD_BASE }; la_uvm_copy_in(new_pgtbl, sp, a, 16); });
     sp -= 16; { uint64_t a[2] = { AT_PAGESZ, LA_PGSIZE };  la_uvm_copy_in(new_pgtbl, sp, a, 16); }
 
     /* AT_RANDOM header — lowest auxv entry (first one musl sees after
@@ -822,13 +1024,17 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
     uint64_t *e = (uint64_t *)(new_tf + 1);
     while (d < e) *d++ = 0;
 
-    new_tf->era = eh.e_entry;
+    /* If dynamically linked, start at the interpreter's entry point.
+     * The AT_ENTRY auxv tells the interpreter where the main binary starts.
+     * For static ELFs, interp_entry == 0 and we use eh.e_entry directly. */
+    uint64_t start_pc = interp_entry ? interp_entry : eh.e_entry;
+    new_tf->era = start_pc;
     new_tf->gpr[LA_GPR_SP] = sp;              /* sp points to argc on stack */
     new_tf->gpr[LA_GPR_A0] = (uint64_t)argc;
     new_tf->gpr[LA_GPR_A1] = argv_uaddr;      /* &argv[0] = sp + 8 */
 
     la_uart_puts("  exec: era=");
-    la_uart_put_hex(eh.e_entry);
+    la_uart_put_hex(start_pc);
     la_uart_puts(" sp=");
     la_uart_put_hex(sp);
     la_uart_puts(" argc=");

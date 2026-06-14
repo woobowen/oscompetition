@@ -102,6 +102,22 @@ void la_trap_dispatch(struct la_trap_frame *tf)
     if (ecode == LA_ECODE_INT) {
         if (tf->estat & LA_ESTAT_IS_TIMER) {
             la_timer_interrupt();
+
+            /* ---- timer preemption ----
+             * Decrement the current user process's time-slice counter.
+             * When it expires, voluntarily yield the CPU so the round-robin
+             * scheduler can pick another runnable process.  The trap frame
+             * stays on this process's private kernel stack; la_proc_yield()
+             * saves sp in p->ctx, and when the process is resumed the frame
+             * is restored and ertn returns to the interrupted instruction. */
+            {
+                struct la_proc *p = la_current_proc();
+                if (p && p->is_user) {
+                    p->ticks--;
+                    if (p->ticks <= 0)
+                        la_proc_yield();
+                }
+            }
         } else {
             la_uart_puts("trap: unknown interrupt IS=");
             la_uart_put_hex(tf->estat & 0xFFFF);

@@ -93,6 +93,17 @@ uint32_t la_fs_inode_size(uint32_t ino);
 uint32_t la_fs_get_dentries(uint32_t dir_ino, void *dst, uint32_t len);
 int     la_fs_is_sea(void);
 
+/* ---- Memory filesystem (writable) ---- */
+void     memfs_init(void);
+int      memfs_lookup(const char *path);
+int      memfs_create(const char *path, int type);
+int      memfs_write(int ino, uint32_t offset, const void *buf, uint32_t len);
+int      memfs_read(int ino, uint32_t offset, void *buf, uint32_t len);
+int      memfs_delete(const char *path);
+int      memfs_getdents(int dir_ino, void *buf, uint32_t len);
+uint32_t memfs_inode_size(int ino);
+int      memfs_path_prefix(const char *path, const char *prefix);
+
 /* ---- User virtual memory ---- */
 uint64_t *la_uvm_create(void);
 int      la_uvm_map_page(uint64_t *root, uint64_t va, uint64_t pa, uint64_t perm);

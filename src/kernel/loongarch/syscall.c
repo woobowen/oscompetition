@@ -15,11 +15,12 @@
 #include "early_boot.h"
 #include "trap.h"
 #include "proc.h"
+#include "memfs_la.h"
 
 /* ---- Syscall numbers (LoongArch asm-generic ABI) ---- */
 #define SYS_fork         4
 #define SYS_mkdir       34
-#define SYS_unlink      35
+#define SYS_unlinkat    35
 #define SYS_link        37
 #define SYS_chdir       49
 #define SYS_dup         23
@@ -300,11 +301,32 @@ static uint64_t sys_write(struct la_trap_frame *tf)
         return done;
     }
 
-    /* File fd */
+    /* memfs fd — write to in-memory file */
+    if (fd >= 0 && fd < LA_NFD && p->fds[fd].type == LA_FD_MEMFS) {
+        if (!p->fds[fd].writable) return (uint64_t)-1;
+
+        /* Copy data from user space into a kernel buffer */
+        static __attribute__((aligned(8))) char wbuf[4096];
+        uint32_t done = 0;
+        while (done < len) {
+            uint32_t chunk = 4096;
+            if (chunk > len - done) chunk = len - done;
+            la_copy_from_user(wbuf, buf + done, chunk);
+            int n = memfs_write((int)p->fds[fd].ino,
+                                p->fds[fd].offset + done,
+                                wbuf, chunk);
+            if (n <= 0) break;
+            done += (uint32_t)n;
+            if ((uint32_t)n < chunk) break;
+        }
+        p->fds[fd].offset += done;
+        return done;
+    }
+
+    /* ext4 file fd — read-only filesystem, return error for write */
     if (fd < 0 || fd >= LA_NFD || p->fds[fd].type != LA_FD_FILE)
         return (uint64_t)-1;
 
-    /* Read-only filesystem — return error for write */
     return (uint64_t)-1;
 }
 
@@ -361,6 +383,25 @@ static uint64_t sys_read(struct la_trap_frame *tf)
         return chunk;
     }
 
+    /* memfs fd — read from in-memory file */
+    if (p->fds[fd].type == LA_FD_MEMFS) {
+        uint32_t ino    = p->fds[fd].ino;
+        uint32_t offset = p->fds[fd].offset;
+        static __attribute__((aligned(8))) char mbuf[4096];
+        uint32_t done = 0;
+        while (done < len) {
+            uint32_t chunk = 4096;
+            if (chunk > len - done) chunk = len - done;
+            int n = memfs_read((int)ino, offset + done, mbuf, chunk);
+            if (n <= 0) break;
+            la_copy_to_user(buf + done, mbuf, (uint32_t)n);
+            done += (uint32_t)n;
+            if ((uint32_t)n < chunk) break;
+        }
+        p->fds[fd].offset = offset + done;
+        return done;
+    }
+
     /* File fd */
     if (p->fds[fd].type != LA_FD_FILE)
         return (uint64_t)-1;
@@ -401,7 +442,6 @@ static uint64_t sys_open(struct la_trap_frame *tf)
     uint64_t upath = tf->gpr[LA_GPR_A1];
     uint32_t flags = (uint32_t)tf->gpr[LA_GPR_A2];
     struct la_proc *p = la_current_proc();
-    (void)flags;
 
     if (!p) return (uint64_t)(-LA_EBADF);
 
@@ -410,6 +450,56 @@ static uint64_t sys_open(struct la_trap_frame *tf)
     if (la_copy_str_from_user(path, upath, sizeof(path) - 1) < 0)
         return (uint64_t)(-LA_EFAULT);
 
+    int writable  = (flags & 1) != 0;      /* O_WRONLY=1 or O_RDWR=2 */
+    int may_create = (flags & 0x40) != 0;   /* O_CREAT = 0x40 */
+
+    /* ---- memfs path ----
+     * Route to the writable memory filesystem when:
+     *   1. The file already exists in memfs.
+     *   2. O_CREAT is set (create in memfs).
+     *   3. Opened for writing AND not found on ext4 (create on demand). */
+    {
+        int mi = memfs_lookup(path);
+
+        if (mi >= 0) {
+            /* Exists in memfs — open it */
+            int fd = -1;
+            for (int i = 0; i < LA_NFD; i++)
+                if (p->fds[i].type == LA_FD_UNUSED) { fd = i; break; }
+            if (fd < 0) return (uint64_t)(-LA_EMFILE);
+
+            p->fds[fd].ino      = (uint32_t)mi;
+            p->fds[fd].offset   = 0;
+            p->fds[fd].type     = LA_FD_MEMFS;
+            p->fds[fd].writable = 1;
+            p->fds[fd].pipe     = 0;
+            return (uint64_t)fd;
+        }
+
+        if (may_create) {
+            /* Create new file in memfs */
+            mi = memfs_create(path, MEMFS_TYPE_FILE);
+            if (mi < 0) return (uint64_t)(-LA_ENOSPC);
+
+            int fd = -1;
+            for (int i = 0; i < LA_NFD; i++)
+                if (p->fds[i].type == LA_FD_UNUSED) { fd = i; break; }
+            if (fd < 0) return (uint64_t)(-LA_EMFILE);
+
+            p->fds[fd].ino      = (uint32_t)mi;
+            p->fds[fd].offset   = 0;
+            p->fds[fd].type     = LA_FD_MEMFS;
+            p->fds[fd].writable = 1;
+            p->fds[fd].pipe     = 0;
+            return (uint64_t)fd;
+        }
+
+        /* Writable open of non-existent file → fail */
+        if (writable)
+            return (uint64_t)(-LA_ENOENT);
+    }
+
+    /* ---- ext4 path (read-only) ---- */
     /* Resolve path to inode */
     uint32_t ino;
     if (la_fs_lookup(path, &ino) < 0) {
@@ -474,18 +564,25 @@ static uint64_t sys_lseek(struct la_trap_frame *tf)
     int whence   = (int)tf->gpr[LA_GPR_A2];
     struct la_proc *p = la_current_proc();
 
-    if (!p || fd < 0 || fd >= LA_NFD || p->fds[fd].type != LA_FD_FILE)
+    if (!p || fd < 0 || fd >= LA_NFD) return (uint64_t)-1;
+    if (p->fds[fd].type != LA_FD_FILE && p->fds[fd].type != LA_FD_MEMFS)
         return (uint64_t)-1;
 
     uint32_t new_off;
-    if (whence == 0)        /* SET */
+    if (whence == 0) {      /* SEEK_SET */
         new_off = (uint32_t)off;
-    else if (whence == 1)   /* ADD */
+    } else if (whence == 1) { /* SEEK_CUR */
         new_off = p->fds[fd].offset + (uint32_t)off;
-    else if (whence == 2)   /* SUB */
-        new_off = p->fds[fd].offset - (uint32_t)off;
-    else
+    } else if (whence == 2) { /* SEEK_END */
+        uint32_t fsize;
+        if (p->fds[fd].type == LA_FD_MEMFS)
+            fsize = memfs_inode_size((int)p->fds[fd].ino);
+        else
+            fsize = la_fs_inode_size(p->fds[fd].ino);
+        new_off = fsize + (uint32_t)off;  /* off is typically negative */
+    } else {
         return (uint64_t)-1;
+    }
 
     p->fds[fd].offset = new_off;
     return new_off;
@@ -517,7 +614,8 @@ static uint64_t sys_fstat(struct la_trap_frame *tf)
     uint64_t udst = tf->gpr[LA_GPR_A1];
     struct la_proc *p = la_current_proc();
 
-    if (!p || fd < 0 || fd >= LA_NFD || p->fds[fd].type != LA_FD_FILE)
+    if (!p || fd < 0 || fd >= LA_NFD) return (uint64_t)-1;
+    if (p->fds[fd].type != LA_FD_FILE && p->fds[fd].type != LA_FD_MEMFS)
         return (uint64_t)-1;
 
     /* Build file_stat_t (matching help.h layout):
@@ -530,10 +628,16 @@ static uint64_t sys_fstat(struct la_trap_frame *tf)
         uint32_t offset;
     } stat;
 
-    int ft = la_fs_inode_type(p->fds[fd].ino);
-    stat.type = (uint16_t)ft;
-    stat.nlink = 1;
-    stat.size = la_fs_inode_size(p->fds[fd].ino);
+    if (p->fds[fd].type == LA_FD_MEMFS) {
+        stat.type = 0;   /* regular file */
+        stat.nlink = 1;
+        stat.size  = memfs_inode_size((int)p->fds[fd].ino);
+    } else {
+        int ft = la_fs_inode_type(p->fds[fd].ino);
+        stat.type = (uint16_t)ft;
+        stat.nlink = 1;
+        stat.size = la_fs_inode_size(p->fds[fd].ino);
+    }
     stat.inode_num = p->fds[fd].ino;
     stat.offset = p->fds[fd].offset;
 
@@ -549,18 +653,27 @@ static uint64_t sys_get_dentries(struct la_trap_frame *tf)
     uint32_t len  = (uint32_t)tf->gpr[LA_GPR_A2];
     struct la_proc *p = la_current_proc();
 
-    if (!p || fd < 0 || fd >= LA_NFD || p->fds[fd].type != LA_FD_FILE)
-        return (uint64_t)-1;
+    if (!p || fd < 0 || fd >= LA_NFD) return (uint64_t)-1;
 
     /* Read dentries into a kernel buffer, then copy to user */
     static __attribute__((aligned(8))) char dentbuf[4096];
     if (len > sizeof(dentbuf)) len = sizeof(dentbuf);
 
-    la_uart_puts("  getdents: ino=");
-    la_uart_put_hex(p->fds[fd].ino);
-    la_uart_puts("\n");
+    uint32_t n = 0;
 
-    uint32_t n = la_fs_get_dentries(p->fds[fd].ino, dentbuf, len);
+    if (p->fds[fd].type == LA_FD_MEMFS) {
+        /* memfs directory — list children from in-memory inode table */
+        n = (uint32_t)memfs_getdents((int)p->fds[fd].ino, dentbuf, len);
+    } else if (p->fds[fd].type == LA_FD_FILE) {
+        la_uart_puts("  getdents: ino=");
+        la_uart_put_hex(p->fds[fd].ino);
+        la_uart_puts("\n");
+
+        n = la_fs_get_dentries(p->fds[fd].ino, dentbuf, len);
+    } else {
+        return (uint64_t)-1;
+    }
+
     if (n == 0) {
         la_uart_puts("  getdents: 0 entries\n");
         return 0;
@@ -585,6 +698,14 @@ static uint64_t sys_chdir(struct la_trap_frame *tf)
     if (la_copy_str_from_user(path, upath, sizeof(path) - 1) < 0)
         return (uint64_t)-1;
 
+    /* Check memfs first */
+    int mi = memfs_lookup(path);
+    if (mi >= 0) {
+        /* memfs directories are type MEMFS_TYPE_DIR (2) */
+        p->cwd_ino = (uint32_t)mi | 0x80000000U;  /* high bit = memfs marker */
+        return 0;
+    }
+
     uint32_t ino;
     if (la_fs_lookup(path, &ino) < 0)
         return (uint64_t)-1;
@@ -597,10 +718,44 @@ static uint64_t sys_chdir(struct la_trap_frame *tf)
     return 0;
 }
 
-/* SYS_mkdir: create directory (not supported on read-only FS) */
+/* SYS_mkdir: create directory in memfs */
 static uint64_t sys_mkdir(struct la_trap_frame *tf)
 {
-    (void)tf;
+    uint64_t upath = tf->gpr[LA_GPR_A0];   /* pathname */
+    /* a1 = mode (ignored) */
+    char path[256];
+
+    if (la_copy_str_from_user(path, upath, sizeof(path) - 1) < 0)
+        return (uint64_t)-1;
+
+    /* Check if already exists in memfs */
+    if (memfs_lookup(path) >= 0)
+        return (uint64_t)-1;  /* -EEXIST */
+
+    /* Create directory inode */
+    int ino = memfs_create(path, MEMFS_TYPE_DIR);
+    if (ino < 0) return (uint64_t)-1;
+
+    return 0;
+}
+
+/* SYS_unlinkat (35): remove a file or directory from memfs.
+ * ABI: a0=dirfd (ignored), a1=pathname, a2=flags (AT_REMOVEDIR=0x200).
+ * memfs_delete handles both files and directories uniformly. */
+static uint64_t sys_unlinkat(struct la_trap_frame *tf)
+{
+    uint64_t upath = tf->gpr[LA_GPR_A1];   /* pathname */
+    (void)tf->gpr[LA_GPR_A0];               /* dirfd — ignored */
+    (void)tf->gpr[LA_GPR_A2];               /* flags  — ignored */
+    char path[256];
+
+    if (la_copy_str_from_user(path, upath, sizeof(path) - 1) < 0)
+        return (uint64_t)-1;
+
+    if (memfs_delete(path) == 0)
+        return 0;
+
+    /* ext4 is read-only — cannot unlink */
     return (uint64_t)-1;
 }
 
@@ -1583,9 +1738,22 @@ static uint64_t sys_newfstatat(struct la_trap_frame *tf)
     if (la_copy_str_from_user(path, upath, sizeof(path) - 1) < 0)
         return (uint64_t)-1;
 
+    /* Check memfs first */
+    int mi = memfs_lookup(path);
+    int ftype;
+    uint64_t fsize;
     uint32_t ino;
-    if (la_fs_lookup(path, &ino) < 0)
-        return (uint64_t)-1;
+
+    if (mi >= 0) {
+        ftype = 0;  /* regular file (memfs dirs are rarer) */
+        fsize = memfs_inode_size(mi);
+        ino   = (uint32_t)mi;
+    } else {
+        if (la_fs_lookup(path, &ino) < 0)
+            return (uint64_t)-1;
+        ftype = la_fs_inode_type(ino);
+        fsize = la_fs_inode_size(ino);
+    }
 
     /* Build a minimal stat struct (kernel stat, 128 bytes) */
     char sbuf[128];
@@ -1595,14 +1763,13 @@ static uint64_t sys_newfstatat(struct la_trap_frame *tf)
      *   [0]  dev (8), [8] ino (8), [16] mode (4), [20] nlink (4),
      *   [24] uid (4), [28] gid (4), [32] rdev (8), [40] size (8),
      *   [48] blksize (8), [56] blocks (8) */
-    int ftype = la_fs_inode_type(ino);
     uint16_t mode = ftype == 1 ? 0040755 : 0100755;
-    *(uint64_t *)&sbuf[0]  = 1;     /* dev */
-    *(uint64_t *)&sbuf[8]  = ino;   /* ino */
-    *(uint32_t *)&sbuf[16] = mode;  /* mode */
-    *(uint32_t *)&sbuf[20] = 1;     /* nlink */
-    *(uint32_t *)&sbuf[48] = 4096;  /* blksize */
-    *(uint64_t *)&sbuf[40] = la_fs_inode_size(ino); /* size */
+    *(uint64_t *)&sbuf[0]  = 1;      /* dev */
+    *(uint64_t *)&sbuf[8]  = ino;    /* ino */
+    *(uint32_t *)&sbuf[16] = mode;   /* mode */
+    *(uint32_t *)&sbuf[20] = 1;      /* nlink */
+    *(uint32_t *)&sbuf[48] = 4096;   /* blksize */
+    *(uint64_t *)&sbuf[40] = fsize;  /* size */
 
     la_copy_to_user(ustat, sbuf, 128);
     return 0;
@@ -1851,6 +2018,7 @@ uint64_t la_syscall_dispatch(struct la_trap_frame *tf)
     /* Directory */
     case SYS_chdir:      return sys_chdir(tf);
     case SYS_mkdir:      return sys_mkdir(tf);
+    case SYS_unlinkat:   return sys_unlinkat(tf);
 
     /* Memory */
     case SYS_brk:        return sys_brk(tf);

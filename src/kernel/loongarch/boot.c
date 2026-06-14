@@ -83,6 +83,9 @@ void la_boot_main(void)
     else
         la_uart_puts("[init] fs: mounted\n");
 
+    /* 8b  Initialise writable memory filesystem */
+    memfs_init();
+
     /* 9  Create first user process (initcode) */
     la_uart_puts("[init] creating first user process\n");
     la_proc_make_first();

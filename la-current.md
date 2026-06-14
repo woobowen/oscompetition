@@ -1,6 +1,6 @@
 # LoongArch (B 线) 内核开发手册
 
-> 最后更新：2026-06-12 23:30
+> 最后更新：2026-06-14
 >
 > 本文档面向**开发者**，记录 SeaOS 项目 LoongArch 架构的设计思路、文件结构、路线图进展、以及按时间排列的开发日志。
 
@@ -134,8 +134,8 @@ src/kernel/loongarch/
 ### 2.1 执行顺序
 
 ```
-✅ Step 10 (EXT4)  → ✅ Step 11 (脚本)  → ⬜ Step 12 (抢占)
-→ ⬜ Step 13 (动态链接) → ✅ Step 14 (管道) → ⬜ Step 15 (文件写入)
+✅ Step 10 (EXT4)  → ✅ Step 11 (脚本)  → ✅ Step 12 (抢占)
+→ ✅ Step 13 (动态链接) → ✅ Step 14 (管道) → ✅ Step 15 (文件写入)
 → ✅ Step 16 (全部 syscall) → ✅ Step 17 (栈增长) → ⬜ Step 18 (堆增强)
 → ✅ Step 19 (资源回收) → ⬜ Step 20 (块缓存) → ⬜ Step 21 (集成验证)
 ```
@@ -147,10 +147,10 @@ src/kernel/loongarch/
 | 1–9 | 基础架构 + 核心 syscall | — | — | ✅ |
 | 10 | 修复 EXT4 目录枚举 | P0 | 小 | ✅ |
 | 11 | 脚本执行（shebang） | P0 | 中 | ✅ |
-| 12 | 定时器抢占调度 | P0 | 小 | ⬜ |
-| 13 | 动态链接器 | P0 | 大 | ⬜ |
+| 12 | 定时器抢占调度 | P0 | 小 | ✅ |
+| 13 | 动态链接器 | P0 | 大 | ✅ |
 | 14 | 管道实现 | P0 | 中 | ✅ |
-| 15 | 文件系统写入（memfs） | P0 | 大 | ⬜ |
+| 15 | 文件系统写入（memfs） | P0 | 大 | ✅ |
 | 16 | 补全 syscall（线程+信号+存根） | P0 | 大 | ✅ |
 | 17 | 栈自动增长 + 不挂死 | P1 | 中 | ✅ |
 | 18 | 堆/mmap 增强 | P2 | 中 | ⬜ |
@@ -318,6 +318,68 @@ src/kernel/loongarch/
 **涉及文件**：`uvm_la.c` `tlb_la.c` `trap.c` `early_boot.h`
 
 **验证**：180 秒运行 0 次崩溃。
+
+---
+
+### 2026-06-14 — Step 12：定时器抢占调度
+
+**完成内容**：
+- `proc.h`：新增 `LA_TIME_SLICE`（10 tick = ~100ms）+ `ticks` 字段（`struct la_proc`）
+- `proc.c`：`la_proc_alloc` 初始化 `ticks = LA_TIME_SLICE`；调度器在选中用户进程时重置 `p->ticks = LA_TIME_SLICE`
+- `trap.c`：在 `la_timer_interrupt()` 之后检查当前用户进程的 `--p->ticks <= 0` → 调用 `la_proc_yield()` 让出 CPU
+- **无需额外的 trap frame 保存/恢复**：每进程有独立内核栈，被抢占进程的 trap frame 留在其内核栈上；`la_swtch` 保存/恢复 sp，恢复后 trap_entry.S 从原位置还原 trap frame 并 ertn 回用户态
+- 设计要点：内核线程（`is_user=0`）不参与抢占（需自行 yield）；`la_current_proc()` 在调度器 idle 期间返回 0，抢占检查自然跳过；syscall 路径不抢占（中断在 trap handler 内关闭，仅用户态执行时响应定时器）
+
+**涉及文件**：`proc.h` `proc.c` `trap.c`
+
+**遗留**：调试串口输出（`sys#...` trace）在中断禁用的 trap handler 内执行，大量 syscall 时显著延迟定时器中断。生产构建关闭 trace 后定时器可达满频。定时器绝对频率与 QEMU 10.0.2 实现相关，不影响抢占机制正确性。未来可考虑在长 syscall 内开中断（内核可抢占化），属独立优化。
+
+---
+
+### 2026-06-14 — Step 13：动态链接器（PT_INTERP + auxv）
+
+**完成内容**：
+- `exec_la.c`：新增 `LA_ELF_PROG_INTERP`(3)/`LA_ELF_PROG_PHDR`(6)/`LA_INTERP_LOAD_BASE`(`0x40000000`)
+- `la_load_interp()`（~130 行新函数）：解释器加载到固定基址
+  - 多级 fallback：原路径 → `/musl/lib/<basename>` → `/glibc/lib/<basename>` → `/musl/lib/libc.so`（musl 的 libc 即 ld）→ `/glibc/lib/ld-linux-loongarch-lp64d.so.1`
+  - 按 PT_LOAD 段映射（RWX），零填 BSS，读取段数据
+  - 返回 `base + e_entry`
+- `la_do_exec_syscall()` 修改：
+  - 段扫描循环新增 PT_PHDR（记录 `phdr_addr`）和 PT_INTERP（读解释器路径）处理
+  - 段加载完成后调用 `la_load_interp()`，记录 `interp_entry`
+  - AT_PHDR 改为使用 `phdr_addr`（优先 PT_PHDR，回退首段 VA+phoff）
+  - auxv 新增 `AT_PHENT`（`sizeof(la_elf_phdr)`）和 `AT_BASE`（仅动态链接时）
+  - `tf->era` 动态链接时设为 `interp_entry`，静态不变
+- 提供 `memset` 弱别名（解决 GCC `-O2` 自动生成 memset 调用）
+
+**涉及文件**：`exec_la.c`
+
+**遗留**：解释器全部段按 RWX 映射（同 D4/D6），依赖 `mprotect` 桩不报错。静态 ELF 路径完全不受影响。initcode 按 `*_testcode.sh` 字母序扫描，首测 libcbench（静态），动态测试（libctest `run-dynamic.sh`、unixbench dhry2、glibc 全组）在后续才触发——受调试 UART 输出慢影响，完整验证需较长运行时间。
+
+---
+
+### 2026-06-14 — Step 15：文件系统写入（memfs）
+
+**完成内容**：
+- 新增 `memfs_la.h`/`memfs_la.c`（~230 行）：内存文件系统，128 inodes，每文件最多 16 数据页（64KB），按需从 `la_pmem_alloc` 分配数据页，`memfs_delete` 释放回池
+- `proc.h`：新增 `LA_FD_MEMFS`（4）fd 类型
+- `syscall.c` 集成（修改 ~7 个函数 + 新增 1 个）：
+  - `sys_open`：memfs 优先——已存在文件直接打开（`LA_FD_MEMFS`）；O_CREAT → `memfs_create`；O_WRONLY 且不存在 → `-ENOENT`；回退 ext4 只读
+  - `sys_write`：`LA_FD_MEMFS` 路径 → 按需分配数据页，从用户空间复制数据并写入
+  - `sys_read`：`LA_FD_MEMFS` 路径 → 从数据页读取到用户缓冲区
+  - `sys_lseek`：支持 `LA_FD_MEMFS`，修复 `SEEK_END`（whence=2）——使用 `memfs_inode_size`
+  - `sys_close`：`LA_FD_MEMFS` 无需特殊清理（管道已有独立路径）
+  - `sys_fstat`：支持 `LA_FD_MEMFS`，使用 `memfs_inode_size`
+  - `sys_get_dentries`：支持 `LA_FD_MEMFS` 目录，调用 `memfs_getdents`
+  - `sys_mkdir`：改为真实实现在 memfs 创建目录
+  - `sys_unlinkat`（35）：新增——从 memfs 删除文件/目录（`memfs_delete` 同时释放数据页）
+  - `sys_newfstatat`：memfs 文件可见（`memfs_lookup` 优先 → ext4 回退）
+  - `sys_chdir`：memfs 目录可设为 cwd
+- `early_boot.h`/`boot.c`：声明并调用 `memfs_init()`
+
+**涉及文件**：`memfs_la.c`（新增）、`memfs_la.h`（新增）、`syscall.c`、`proc.h`、`early_boot.h`、`boot.c`
+
+**遗留**：memfs 与 ext4 并存于同一命名空间（memfs 优先），但无 copy-on-write 叠加层——对 ext4 已有文件进行写打开会返回 ENOENT。每文件最大 64KB（16 页），若测试需要更大文件需上调 `MEMFS_PAGES_PER_FILE`。不实现文件扩展属性、时间戳、权限位（均返回默认值）。`sys_faccessat` 仍为桩（全部允许）。
 
 ---
 

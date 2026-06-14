@@ -49,6 +49,7 @@ static struct la_proc *la_proc_alloc(void)
         p->stack_bottom = 0;
         p->is_user  = 0;
         p->shared_vm = 0;
+        p->ticks    = LA_TIME_SLICE;
         p->clear_child_tid = 0;
         p->wait_chan = 0;
         p->sig_pending = 0;
@@ -473,6 +474,11 @@ void la_scheduler(void)
 
         p->state = LA_PROC_RUNNING;
         la_cpu.current = p;
+
+        /* Refill the time slice for user processes.
+         * Kernel threads yield voluntarily and don't consume ticks. */
+        if (p->is_user)
+            p->ticks = LA_TIME_SLICE;
 
         /*
          * For user processes: save kernel SP in la_trap_ksp before swtch.

@@ -9,7 +9,7 @@
 
 - **项目**：SeaOS — 华东师大花狮小队，oscomp 2026「OS 内核实现赛道」初赛。xv6 风格内核，目标跑通 `/musl`、`/glibc` 下的 oscomp 测试脚本。
 - **两条线**：**A 线 = RISC-V**（`src/kernel/`，成熟，101+ syscall、动态链接、pipe、memfs 齐备，是事实参考实现）；**B 线 = LoongArch**（`src/kernel/loongarch/`，移植中，**本文档对象**）。LoongArch 与 RISC-V 共用同一套 Linux「通用 ABI」syscall 号表。
-- **当前状态（2026-06-12 23:00）**：**Step 11 + Step 14（管道）+ Step 16（全部）+ Step 17 + Step 19 已完成并实测通过**。**已修复 ADEF→INE 级联（过时 TLB 条目 bug）**——QEMU 10.0.2 的广播 `invtlb` 在页面释放后无法可靠地清除重复的 TLB 条目（相同 VPPN、不同 PA）；修复方法为在 `la_uvm_free_pgtbl` 中在释放页面之前针对每个映射的 VA 进行 `invtlb 0x6` 逐 VA 失效，已验证 180 秒内 0 次崩溃。运行时 **0 个 UNKNOWN syscall**，所有 200 个追踪槽位均已处理。libcbench-musl 现在具备完整的基础设施，可正常运行直到测试完成（无级联崩溃）。**下一步优先级**：Step 12（定时器抢占）> Step 13（动态链接）> Step 15（文件写入）。详见 §6。
+- **当前状态（2026-06-14）**：**Step 10、11、12（定时器抢占）、13（动态链接）、14（管道）、15（文件写入/memfs）、16（全部）、17、19 已完成并实测通过**。**已修复 ADEF→INE 级联（过时 TLB 条目 bug）**——QEMU 10.0.2 的广播 `invtlb` 在页面释放后无法可靠地清除重复的 TLB 条目（相同 VPPN、不同 PA）；修复方法为在 `la_uvm_free_pgtbl` 中在释放页面之前针对每个映射的 VA 进行 `invtlb 0x6` 逐 VA 失效，已验证 180 秒内 0 次崩溃。运行时 **0 个 UNKNOWN syscall**。libcbench-musl 具备完整基础设施，稳定运行。**Step 12（定时器抢占）**：每 10 tick 用户进程时间片到期 → `la_proc_yield()`。**Step 13（动态链接）**：PT_INTERP 扫描 + ld.so 加载。**Step 15（文件写入）**：memfs 内存文件系统（128 inodes，每文件最多 64KB），接管 O_CREAT/open/write/read/mkdir/unlinkat/getdents，与只读 ext4 并存。**下一步优先级**：Step 18（堆/mmap 增强）> Step 20（块缓存）> Step 21（集成验证）。详见 §6。
 - **常用命令（必须在 Docker 容器内执行，见 §3）**：
   - 构建：`docker exec nostalgic_khayyam bash -lc 'cd /workspace && make build-la'`（或 `make all`）
   - 用真实测试镜像跑：`docker exec nostalgic_khayyam bash -lc 'cd /workspace && /opt/qemu-bin-10.0.2/bin/qemu-system-loongarch64 -kernel kernel-la -m 1G -nographic -smp 1 -drive file=sdcard-la.img,if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0 -no-reboot'`
@@ -268,14 +268,14 @@ sudo docker run --rm \
 ### 推荐执行顺序
 
 ```
-✅ Step 10 (修EXT4 bug) → ✅ Step 11 (脚本执行) → ⬜ Step 12 (定时器抢占)
-  → ⬜ Step 13 (动态链接) → ✅ Step 14 (管道) → ⬜ Step 15 (文件写入)
+✅ Step 10 (修EXT4 bug) → ✅ Step 11 (脚本执行) → ✅ Step 12 (定时器抢占)
+  → ✅ Step 13 (动态链接) → ✅ Step 14 (管道) → ✅ Step 15 (文件写入)
   → ✅ Step 16 (全部：clone+futex+信号+存根)
   → ✅ Step 17 (栈增长+不挂死) → ⬜ Step 18 (堆增强)
   → ✅ Step 19 (资源回收) → ⬜ Step 20 (块缓存) → ⬜ Step 21 (集成验证)
 ```
 > **Bugfix：ADEF→INE 级联（TLB）已修复**（`uvm_la.c`：`la_uvm_free_pgtbl` 中逐 VA 失效，180 秒内 0 次崩溃）。
-> **Step 10、11、14、16、17、19 已完成并实测通过**。**当前最短路径 = Step 12（定时器抢占）+ Step 13（动态链接）+ Step 15（文件写入）**。libcbench-musl 已具备完整基础设施且稳定运行（线程+管道+信号+全覆盖 syscall，0 个 UNKNOWN，无级联崩溃）。
+> **Step 10、11、12、13、14、15、16、17、19 已完成并实测通过**。**当前最短路径 = Step 18（堆/mmap 增强）+ Step 20（块缓存）+ Step 21（集成验证）**。libcbench-musl 已具备完整基础设施且稳定运行（线程+管道+信号+全覆盖 syscall，0 个 UNKNOWN，无级联崩溃）。
 
 ### 各步详情
 
@@ -288,22 +288,31 @@ sudo docker run --rm \
 - exec 识别 `#!`，读解释器路径，原路径失败回退 `/musl/busybox`，重建 argv `[解释器, 脚本路径, 原argv…]`，加载静态 busybox。**已跑通**：busybox `sh` 解释执行脚本，`echo` 打印评测标记、wait4 回收、相对路径 `exec ./libc-bench` 成功。
 - 本轮修复（`exec_la.c`/`syscall.c`/`proc.c`/`uvm_la.c`/`tlb_la.c`/`fs_la.c`）：§6 mallocng 崩溃（TLB 一致性）、EPERM 掩码（openat ABI + 正确 errno）、exec 4KB 内核栈溢出（大数组改 static）、相对路径解析（`la_fs_cwd_ino`）。详见 §6。
 
-#### Step 12：定时器抢占调度（🔴 P0）
-- `la_timer_interrupt()` 当前只计数不调度，长任务独占 CPU。
-- 加 tick 计数，超时间片（如 10 ticks）标记 RUNNABLE + `la_proc_yield()`；trap 返回路径保存/恢复 trapframe。
-- 涉及：`timer.c proc.c trap.c proc.h`（加 `ticks` 字段）。
+#### Step 12：定时器抢占调度（🔴 P0）— ✅ 已完成
+- `la_timer_interrupt()` 原只计数不调度 → 现在每次 tick 递减当前用户进程的 `p->ticks`，耗尽时调用 `la_proc_yield()` 让出 CPU。
+- 调度器在选中用户进程时重置 `p->ticks = LA_TIME_SLICE`（10 tick = ~100ms）。
+- 利用每进程独立的**内核栈保存 trap frame**：被抢占进程的 trap frame 留在其内核栈上，`la_swtch` 保存/恢复 sp，恢复后 trap_entry.S 从原位置还原 trap frame 并 ertn 回用户态。无需额外保存/恢复路径。
+- 涉及：`proc.h`（`LA_TIME_SLICE` + `ticks` 字段）、`proc.c`（初始化 + 调度器重置）、`trap.c`（timer 后抢占检查）。
 
-#### Step 13：动态链接器（🔴 P0，**非可延后**——覆盖半数测试组）
-- 扫 PT_INTERP/PT_PHDR，加载 musl dynamic linker，auxv 输出 AT_PHDR/AT_PHNUM/AT_ENTRY/AT_BASE，入口改 interp entry。蓝本：RV 线 DECISIONS D4。涉及 `exec_la.c`。
-- **为何提级**：`libctest_testcode.sh` 显式跑 `run-dynamic.sh`；unixbench 的 dhry2 动态链接；**整个 `/glibc/` 12 组** glibc 程序天然动态链接。不实现 = 直接放弃 libctest 动态组 + 全部 /glibc/（24 组里约 12 组受影响）。原先标"可延后"是低估，实测脚本内容后纠正。
+#### Step 13：动态链接器（🔴 P0，**非可延后**——覆盖半数测试组）— ✅ 已完成
+- 扫描 PT_INTERP 读解释器路径、PT_PHDR 记录程序头地址。
+- `la_load_interp()`：解释器加载到固定基址 `0x40000000`（1GB），多级 fallback：原路径 → `/musl/lib/<basename>` → `/glibc/lib/<basename>` → `/musl/lib/libc.so`（musl 的 libc 即 ld）→ `/glibc/lib/ld-linux-loongarch-lp64d.so.1`。
+- auxv 新增 AT_PHENT、AT_BASE（有 interp 时）；AT_PHDR 优先用 PT_PHDR 值，回退首段 VA+phoff。
+- 有 interp 时入口改为解释器 entry（`interp_entry`）；静态 ELF 原流程不变。
+- 蓝本：RV 线 DECISIONS D4。涉及 `exec_la.c`。
 
 #### Step 14：管道实现（🔴 P0）
 - `la_pipe`（4KB 环形缓冲 + 读/写指针 + 端开闭标志 + sleep/wakeup）；`SYS_pipe/pipe2`、read/write/close 对 pipe fd、fork 继承。
 - 脚本大量用管道（`a | b`），无管道 unixbench 跑不动。涉及 `syscall.c proc.h`。
 
-#### Step 15：文件系统写入（🔴 P0）
-- 推荐 **memfs**（内存小 FS，16MB，挂可写路径）：`creat/unlink/mkdir/rmdir`、fd write 落 memfs，不动只读 ext4。
-- 备选：ext4 写入（块/inode/目录项分配，复杂）。涉及 `fs_la.c syscall.c early_boot.h proc.h`。
+#### Step 15：文件系统写入（memfs）（🔴 P0）— ✅ 已完成
+- 新增 `memfs_la.c`/`memfs_la.h`：内存文件系统，128 inodes，每文件最多 16 数据页（64KB），按需从 pmem 分配。
+- `sys_open` 路由：memfs 文件优先；O_CREAT → 在 memfs 创建；O_WRONLY 且不存在 → `-ENOENT`；回退 ext4 只读。
+- `sys_write`/`sys_read`/`sys_lseek`/`sys_close`/`sys_fstat`/`sys_get_dentries`：均支持 `LA_FD_MEMFS`（新增 fd 类型 4）。
+- `sys_mkdir`/`sys_unlinkat`（35）：目录创建/文件删除均在 memfs 执行。
+- `sys_newfstatat`/`sys_chdir`：memfs 文件/目录可见。
+- 静态 ELF 路径完全不受影响；与只读 ext4 共享同一命名空间（memfs 优先）。
+- 涉及：`memfs_la.c`（新增）、`memfs_la.h`（新增）、`syscall.c`、`proc.h`、`early_boot.h`、`boot.c`。
 
 #### Step 16：补全关键 syscall（🔴 P0——**范围比标题大**，当前在线程部分已完成，socket/信号/select 待做）
 对照 `docs/SYSCALL_STATUS.md`，按 `syscall: UNKNOWN #N` 日志逐个补。
@@ -339,10 +348,10 @@ sudo docker run --rm \
 | --- | --- | --- | --- | --- | --- |
 | 10 | 修复 EXT4 目录 bug | 🔴 P0 | 小 | 无 | ✅ 已完成 |
 | 11 | 脚本执行 shebang | 🔴 P0 | 中 | Step 10 | ✅ 已完成 |
-| 12 | 定时器抢占调度 | 🔴 P0 | 小 | 无 | ⬜ 待做 |
-| 13 | 动态链接器 | 🔴 P0（**提级**：libctest 动态组+整个 /glibc/ 需要） | 大 | Step 11 | ⬜ 待做 |
+| 12 | 定时器抢占调度 | 🔴 P0 | 小 | 无 | ✅ 已完成 |
+| 13 | 动态链接器 | 🔴 P0（**提级**：libctest 动态组+整个 /glibc/ 需要） | 大 | Step 11 | ✅ 已完成 |
 | 14 | 管道实现 | 🔴 P0 | 中 | Step 11 | ✅ 已完成 |
-| 15 | 文件系统写入 | 🔴 P0 | 大 | Step 10 | ⬜ 待做 |
+| 15 | 文件系统写入（memfs）| 🔴 P0 | 大 | Step 10 | ✅ 已完成 |
 | 16 | 补全关键 syscall | 🔴 P0 | **大**（全部完成）| 无 | ✅ 已完成 |
 | -- | **Bugfix: TLB 级联** | 🔴 P0 | 小 | 无 | ✅ 已修复（`uvm_la.c` 逐 VA 失效） |
 | 17 | 栈增长+不挂死 | 🟡 P1 | 中 | 无 | ✅ 已完成 |
