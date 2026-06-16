@@ -6,3 +6,4 @@ la_trap: full trapframe syscall return scaffold staged
 la_userret: era prmd gpr restore scaffold staged
 la_proc: trapframe init userret bridge staged
 la_boot_main: next context switch virtio-pci ext4
+qemu-system-loongarch64: terminating on signal 15 from pid 109 (<unknown process>)

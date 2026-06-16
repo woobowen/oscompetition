@@ -88,7 +88,7 @@ typedef struct disk {
 
 #define BLOCK_SIZE 4096              // 基本管理单位的大小
 #define N_BUFFER_TEST 8              // 测试时的N_BUFFER取值
-#define N_BUFFER (32 * 512)          // 最多可以用32MB内存空间(25%)作为Block缓冲区
+#define N_BUFFER (32 * 512)          // 最多可以用64MB内存空间作为Block缓冲区
 #define BLOCK_NUM_UNUSED 0xFFFFFFFF  // 未使用的Buffer需要将block_num设为这个值
 
 /* 以Block为单位在内存和磁盘间传递数据 */
@@ -103,6 +103,7 @@ typedef struct buffer {
     sleeplock_t slk;                 // 睡眠锁
     uint8* data;                     // block数据(大小为BLOCK_SIZE)
     bool disk;                       // 在virtio.c中使用
+    bool valid;                      // data matches block_num after disk read
 } buffer_t;
 
 /* 将buffer这种数据结构包装成资源节点 */
@@ -390,6 +391,7 @@ typedef struct ext4_info {
 #define INODE_MAJOR_NULL      6              // 特殊设备文件 (/dev/null, 可读可写)
 #define INODE_MAJOR_GPT0      7              // 特殊设备文件 (/dev/gpt0, 可写)
 #define INODE_MAJOR_RTC       8              // virtual RTC (/dev/rtc, /dev/rtc0)
+#define INODE_MAJOR_RANDOM    9              // random byte stream (/dev/random, /dev/urandom)
 #define INODE_MINOR_DEFAULT   1              // 默认的次设备号 (所有文件都使用它)
 
 /* index字段相关 */

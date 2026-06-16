@@ -107,6 +107,7 @@ enum proc_state
 #define NSIG        64
 #define SIGHUP      1
 #define SIGINT      2
+#define SIGABRT     6
 #define SIGBUS      7
 #define SIGKILL     9
 #define SIGSEGV     11

@@ -35,6 +35,62 @@ uint64 sys_brk()
     return p->heap_top;
 }
 
+#define MAP_ANONYMOUS_LOCAL 0x20
+#define MAP_FIXED_LOCAL 0x10
+
+static int mmap_prefill_file(file_t *file, uint64 start, uint64 len, uint64 file_off)
+{
+    proc_t *p = myproc();
+    if (p == NULL || file == NULL || file->ip == NULL || len == 0)
+        return 0;
+
+    inode_t *ip = file->ip;
+    inode_lock(ip);
+    uint64 file_size = ip->disk_info.size;
+    uint64 end = start + len;
+
+    for (uint64 va = (start / PGSIZE) * PGSIZE; va < end; va += PGSIZE) {
+        pte_t *pte = vm_getpte(p->pgtbl, va, false);
+        if (pte == NULL || !(*pte & PTE_V)) {
+            if (uvm_mmap_handle_fault(p->pgtbl, va) == (uint64)-1) {
+                inode_unlock(ip);
+                return -1;
+            }
+            pte = vm_getpte(p->pgtbl, va, false);
+            if (pte == NULL || !(*pte & PTE_V)) {
+                inode_unlock(ip);
+                return -1;
+            }
+        }
+
+        uint64 copy_start = va < start ? start : va;
+        uint64 copy_end = (va + PGSIZE) < end ? (va + PGSIZE) : end;
+        if (copy_start >= copy_end)
+            continue;
+
+        uint64 pos = file_off + (copy_start - start);
+        if (pos >= file_size)
+            continue;
+
+        uint64 want64 = copy_end - copy_start;
+        if (want64 > file_size - pos)
+            want64 = file_size - pos;
+        uint32 want = (uint32)want64;
+        if (want == 0)
+            continue;
+
+        uint64 pa = PTE_TO_PA(*pte);
+        if (inode_read_data(ip, (uint32)pos, want,
+                            (void *)(pa + (copy_start - va)), false) != want) {
+            inode_unlock(ip);
+            return -1;
+        }
+    }
+
+    inode_unlock(ip);
+    return 0;
+}
+
 /*
     澧炲姞涓€娈靛唴瀛樻槧灏?    mmap(addr, length, prot, flags, fd, offset)
     鎴愬姛杩斿洖鏄犲皠绌洪棿鐨勮捣濮嬪湴鍧€, 澶辫触杩斿洖(uint64)-1
@@ -46,22 +102,35 @@ uint64 sys_mmap()
     uint64 prot;
     uint64 flags;
     uint64 fd;
+    uint64 offset;
     arg_uint64(0, &start);
     arg_uint64(1, &len);
     arg_uint64(2, &prot);
     arg_uint64(3, &flags);
     fd = arg_raw(4);
-    // a4=fd, a5=offset 浠呮枃浠舵槧灏勯渶瑕侊紝鍖垮悕鏄犲皠蹇界暐
+    offset = arg_raw(5);
 
     if (len == 0)
-        return (uint64)-1;
+        return (uint64)(-EINVAL);
     if (start != 0 && start % PGSIZE != 0)
-        return (uint64)-1;
+        return (uint64)(-EINVAL);
 
     uint64 aligned_len = (len + PGSIZE - 1) & ~(PGSIZE - 1);
+    if (aligned_len < len)
+        return (uint64)(-EINVAL);
     uint32 npages = aligned_len / PGSIZE;
-    if (fd != (uint64)-1 && npages < 16)
-        npages = 16;
+    int map_fixed = (flags & MAP_FIXED_LOCAL) != 0;
+    if (!map_fixed)
+        start = 0;
+    if (start != 0 && (start < MMAP_BEGIN || start + aligned_len < start || start + aligned_len > MMAP_END)) {
+        return (uint64)(-ENOMEM);
+    }
+    int file_backed = ((flags & MAP_ANONYMOUS_LOCAL) == 0 && fd != (uint64)-1);
+    file_t *file = NULL;
+    if (file_backed && offset % PGSIZE != 0)
+        return (uint64)(-EINVAL);
+    if (file_backed && arg_fd(4, NULL, &file) < 0)
+        return (uint64)(-EBADF);
 
     // 鏍规嵁 prot 璁剧疆 PTE 鏉冮檺
     // PROT_READ=1, PROT_WRITE=2, PROT_EXEC=4
@@ -73,7 +142,15 @@ uint64 sys_mmap()
     if (!(perm & (PTE_R | PTE_W | PTE_X)))
         perm |= PTE_R;
 
+    if (map_fixed)
+        uvm_munmap(start, npages);
     uint64 ret_addr = uvm_mmap(start, npages, perm);
+    if (ret_addr == (uint64)-1)
+        return (uint64)(-ENOMEM);
+    if (file_backed && mmap_prefill_file(file, ret_addr, (uint64)npages * PGSIZE, offset) < 0) {
+        uvm_munmap(ret_addr, npages);
+        return (uint64)(-ENOMEM);
+    }
     return ret_addr;
 }
 
@@ -150,6 +227,12 @@ uint64 sys_clone()
     child->parent = parent;
     child->exit_code = 0;
     child->pgtbl = proc_pgtbl_init((uint64)tf);
+    if (!child->pgtbl) {
+        pmem_free((uint64)tf, false);
+        child->tf = NULL;
+        spinlock_release(&child->lk);
+        return (uint64)(-ENOMEM);
+    }
     child->heap_top = parent->heap_top;
     child->ustack_npage = parent->ustack_npage;
     child->mmap = parent->mmap;
@@ -163,8 +246,12 @@ uint64 sys_clone()
     tf->user_to_kern_sp = child->kstack + 2 * PGSIZE;
     tf->user_to_kern_hartid = mycpuid();
 
-    uvm_share_pgtbl(parent->pgtbl, child->pgtbl, parent->heap_top,
-                    parent->ustack_npage, parent->mmap);
+    if (uvm_share_pgtbl(parent->pgtbl, child->pgtbl, parent->heap_top,
+                        parent->ustack_npage, parent->mmap) < 0) {
+        proc_free(child);
+        spinlock_release(&child->lk);
+        return (uint64)(-ENOMEM);
+    }
 
     for (int i = 0; i < N_OPEN_FILE_PER_PROC; i++) {
         child->open_file[i] = parent->open_file[i] ? file_dup(parent->open_file[i]) : NULL;
@@ -304,30 +391,27 @@ uint64 sys_set_tid_address()
 // 98 futex(uaddr, op, val, timeout, uaddr2, val3): minimal WAIT/WAKE.
 uint64 sys_futex()
 {
-    static spinlock_t futex_lk;
-    static int futex_lk_ready = 0;
     uint64 uaddr = arg_raw(0);
     int op = (int)arg_raw(1) & 0x7f;
     uint32 val = (uint32)arg_raw(2);
 
-    if (!futex_lk_ready) {
-        spinlock_init(&futex_lk, "futex");
-        futex_lk_ready = 1;
-    }
     if (uaddr == 0)
         return (uint64)(-EFAULT);
     if (op == 1) {
-        proc_wakeup((void *)uaddr);
+        proc_wakeup_force((void *)uaddr);
         return 1;
     }
     if (op == 0) {
+        proc_t *p = myproc();
         uint32 cur = 0;
-        uvm_copyin(myproc()->pgtbl, (uint64)&cur, uaddr, sizeof(cur));
-        if (cur != val)
+        spinlock_acquire(&p->lk);
+        uvm_copyin(p->pgtbl, (uint64)&cur, uaddr, sizeof(cur));
+        if (cur != val) {
+            spinlock_release(&p->lk);
             return (uint64)(-EAGAIN);
-        spinlock_acquire(&futex_lk);
-        proc_sleep((void *)uaddr, &futex_lk);
-        spinlock_release(&futex_lk);
+        }
+        proc_sleep((void *)uaddr, &p->lk);
+        spinlock_release(&p->lk);
         return 0;
     }
     return 0;
@@ -535,6 +619,11 @@ uint64 sys_read()
     uint32 len;
     arg_uint32(2, &len);    // a2 = count
 
+    if (file->is_socket) {
+        int ret = socket_recvfrom(file->socket, addr, len, 0, 0, 0);
+        return ret < 0 ? (uint64)ret : (uint64)ret;
+    }
+
     return file_read(file, len, addr, true);
 }
 
@@ -556,6 +645,11 @@ uint64 sys_write()
     arg_uint64(1, &addr);   // a1 = buf
     uint32 len;
     arg_uint32(2, &len);    // a2 = count
+
+    if (file->is_socket) {
+        int ret = socket_sendto(file->socket, addr, len, 0, 0, 0);
+        return ret < 0 ? (uint64)ret : (uint64)ret;
+    }
 
     uint32 ret = file_write(file, len, addr, true);
     return ret;
@@ -1234,8 +1328,23 @@ uint64 sys_fcntl()
         case 2:
             p->fd_cloexec[fd] = (arg_raw(2) & 1) ? 1 : 0;
             return 0;     // F_SETFD
-        case 3: return 2;     // F_GETFL锛氳繑鍥?O_RDWR(2)
-        case 4: return 0;     // F_SETFL锛氬拷鐣? 鎴愬姛
+        case 3: {     // F_GETFL
+            int flags = 2; // O_RDWR
+            if (file->is_socket) {
+                int ret = socket_get_nonblock(file->socket);
+                if (ret < 0) return (uint64)ret;
+                if (ret != 0) flags |= 0x800; // O_NONBLOCK
+            }
+            return (uint64)flags;
+        }
+        case 4: {     // F_SETFL
+            int flags = (int)arg_raw(2);
+            if (file->is_socket) {
+                int ret = socket_set_nonblock(file->socket, (flags & 0x800) != 0);
+                if (ret < 0) return (uint64)ret;
+            }
+            return 0;
+        }
         default: return 0;    // 鍏跺畠鍛戒护鏆備綔鎴愬姛澶勭悊
     }
 }
@@ -1354,6 +1463,16 @@ uint64 sys_getppid()
     return 1;
 }
 
+// 157 setsid(): SeaOS has no process groups or controlling terminals yet.
+// Return the caller pid as the new session id for Linux compatibility.
+uint64 sys_setsid()
+{
+    proc_t *p = myproc();
+    if (p == NULL)
+        return (uint64)(-ESRCH);
+    return (uint64)p->pid;
+}
+
 // qemu virt 鐨?time CSR 棰戠巼: INTERVAL=1e6 cycle鈮?.1s => 10MHz
 #define TIMEBASE_HZ 10000000ull
 
@@ -1389,6 +1508,25 @@ uint64 sys_gettimeofday()
     val[1] = (t % TIMEBASE_HZ) / 10;     // tv_usec (10MHz/10 = 1MHz)
     uvm_copyout(myproc()->pgtbl, tv, (uint64)val, sizeof(val));
     return 0;
+}
+
+// 278 getrandom(buf, buflen, flags): non-blocking pseudo-random bytes.
+uint64 sys_getrandom()
+{
+    uint64 buf = arg_raw(0);
+    uint64 len = arg_raw(1);
+    uint64 flags = arg_raw(2);
+
+    if (len == 0)
+        return 0;
+    if (buf == 0)
+        return (uint64)(-EFAULT);
+    if ((flags & ~0x7ull) != 0)
+        return (uint64)(-EINVAL);
+    if (len > 0x7ffff000ull)
+        len = 0x7ffff000ull;
+
+    return (uint64)device_random_bytes((uint32)len, buf, true);
 }
 
 // 165 getrusage锛氳幏鍙栬祫婧愪娇鐢ㄧ粺璁★紙鏈€灏忔々锛氬叏闆讹級
@@ -1809,17 +1947,8 @@ uint64 sys_syslog()
     return 0;
 }
 
-uint64 sys_kill()
+static uint64 sys_signal_proc_locked(proc_t *p, int sig)
 {
-    int pid = (int)arg_raw(0);
-    int sig = (int)arg_raw(1);
-    if (sig < 0 || sig > NSIG)
-        return (uint64)(-EINVAL);
-    if (pid <= 0)
-        return 0;
-    proc_t *p = proc_get_by_pid(pid);
-    if (p == NULL)
-        return (uint64)(-ESRCH);
     if (sig == 0) {
         spinlock_release(&p->lk);
         return 0;
@@ -1838,6 +1967,51 @@ uint64 sys_kill()
     }
     spinlock_release(&p->lk);
     return 0;
+}
+
+uint64 sys_kill()
+{
+    int pid = (int)arg_raw(0);
+    int sig = (int)arg_raw(1);
+    if (sig < 0 || sig > NSIG)
+        return (uint64)(-EINVAL);
+    if (pid <= 0)
+        return 0;
+    proc_t *p = proc_get_by_pid(pid);
+    if (p == NULL)
+        return (uint64)(-ESRCH);
+    return sys_signal_proc_locked(p, sig);
+}
+
+uint64 sys_tkill()
+{
+    int tid = (int)arg_raw(0);
+    int sig = (int)arg_raw(1);
+    if (sig < 0 || sig > NSIG)
+        return (uint64)(-EINVAL);
+    if (tid <= 0)
+        return (uint64)(-EINVAL);
+    proc_t *p = proc_get_by_pid(tid);
+    if (p == NULL)
+        return (uint64)(-ESRCH);
+    return sys_signal_proc_locked(p, sig);
+}
+
+uint64 sys_tgkill()
+{
+    int tgid = (int)arg_raw(0);
+    int tid = (int)arg_raw(1);
+    int sig = (int)arg_raw(2);
+    if (sig < 0 || sig > NSIG)
+        return (uint64)(-EINVAL);
+    if (tgid <= 0 || tid <= 0)
+        return (uint64)(-EINVAL);
+    if (tgid != tid)
+        return (uint64)(-ESRCH);
+    proc_t *p = proc_get_by_pid(tid);
+    if (p == NULL)
+        return (uint64)(-ESRCH);
+    return sys_signal_proc_locked(p, sig);
 }
 
 // 179 sysinfo(struct sysinfo *info): 绯荤粺淇℃伅銆傛渶灏忔々: 闆跺～鍏呫€?
@@ -2208,38 +2382,82 @@ uint64 sys_ppoll()
     proc_t *p = myproc();
 
     if (nfds == 0) return 0;
-    if (nfds > 16) nfds = 16;
+    if (nfds > N_OPEN_FILE_PER_PROC)
+        nfds = N_OPEN_FILE_PER_PROC;
 
-    struct { int fd; short events; short revents; } pfd[16];
+    struct { int fd; short events; short revents; } pfd[N_OPEN_FILE_PER_PROC];
     uvm_copyin(p->pgtbl, (uint64)pfd, fds_addr, nfds * 8);
 
-    int ready = 0;
-    for (uint64 i = 0; i < nfds; i++) {
-        pfd[i].revents = 0;
-        if (pfd[i].fd < 0) continue;
-        if ((uint32)pfd[i].fd >= N_OPEN_FILE_PER_PROC) continue;
-        file_t *f = p->open_file[pfd[i].fd];
-        if (!f) { pfd[i].revents = 0x20; ready++; continue; }
-        // POLLIN(1): readable; POLLOUT(4): writable
-        if (pfd[i].events & 1) pfd[i].revents |= 1;
-        if (pfd[i].events & 4) pfd[i].revents |= 4;
-        if (pfd[i].revents) ready++;
-    }
+    uint64 timeout_ticks = timespec_to_ticks(tmo_addr);
+    for (;;) {
+        int ready = 0;
+        int saw_socket = 0;
+        int saw_pipe = 0;
+        pipe_t *wait_pipe = NULL;
+        int wait_pipe_r = 0;
+        int wait_pipe_w = 0;
 
-    if (ready == 0 && tmo_addr != 0) {
-        uint64 ts[2] = {0, 0};
-        uvm_copyin(p->pgtbl, (uint64)ts, tmo_addr, 16);
-        uint64 ntick = ts[0] * 10;
-        if (ts[1] > 0) ntick++;
-        if (ntick > 0) timer_wait(ntick);
-        ready = 0;
         for (uint64 i = 0; i < nfds; i++) {
-            if (pfd[i].revents) ready++;
-        }
-    }
+            pfd[i].revents = 0;
+            if (pfd[i].fd < 0)
+                continue;
+            if ((uint32)pfd[i].fd >= N_OPEN_FILE_PER_PROC) {
+                pfd[i].revents = 0x20;
+                ready++;
+                continue;
+            }
+            file_t *f = p->open_file[pfd[i].fd];
+            if (!f) {
+                pfd[i].revents = 0x20;
+                ready++;
+                continue;
+            }
 
-    uvm_copyout(p->pgtbl, fds_addr, (uint64)pfd, nfds * 8);
-    return ready;
+            if (f->is_socket) {
+                saw_socket = 1;
+                pfd[i].revents = (short)socket_poll_ready(f->socket, pfd[i].events);
+            } else if (f->is_pipe) {
+                saw_pipe = 1;
+                int want_r = (pfd[i].events & 1) != 0;
+                int want_w = (pfd[i].events & 4) != 0;
+                if (wait_pipe == NULL) {
+                    wait_pipe = f->pipe;
+                    wait_pipe_r = want_r;
+                    wait_pipe_w = want_w;
+                }
+                int revents = pipe_select_ready(f->pipe, want_r, want_w);
+                if (revents & 1)
+                    pfd[i].revents |= 1;
+                if (revents & 2)
+                    pfd[i].revents |= 4;
+            } else {
+                if (pfd[i].events & 1)
+                    pfd[i].revents |= 1;
+                if (pfd[i].events & 4)
+                    pfd[i].revents |= 4;
+            }
+
+            if (pfd[i].revents != 0)
+                ready++;
+        }
+
+        if (ready > 0 || tmo_addr != 0) {
+            if (ready == 0 && timeout_ticks > 0) {
+                timer_wait(1);
+                timeout_ticks--;
+                continue;
+            }
+            uvm_copyout(p->pgtbl, fds_addr, (uint64)pfd, nfds * 8);
+            return ready;
+        }
+
+        if (saw_socket && !saw_pipe)
+            socket_wait();
+        else if (saw_pipe && !saw_socket)
+            pipe_select_wait(wait_pipe, wait_pipe_r, wait_pipe_w);
+        else
+            timer_wait(1);
+    }
 }
 
 // 71 sendfile(out_fd, in_fd, offset, count): 闆舵嫹璐濇枃浠朵紶杈撱€?// 绠€鍖栧疄鐜帮細鍐呮牳缂撳啿鍖轰腑杞€?

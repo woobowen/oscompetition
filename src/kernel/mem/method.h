@@ -10,6 +10,7 @@ void pmem_stat(uint32 *free_pages_in_kernel, uint32 *free_pages_in_user);
 /* kvm.c: 内核态虚拟内存管理 + 页表通用函数 */
 
 pte_t *vm_getpte(pgtbl_t pgtbl, uint64 va, bool alloc);
+int vm_try_mappages(pgtbl_t pgtbl, uint64 va, uint64 pa, uint64 len, int perm);
 void vm_mappages(pgtbl_t pgtbl, uint64 va, uint64 pa, uint64 len, int perm);
 void vm_unmappages(pgtbl_t pgtbl, uint64 va, uint64 len, bool freeit);
 void vm_print(pgtbl_t pgtbl);
@@ -32,7 +33,7 @@ uint64 uvm_ustack_grow(pgtbl_t pgtbl, uint64 old_ustack_npage, uint64 fault_addr
 void uvm_destroy_pgtbl(pgtbl_t pgtbl);
 void uvm_destroy_shared_pgtbl(pgtbl_t pgtbl);
 int uvm_copy_pgtbl(pgtbl_t old, pgtbl_t new, uint64 heap_top, uint64 ustack_npage, mmap_region_t *mmap);
-void uvm_share_pgtbl(pgtbl_t old, pgtbl_t new, uint64 heap_top, uint64 ustack_npage, mmap_region_t *mmap);
+int uvm_share_pgtbl(pgtbl_t old, pgtbl_t new, uint64 heap_top, uint64 ustack_npage, mmap_region_t *mmap);
 
 /* mmap.c: mmap_node仓库管理 */
 
