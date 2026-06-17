@@ -9,11 +9,30 @@
 .section .text.trap, "ax"
 .align 12
 .globl la_exception_entry
+.globl la_tlb_refill_entry
 .type la_exception_entry, @function
 la_exception_entry:
         csrwr   $t0, LA_CSR_KS0
         csrwr   $t1, LA_CSR_KS1
+        # General exceptions must not inherit a stale TLBRERA.ISTLBR bit from
+        # an earlier refill.  Only la_tlb_refill_entry is allowed to mark it.
+        csrrd   $t0, LA_CSR_TLBRERA
+        addi.d  $t1, $zero, -2
+        and     $t0, $t0, $t1
+        csrwr   $t0, LA_CSR_TLBRERA
+        b       .Lcommon_entry
 
+.type la_tlb_refill_entry, @function
+la_tlb_refill_entry:
+        csrwr   $t0, LA_CSR_KS0
+        csrwr   $t1, LA_CSR_KS1
+        # QEMU 10.0.2 may enter TLBRENTRY without setting TLBRERA.ISTLBR.
+        # Mark it explicitly so C code and ertn both take the refill path.
+        csrrd   $t0, LA_CSR_TLBRERA
+        ori     $t0, $t0, 1
+        csrwr   $t0, LA_CSR_TLBRERA
+
+.Lcommon_entry:
         # ---- Check if TLB refill exception ----
         # TLB refill updates TLBRERA/TLBRPRMD but NOT ERA/PRMD/ESTAT.
         # If ISTLBR is set, copy TLBRPRMD→PRMD so the rest of the

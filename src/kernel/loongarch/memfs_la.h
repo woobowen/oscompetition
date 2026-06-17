@@ -51,6 +51,9 @@ int      memfs_read(int ino, uint32_t offset,
                     void *buf, uint32_t len);
 int      memfs_delete(const char *path);        /* unlink / rmdir */
 int      memfs_truncate(int ino);              /* reset file size to 0, free all data pages */
+int      memfs_unlink_inode(int ino);          /* remove name, keep open file data */
+int      memfs_reclaim_inode(int ino);         /* free unnamed inode data */
+int      memfs_is_unlinked(int ino);           /* path removed while fd open */
 int      memfs_getdents(int dir_ino, void *buf, uint32_t len);
 uint32_t memfs_inode_size(int ino);
 

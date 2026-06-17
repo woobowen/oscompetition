@@ -19,6 +19,7 @@
 #include "early_boot.h"
 
 #define LA_PS_4KB  12
+#define LA_PTE_PPN_MASK 0xFFFFFFFFFUL
 
 /* User page: V|D|PLV=3|MAT=1|G|P|W = 0x1DF
  *   V(1) D(1) PLV=3(0xC) MAT=1(0x10) G(0x40) P(0x80) W(0x100)
@@ -134,24 +135,10 @@ static int la_pte_lookup(uint64_t *root, uint64_t va,
     uint64_t pte2 = leaf[idx2];
     if (!(pte2 & 1)) return -1;
 
-    *out_ppn  = (pte2 >> 12) & 0xFFFFFFFFFFFFFUL;
+    *out_ppn  = (pte2 >> 12) & LA_PTE_PPN_MASK;
     /* Copy the PTE permission bits verbatim (V|D|PLV|MAT|G|P|W = bits [8:0]).
-     *
-     * Do NOT force the G (global) bit.  The leaf PTEs are built with G=0
-     * (LA_PTE_U_RWX = 0x19F), and this code formerly overrode them to G=1.
-     * That created GLOBAL TLB entries that `invtlb 0` — op 0 invalidates
-     * everything EXCEPT (G=1 && ASID!=0) — does not reliably drop in QEMU.
-     * Such stale global entries outlive the process that created them: once
-     * that process is reaped and its physical pages freed/reused, any other
-     * process mapping the same VPPN (even/odd pair) hits the stale global
-     * entry and translates through the freed page -> ADEF/INE.  This was the
-     * root cause of the libc-bench cascade (pid0b clone(CLONE_VM) segv ->
-     * pid4 ADEF -> pid2 ADEF -> initcode 0x137c INE).
-     *
-     * G=0 entries tagged ASID 0 (we never change ASID) still match every
-     * lookup, AND `invtlb 0` flushes them on every address-space switch, so
-     * the scheduler-resume path (which inval's but, unlike la_proc_return,
-     * does not re-fill_all) no longer inherits stale translations. */
+     * Do NOT force G: without real per-process ASIDs, global entries can
+     * survive longer than the address space that created them. */
     *out_perm = pte2 & 0x1FFUL;
     return 0;
 }
@@ -178,27 +165,38 @@ int la_tlb_refill_one(uint64_t va)
 
     uint64_t vppn = va >> 13;
 
-    la_tlb_do_fill_istlbr(vppn,
-                           have_even ? ppn_even : 0, have_even ? perm_even : 0,
-                           have_odd  ? ppn_odd  : 0, have_odd  ? perm_odd  : 0);
+    if (la_csr_read(LA_CSR_TLBRERA) & 1) {
+        la_tlb_do_fill_istlbr(vppn,
+                              have_even ? ppn_even : 0,
+                              have_even ? perm_even : 0,
+                              have_odd  ? ppn_odd  : 0,
+                              have_odd  ? perm_odd  : 0);
+    } else {
+        la_tlb_do_fill_normal(vppn,
+                              have_even ? ppn_even : 0,
+                              have_even ? perm_even : 0,
+                              have_odd  ? ppn_odd  : 0,
+                              have_odd  ? perm_odd  : 0);
+    }
     return 0;
 }
 
 /* ---- Invalidate all TLB entries (fast path) ----
- * Called on every scheduler-to-user switch and inside exec before
- * filling the new image's mappings.  Uses op 0x3 (all entries, all
- * ASIDs) which is supposed to be a broadcast invalidation.  We add
- * dbar on both sides as insurance against QEMU reordering. */
+ * Called on every scheduler-to-user switch and inside exec before filling the
+ * new image's mappings.  INVTLB op 0 is the architectural "all entries"
+ * operation.  We previously used op 3 here, which only targets a narrower
+ * ASID-scoped class and can leave stale translations behind across processes.
+ */
 void la_tlb_inval_all(void)
 {
     asm volatile("dbar 0" ::: "memory");
-    asm volatile("invtlb 0x3, $r0, $r0" ::: "memory");
+    asm volatile("invtlb 0x0, $r0, $r0" ::: "memory");
     asm volatile("dbar 0" ::: "memory");
 }
 
 /* ---- Invalidate all TLB entries (deep / page-table-free path) ----
  *
- * QEMU 10.0.2's broadcast invtlb 0x3 is NOT reliable when the physical
+ * If stale entries exist when the physical
  * pages underlying a page-table walk have already been freed and may be
  * reused before the invalidation completes: duplicate TLB entries
  * (same VPPN, different PA, one stale) survive broadcast inval and the
@@ -235,7 +233,9 @@ void la_tlb_inval_all_deep(void)
  * invtlb op 0x6 = invalidate entries matching VA=rk, both G=0 and G=1. */
 void la_tlb_inval_page(uint64_t va)
 {
+    asm volatile("dbar 0" ::: "memory");
     asm volatile("invtlb 0x6, $r0, %0" :: "r"(va) : "memory");
+    asm volatile("dbar 0" ::: "memory");
 }
 
 /* ---- One-time TLB init ---- */
@@ -289,11 +289,11 @@ int la_tlb_fill_all(uint64_t *pgtbl)
                 /* Use the PTE's own perm (bits [8:0], G=0) — see la_pte_lookup
                  * for why we must NOT force G=1 here. */
                 if (have_even) {
-                    ppn_e  = (pte2_even >> 12) & 0xFFFFFFFFFFFFFUL;
+                    ppn_e  = (pte2_even >> 12) & LA_PTE_PPN_MASK;
                     perm_e = pte2_even & 0x1FFUL;
                 }
                 if (have_odd) {
-                    ppn_o  = (pte2_odd >> 12) & 0xFFFFFFFFFFFFFUL;
+                    ppn_o  = (pte2_odd >> 12) & LA_PTE_PPN_MASK;
                     perm_o = pte2_odd & 0x1FFUL;
                 }
 

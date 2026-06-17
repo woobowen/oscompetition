@@ -180,13 +180,21 @@ int memfs_truncate(int ino)
     return 0;
 }
 
-int memfs_delete(const char *path)
+int memfs_unlink_inode(int ino)
 {
-    int ino = memfs_lookup(path);
-    if (ino < 0) return -1;
+    if (ino <= MEMFS_ROOT_INO || ino >= MEMFS_MAX_INODES) return -1;
     struct memfs_inode *inode = &memfs_inodes[ino];
+    if (inode->type == MEMFS_TYPE_FREE) return -1;
+    inode->path[0] = '\0';
+    return 0;
+}
 
-    /* Free data pages */
+int memfs_reclaim_inode(int ino)
+{
+    if (ino <= MEMFS_ROOT_INO || ino >= MEMFS_MAX_INODES) return -1;
+    struct memfs_inode *inode = &memfs_inodes[ino];
+    if (inode->type == MEMFS_TYPE_FREE) return -1;
+
     for (int j = 0; j < MEMFS_PAGES_PER_FILE; j++) {
         if (inode->pages[j]) {
             la_pmem_free(inode->pages[j]);
@@ -198,6 +206,20 @@ int memfs_delete(const char *path)
     inode->path[0] = '\0';
     inode->size = 0;
     return 0;
+}
+
+int memfs_is_unlinked(int ino)
+{
+    if (ino <= MEMFS_ROOT_INO || ino >= MEMFS_MAX_INODES) return 0;
+    struct memfs_inode *inode = &memfs_inodes[ino];
+    return inode->type != MEMFS_TYPE_FREE && inode->path[0] == '\0';
+}
+
+int memfs_delete(const char *path)
+{
+    int ino = memfs_lookup(path);
+    if (ino < 0) return -1;
+    return memfs_reclaim_inode(ino);
 }
 
 /* Simple directory listing: scan all inodes for immediate children of dir_ino.

@@ -96,6 +96,8 @@ void la_trap_dispatch(struct la_trap_frame *tf)
         }
     }
 
+    uint64_t entry_prmd = la_csr_read(LA_CSR_PRMD);
+    int from_user = (entry_prmd & 0x3) != 0;
     uint64_t ecode = la_estat_ecode(tf->estat);
 
     /* ---- interrupt (ecode == 0) ---- */
@@ -134,6 +136,35 @@ void la_trap_dispatch(struct la_trap_frame *tf)
         goto check_signal;
     }
 
+    /* Floating-point disabled.  The LoongArch lp64d ABI permits user programs
+     * to execute FP instructions; enable FPU for the current user context and
+     * retry the faulting instruction.  The kernel does not use FP registers,
+     * so this does not clobber kernel state. */
+    if (ecode == LA_ECODE_FPD) {
+        la_csr_write(la_csr_read(LA_CSR_EUEN) | LA_EUEN_FPE, LA_CSR_EUEN);
+        return;
+    }
+
+    /* HPTW may report a normal page-invalid exception for freshly mapped
+     * pages in our software page table (notably mmap/brk pages).  If the
+     * current page table says the address is present, fill the TLB through
+     * the normal CSR path and retry the faulting instruction. */
+    if (ecode >= 0x1 && ecode <= 0x3) {
+        struct la_proc *p = la_current_proc();
+        if (p && p->is_user && p->pgtbl) {
+            if (la_uva_to_pa(p->pgtbl, tf->badv) != 0 &&
+                la_tlb_refill_one(tf->badv) == 0) {
+                la_tlb_refill_count++;
+                return;
+            }
+            if (la_uvm_grow_stack(p->pgtbl, tf->badv) == 0 &&
+                la_tlb_refill_one(tf->badv) == 0) {
+                la_tlb_refill_count++;
+                return;
+            }
+        }
+    }
+
     /* ---- unhandled exception → kill user proc / halt ----
      * Minimal report only: a verbose dump here blows the 4 KB kernel
      * stack (one page) and corrupts the neighbouring physical page,
@@ -148,71 +179,70 @@ void la_trap_dispatch(struct la_trap_frame *tf)
     la_uart_puts(" name=");
     if (fault_proc) la_uart_puts(fault_proc->name);
     la_uart_puts("\n");
+    la_uart_puts("  csr: CRMD=");
+    la_uart_put_hex(la_csr_read(LA_CSR_CRMD));
+    la_uart_puts(" PRMD=");
+    la_uart_put_hex(la_csr_read(LA_CSR_PRMD));
+    la_uart_puts(" TLBRERA=");
+    la_uart_put_hex(la_csr_read(LA_CSR_TLBRERA));
+    la_uart_puts(" TLBRBADV=");
+    la_uart_put_hex(la_csr_read(LA_CSR_TLBRBADV));
+    la_uart_puts(" TLBRPRMD=");
+    la_uart_put_hex(la_csr_read(LA_CSR_TLBRPRMD));
+    la_uart_puts("\n");
+    if (ecode == 0x8) {
+        la_uart_puts("  regs: ra=");
+        la_uart_put_hex(tf->gpr[LA_GPR_RA]);
+        la_uart_puts(" sp=");
+        la_uart_put_hex(tf->gpr[LA_GPR_SP]);
+        la_uart_puts(" a0=");
+        la_uart_put_hex(tf->gpr[LA_GPR_A0]);
+        la_uart_puts(" a1=");
+        la_uart_put_hex(tf->gpr[LA_GPR_A1]);
+        la_uart_puts(" a2=");
+        la_uart_put_hex(tf->gpr[LA_GPR_A2]);
+        la_uart_puts(" a3=");
+        la_uart_put_hex(tf->gpr[LA_GPR_A3]);
+        la_uart_puts("\n");
+    }
 
-    /* Diagnostic: for page-fault-like exceptions (PIL=0x1, PIS=0x2,
-     * PIF=0x3, PME=0x4, ADEF=0x8, ADEM=0x9), dump the PTE at badv
-     * so we can see whether the page-table mapping is corrupted or the
-     * TLB/HPTW delivered a stale translation.
-     *
-     * ALSO dump the PTE at ERA — for ADEF, ERA itself may be the
-     * problematic address. */
+    /* For page-fault-like exceptions, show whether ERA and BADV are actually
+     * mapped in the current user page table.  This keeps the failure visible
+     * while giving enough state to distinguish stale-TLB bugs from real user
+     * faults. */
     if ((ecode >= 0x1 && ecode <= 0x4) || ecode == 0x8 || ecode == 0x9) {
         struct la_proc *cur = fault_proc;
         if (cur && cur->pgtbl) {
-            /* Dump PTE for ERA (useful for ADEF) */
-            {
-                uint64_t eva = tf->era;
-                uint64_t eidx0 = (eva >> 30) & 0x1FF;
-                uint64_t eidx1 = (eva >> 21) & 0x1FF;
-                uint64_t eidx2 = (eva >> 12) & 0x1FF;
-                uint64_t ee0 = cur->pgtbl[eidx0];
-                uint64_t epte = 0;
-                if (ee0) {
-                    uint64_t *emid = (uint64_t *)ee0;
-                    uint64_t ee1 = emid[eidx1];
-                    if (ee1) {
-                        uint64_t *eleaf = (uint64_t *)ee1;
-                        epte = eleaf[eidx2];
-                    }
-                }
-                la_uart_puts("  diag: ERA_PTE=");
-                la_uart_put_hex(epte);
-                la_uart_puts(" at era=");
-                la_uart_put_hex(eva);
-                la_uart_puts(epte ? " (mapped)" : " (UNMAPPED)");
-                la_uart_puts("\n");
-            }
-
-            uint64_t dump_pa = la_uva_to_pa(cur->pgtbl, tf->badv);
-            if (dump_pa) {
-                /* Walk PTE explicitly to get perm bits (la_uva_to_pa
-                 * only returns the PA). */
+            uint64_t era_pa = la_uva_to_pa(cur->pgtbl, tf->era);
+            uint64_t badv_pa = la_uva_to_pa(cur->pgtbl, tf->badv);
+            uint64_t badv_pte = 0;
+            if (tf->badv < (1ULL << 39)) {
                 uint64_t idx0 = (tf->badv >> 30) & 0x1FF;
                 uint64_t idx1 = (tf->badv >> 21) & 0x1FF;
                 uint64_t idx2 = (tf->badv >> 12) & 0x1FF;
                 uint64_t e0 = cur->pgtbl[idx0];
-                uint64_t pte = 0;
                 if (e0) {
                     uint64_t *mid = (uint64_t *)e0;
                     uint64_t e1 = mid[idx1];
                     if (e1) {
                         uint64_t *leaf = (uint64_t *)e1;
-                        pte = leaf[idx2];
+                        badv_pte = leaf[idx2];
                     }
                 }
-                la_uart_puts("  diag: PTE=");
-                la_uart_put_hex(pte);
-                la_uart_puts(" PGDL=");
-                la_uart_put_hex(la_csr_read(LA_CSR_PGDL));
-                la_uart_puts(" active=");
-                la_uart_put_hex(la_tlb_active_pgtbl);
-                la_uart_puts(" pgtbl=");
-                la_uart_put_hex((uint64_t)cur->pgtbl);
-                la_uart_puts("\n");
-            } else {
-                la_uart_puts("  diag: PTE unmapped "
-                             "(no page table entry)\n");
             }
+            la_uart_puts("  diag: ERA_PA=");
+            la_uart_put_hex(era_pa);
+            la_uart_puts(" BADV_PA=");
+            la_uart_put_hex(badv_pa);
+            la_uart_puts(" BADV_PTE=");
+            la_uart_put_hex(badv_pte);
+            la_uart_puts(" PGDL=");
+            la_uart_put_hex(la_csr_read(LA_CSR_PGDL));
+            la_uart_puts(" active=");
+            la_uart_put_hex(la_tlb_active_pgtbl);
+            la_uart_puts(" pgtbl=");
+            la_uart_put_hex((uint64_t)cur->pgtbl);
+            la_uart_puts("\n");
         }
     }
 
@@ -236,7 +266,23 @@ check_signal:
      * the original context is restored. */
     {
         struct la_proc *cur = la_current_proc();
-        if (cur && cur->is_user && la_signal_pending(tf))
-            la_signal_deliver(tf);
+        if (cur && cur->is_user) {
+            if (la_signal_pending(tf))
+                la_signal_deliver(tf);
+
+            /* trap_entry.S chooses the final restore path from PRMD.PPLV.
+             * Syscalls such as wait/futex/sigtimedwait can context-switch
+             * inside the kernel; while they are asleep, the scheduler may
+             * take kernel-mode timer interrupts, leaving PRMD.PPLV as PLV0.
+             * Restore the user-return PRMD at the last C-side exit point and
+             * close the tiny window for another nested kernel interrupt before
+             * assembly executes ertn.  ertn will re-enable user interrupts
+             * from PRMD.PIE. */
+            if (from_user) {
+                la_csr_write(LA_USER_PLV | LA_PRMD_PIE, LA_CSR_PRMD);
+                la_csr_write(la_csr_read(LA_CSR_CRMD) & ~LA_CRMD_IE,
+                             LA_CSR_CRMD);
+            }
+        }
     }
 }

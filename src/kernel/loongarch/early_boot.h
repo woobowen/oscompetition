@@ -113,6 +113,9 @@ uint32_t memfs_inode_size(int ino);
 int      memfs_path_prefix(const char *path, const char *prefix);
 const char *memfs_get_path(int ino);
 int      memfs_truncate(int ino);
+int      memfs_unlink_inode(int ino);
+int      memfs_reclaim_inode(int ino);
+int      memfs_is_unlinked(int ino);
 
 /* ---- Loopback socket layer ---- */
 void la_socket_init(void);

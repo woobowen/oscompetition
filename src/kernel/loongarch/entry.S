@@ -14,8 +14,9 @@ _entry:
         la.local $t0, la_exception_entry
         csrwr   $t0, 0xc
 
-        # TLB refill exceptions → same handler (for diagnostic)
-        la.local $t0, la_exception_entry
+        # TLB refill exceptions use a tiny wrapper that marks TLBRERA.ISTLBR
+        # before entering the shared exception path.
+        la.local $t0, la_tlb_refill_entry
         csrwr   $t0, LA_CSR_TLBRENTRY
 
         bl la_boot_main

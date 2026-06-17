@@ -366,7 +366,61 @@ static uint64_t e4_isize(const e4_inode_t *ip) { return ((uint64_t)ip->size_high
 
 static int e4_lbn2pb(const e4_inode_t *ip, uint32_t lbn, uint64_t *pb)
 {
-    if (!(ip->flags & E4_EXTENTS_FL)) return -1;
+    /* ---- Inode-block-map path (no extents flag) ----
+     * Traditional ext4 layout for older/small files:
+     *   block[0..11]  : direct block pointers (12 entries)
+     *   block[12]     : single-indirect (block of uint32_t block numbers)
+     *   block[13]     : double-indirect
+     *   block[14]     : triple-indirect
+     * For 4KB blocks each indirect block holds 1024 entries. */
+    if (!(ip->flags & E4_EXTENTS_FL)) {
+        const uint32_t *bp = (const uint32_t *)ip->block;
+        if (lbn < 12) {
+            if (bp[lbn] == 0) return -1;
+            *pb = bp[lbn];
+            return 0;
+        }
+        uint32_t ptrs_per_blk = e4.bsz / 4;
+        lbn -= 12;
+        /* single indirect */
+        if (lbn < ptrs_per_blk) {
+            if (bp[12] == 0) return -1;
+            const uint32_t *tbl = (const uint32_t *)bio_read(bp[12]);
+            if (!tbl || tbl[lbn] == 0) return -1;
+            *pb = tbl[lbn];
+            return 0;
+        }
+        lbn -= ptrs_per_blk;
+        /* double indirect */
+        if (lbn < (uint32_t)ptrs_per_blk * ptrs_per_blk) {
+            if (bp[13] == 0) return -1;
+            const uint32_t *l1 = (const uint32_t *)bio_read(bp[13]);
+            if (!l1) return -1;
+            uint32_t i1 = lbn / ptrs_per_blk;
+            uint32_t i2 = lbn % ptrs_per_blk;
+            if (l1[i1] == 0) return -1;
+            const uint32_t *l2 = (const uint32_t *)bio_read(l1[i1]);
+            if (!l2 || l2[i2] == 0) return -1;
+            *pb = l2[i2];
+            return 0;
+        }
+        lbn -= (uint32_t)ptrs_per_blk * ptrs_per_blk;
+        /* triple indirect */
+        if (bp[14] == 0) return -1;
+        const uint32_t *t1 = (const uint32_t *)bio_read(bp[14]);
+        if (!t1) return -1;
+        uint32_t j1 = lbn / ((uint32_t)ptrs_per_blk * ptrs_per_blk);
+        uint32_t rem = lbn % ((uint32_t)ptrs_per_blk * ptrs_per_blk);
+        uint32_t j2 = rem / ptrs_per_blk;
+        uint32_t j3 = rem % ptrs_per_blk;
+        if (t1[j1] == 0) return -1;
+        const uint32_t *t2 = (const uint32_t *)bio_read(t1[j1]);
+        if (!t2 || t2[j2] == 0) return -1;
+        const uint32_t *t3 = (const uint32_t *)bio_read(t2[j2]);
+        if (!t3 || t3[j3] == 0) return -1;
+        *pb = t3[j3];
+        return 0;
+    }
     uint8_t *sc = 0;
     const uint8_t *nd = ip->block;
     int r = -1, cnt = 0;
@@ -378,8 +432,7 @@ static int e4_lbn2pb(const e4_inode_t *ip, uint32_t lbn, uint64_t *pb)
             const e4_ext_t *ex = (const e4_ext_t *)(nd + sizeof(*eh));
             for (uint32_t i = 0; i < eh->entries; i++) {
                 uint32_t s = ex[i].block, n = ex[i].len & 0x7fff;
-                if (lbn >= s && lbn < s + n) {
-                    *pb = ((uint64_t)ex[i].start_hi << 32) | ex[i].start_lo | (lbn - s);
+                if (lbn >= s && lbn < s + n) {                    *pb = ((uint64_t)ex[i].start_hi << 32) | ex[i].start_lo | (lbn - s);
                     /* Note: extent start is the full physical block number */
                     *pb = ((uint64_t)ex[i].start_hi << 32) | ex[i].start_lo;
                     *pb += (lbn - s);
@@ -396,6 +449,38 @@ static int e4_lbn2pb(const e4_inode_t *ip, uint32_t lbn, uint64_t *pb)
         sc = bio_read((uint32_t)child);
         if (!sc) break;
         nd = sc;
+    }
+    /* Fallback: if extents flag was set but the extent tree is invalid
+     * (magic mismatch, corrupted nodes), try the traditional block-map
+     * path.  This handles inodes that were created with mixed metadata
+     * (e.g. extents flag set but i_block still holds direct pointers). */
+    if (r < 0) {
+        const uint32_t *bp = (const uint32_t *)ip->block;
+        if (lbn < 12) {
+            if (bp[lbn] != 0) { *pb = bp[lbn]; r = 0; }
+            return r;
+        }
+        uint32_t ptrs_per_blk = e4.bsz / 4;
+        lbn -= 12;
+        if (lbn < ptrs_per_blk) {
+            if (bp[12] == 0) return -1;
+            const uint32_t *tbl = (const uint32_t *)bio_read(bp[12]);
+            if (tbl && tbl[lbn] != 0) { *pb = tbl[lbn]; r = 0; }
+            return r;
+        }
+        lbn -= ptrs_per_blk;
+        if (lbn < (uint32_t)ptrs_per_blk * ptrs_per_blk) {
+            if (bp[13] == 0) return -1;
+            const uint32_t *l1 = (const uint32_t *)bio_read(bp[13]);
+            if (!l1) return -1;
+            uint32_t i1 = lbn / ptrs_per_blk;
+            uint32_t i2 = lbn % ptrs_per_blk;
+            if (l1[i1] == 0) return -1;
+            const uint32_t *l2 = (const uint32_t *)bio_read(l1[i1]);
+            if (l2 && l2[i2] != 0) { *pb = l2[i2]; r = 0; }
+            return r;
+        }
+        return -1;
     }
     return r;
 }
@@ -417,12 +502,10 @@ static uint32_t e4_read_file(uint32_t inum, uint32_t off, void *dst, uint32_t le
         if (take > len - done) take = len - done;
         uint64_t pb;
         if (e4_lbn2pb(&ip, lbn, &pb) < 0) {
-            la_uart_puts("  e4rf: lbn2pb FAIL inum=");
-            la_uart_put_hex(inum);
-            la_uart_puts(" lbn=");
-            la_uart_put_hex(lbn);
-            la_uart_puts("\n");
-            break;
+            /* Sparse hole: fill the rest of the buffer with zeros. */
+            for (uint32_t z = 0; z < take; z++) d[done + z] = 0;
+            done += take;
+            continue;
         }
         if (e4_read_bytes(pb * (uint64_t)e4.bsz + boff, d + done, take) != take) {
             la_uart_puts("  e4rf: read_bytes FAIL inum=");

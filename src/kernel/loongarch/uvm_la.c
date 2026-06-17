@@ -41,6 +41,7 @@
 #define LA_PTE_P        (1UL << 7)   /* Present */
 #define LA_PTE_NX       (1UL << 62)  /* No Execute */
 #define LA_PTE_NR       (1UL << 61)  /* No Read */
+#define LA_PTE_PA_MASK  0x0000FFFFFFFFF000UL
 
 /* Permission shorthand.
  * When HPTW is enabled, QEMU's pte_write() checks bit W (bit 8),
@@ -58,8 +59,8 @@
 #define LA_VA_PT(va)    (((va) >> 12) & 0x1FF)
 
 /* Build / extract PTE */
-#define LA_MK_PTE(pa, flags) (((uint64_t)(pa) & ~0xFFFUL) | (flags))
-#define LA_PTE_PPN(pte)      ((pte) & ~0xFFFUL)
+#define LA_MK_PTE(pa, flags) (((uint64_t)(pa) & LA_PTE_PA_MASK) | (flags))
+#define LA_PTE_PPN(pte)      ((pte) & LA_PTE_PA_MASK)
 
 /*
  * PWCL value for 3-level 4KB page tables.
@@ -168,13 +169,12 @@ int la_uvm_unmap_page(uint64_t *root, uint64_t va, int free_page)
 
     if (!(pte & LA_PTE_V)) return -1;
 
+    leaf[idx2] = 0;
+    la_tlb_inval_page(va);
     if (free_page) {
         uint64_t pa = LA_PTE_PPN(pte);
         la_pmem_free((void *)pa);
     }
-
-    leaf[idx2] = 0;
-    la_tlb_inval_page(va);
     return 0;
 }
 
@@ -466,20 +466,13 @@ void la_uvm_free_pgtbl(uint64_t *root)
 {
     if (!root) return;
 
-    /* Walk the 3-level table and, for each mapped data page, inval
-     * the TLB entry for that VA BEFORE freeing the physical page.
-     *
-     * QEMU 10.0.2's broadcast invtlb (op 0x0/0x3) is not reliable:
-     * duplicate TLB entries for the same VPPN (one stale, one fresh)
-     * survive the broadcast and the CPU may hit the stale entry,
-     * translating through a now-freed/reused physical page → ADEF/INE
-     * cascade.  Per-VA invalidation (op 0x6 = "invalidate by VA, both
-     * G=0 and G=1") atomically drops the exact TLB pair that referenced
-     * the page we are about to free.
-     *
-     * This is O(pages) — ~500 invals for a typical process — which is
-     * much cheaper than the deep 2112-slot scan, and is called only at
-     * process teardown, not on the hot scheduler path. */
+    /* Drop stale translations before the physical pages can be reused.
+     * Normal execution no longer pre-fills whole address spaces, so process
+     * teardown does not need an expensive per-page invalidation loop.  A
+     * global invalidation before and after the free keeps the invariant
+     * simple: no live CPU translation should reference a page after it has
+     * returned to the allocator. */
+    la_tlb_inval_all();
 
     for (int i = 0; i < LA_PT_ENTRIES; i++) {
         uint64_t e0 = root[i];
@@ -495,13 +488,6 @@ void la_uvm_free_pgtbl(uint64_t *root)
                 uint64_t e2 = leaf[k];
                 if (!(e2 & LA_PTE_V)) continue;
 
-                /* Invalidate the TLB entry for this VA before
-                 * freeing the backing page. */
-                uint64_t va = ((uint64_t)i << 30)
-                            | ((uint64_t)j << 21)
-                            | ((uint64_t)k << 12);
-                la_tlb_inval_page(va);
-
                 la_pmem_free((void *)LA_PTE_PPN(e2));   /* data page */
             }
             la_pmem_free(leaf);   /* leaf table page */
@@ -510,10 +496,5 @@ void la_uvm_free_pgtbl(uint64_t *root)
     }
     la_pmem_free(root);   /* root table page */
 
-    /* After freeing all PT pages and doing per-VA invals, fire one
-     * full TLB invalidation as insurance.  QEMU 10.0.2's broadcast
-     * invtlb is known to leak entries; a single extra full inval
-     * here costs ~zero (process teardown path, not hot) and prevents
-     * stale entries from outliving the freed page table. */
     la_tlb_inval_all();
 }

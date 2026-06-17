@@ -1,7 +1,7 @@
 loongarch boot start
 [init] pmem
-  pmem: region 0x0000000000997000 - 0x0000000010000000
-  pmem: 0x000000000000f669 pages (0x00000000000000f6 MB)
+  pmem: region 0x0000000000998000 - 0x0000000010000000
+  pmem: 0x000000000000f668 pages (0x00000000000000f6 MB)
 [init] kvm
   kvm: DMW0 identity-mapped for PLV0
 [init] paging
@@ -25,7 +25,7 @@ loongarch boot start
       io_val=0x0000000079006e54
     host_features=0x0000000079006e54
     queue_max=0x0000000000000100
-    vq_pages=0x0000000000990000 pfn=0x0000000000000990
+    vq_pages=0x0000000000991000 pfn=0x0000000000000991
     status=0x000000000000000f
   virtio: block device ready
   bio: buffer cache (0x0000000000000100 blocks, 0x0000000000000400 KB)
@@ -46,4 +46,4 @@ initcode: started
   open: lookup '/glibc' FAILED
   getdents: 0 entries
 initcode: no *_testcode.sh found
-[tick 0x0000000000000001 s] refills=0x000000000000000a
+[tick 0x0000000000000001 s] refills=0x0000000000000001

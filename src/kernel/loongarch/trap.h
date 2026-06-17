@@ -17,6 +17,7 @@ enum la_exception_code {
     LA_ECODE_BRK = 0xc,
     LA_ECODE_INE = 0xd,
     LA_ECODE_IPE = 0xe,
+    LA_ECODE_FPD = 0xf,
 };
 
 enum la_gpr_index {

@@ -9,6 +9,7 @@
 /* ---- Control / Status Registers ---- */
 #define LA_CSR_CRMD   0x0
 #define LA_CSR_PRMD   0x1
+#define LA_CSR_EUEN   0x2
 #define LA_CSR_ECFG   0x4
 #define LA_CSR_ESTAT  0x5
 #define LA_CSR_ERA    0x6
@@ -62,6 +63,9 @@
 #define LA_PRMD_PPLV_MASK 0x3
 #define LA_PRMD_PIE       0x4
 #define LA_USER_PLV       0x3
+
+/* ---- EUEN bits ---- */
+#define LA_EUEN_FPE       (1 << 0)    /* Floating-point enable */
 
 /* ---- TCFG bits (QEMU LoongArch layout) ---- */
 #define LA_TCFG_EN         (1 << 0)     /* bit 0:  Enable */
@@ -130,4 +134,3 @@
 #endif
 #define LA_CSR_KS0 0x30
 #define LA_CSR_KS1 0x31
-

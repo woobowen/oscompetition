@@ -834,6 +834,7 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
     } else {
         p->mm->heap_top = 0x400000ULL;  /* fallback: 4MB */
     }
+    p->mm->brk_base = p->mm->heap_top;
     /* mmap uses a SEPARATE address region (high, growing up) so it never
      * collides with the brk heap (which grows up from heap_top).
      * Linux keeps brk and mmap in disjoint ranges; mapping mmap onto the
@@ -925,25 +926,6 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
     {
         uint64_t rand_data[2] = { seed, seed * 6364136223846793005ULL + 1ULL };
         la_uvm_copy_in(new_pgtbl, sp, rand_data, 16);
-    }
-    /* DIAGNOSTIC: read back the seed from user memory to confirm AT_RANDOM
-     * actually points at our random bytes (not leftover kernel/stack data). */
-    {
-        uint64_t rpa = la_uva_to_pa(new_pgtbl, at_rand_base);
-        la_uart_puts("  exec: AT_RANDOM@");
-        la_uart_put_hex(at_rand_base);
-        la_uart_puts(" seed=");
-        la_uart_put_hex(seed);
-        la_uart_puts(" pa=");
-        la_uart_put_hex(rpa);
-        if (rpa) {
-            la_uart_puts(" rb=[");
-            la_uart_put_hex(*(uint64_t *)rpa);
-            la_uart_puts(",");
-            la_uart_put_hex(*((uint64_t *)rpa + 1));
-            la_uart_puts("]");
-        }
-        la_uart_puts("\n");
     }
 
     /* AT_NULL terminator — top of the auxv array, ends parsing. */
@@ -1055,23 +1037,18 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
 
     /* Switch page table and return to user mode */
     if (p->pgtbl) {
-        la_uvm_switch(p->pgtbl);
+        /* Update ASID, PGDL, and the software refill root before rebuilding
+         * TLB entries for the replacement image.  exec keeps the same PID/ASID
+         * but installs a new page table, so old translations for this ASID
+         * must still be flushed below. */
+        la_proc_activate_user_pgtbl(p);
 
-        /* Update the active page table for the TLB refill handler.
-         * Without this, TLB refills would walk the OLD page table
-         * (from before exec) and fail to find the new mappings. */
-        la_tlb_active_pgtbl = (uint64_t)p->pgtbl;
-
-        /* Invalidate all TLB entries, then pre-fill ALL mapped pages
-         * into the STLB (2048 entries).  la_tlb_fill_all uses the
-         * normal (non-ISTLBR) tlbfill path, writing TLBEHI/TLBIDX/TLBELO.
-         * Note: la_tlb_refill_one uses the ISTLBR path (TLBREHI/TLBRELO)
-         * which is wrong here since ISTLBR=0 during exec. */
+        /* exec keeps the same ASID but replaces the page table, so old
+         * translations must be dropped.  Do not pre-fill the whole image:
+         * QEMU's LoongArch STLB can retain duplicate/stale entries after
+         * heavy mmap/munmap churn.  Let HPTW and the single-page refill path
+         * populate translations on demand. */
         la_tlb_inval_all();
-        int nfills = la_tlb_fill_all(new_pgtbl);
-        la_uart_puts("  exec: pre-filled ");
-        la_uart_put_hex(nfills);
-        la_uart_puts(" TLB pairs\n");
     }
 
     /* CRITICAL: Set DA=0, PG=1 before returning to user mode.

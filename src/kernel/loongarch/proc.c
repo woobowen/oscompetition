@@ -12,6 +12,14 @@ static struct la_proc la_procs[LA_NPROC];
 static struct la_cpu la_cpu;
 static int la_next_pid;
 
+#define LA_ASID_MASK 0x3ffUL
+
+static uint64_t la_proc_asid_from_pid(int pid)
+{
+    uint64_t asid = (uint64_t)pid & LA_ASID_MASK;
+    return asid ? asid : 1;
+}
+
 /* ---- init ---- */
 void la_proc_init(void)
 {
@@ -39,10 +47,12 @@ static struct la_proc *la_proc_alloc(void)
 
         struct la_proc *p = &la_procs[i];
         p->pid    = la_next_pid++;
+        p->asid   = la_proc_asid_from_pid(p->pid);
         p->kstack = 0;
         p->entry  = 0;
         p->tf     = 0;
         p->pgtbl  = 0;
+        p->__mm.brk_base = 0;
         p->__mm.heap_top = 0;
         p->__mm.mmap_top = 0;
         p->mm     = &p->__mm;
@@ -50,6 +60,7 @@ static struct la_proc *la_proc_alloc(void)
         p->is_user  = 0;
         p->shared_vm = 0;
         p->ticks    = LA_TIME_SLICE;
+        p->sched_priority = 0;
         p->clear_child_tid = 0;
         p->wait_chan = 0;
         p->sig_pending = 0;
@@ -94,9 +105,9 @@ static struct la_proc *la_proc_alloc(void)
  * Called by the scheduler for parentless zombies AND by sys_wait when a parent
  * collects a child.  Safe to call on a ZOMBIE that has already swtch'd away:
  * its kstack is no longer in use and the kernel runs off DMW0 identity mapping
- * (not the user page table), so freeing pgtbl cannot fault the kernel.  The
- * scheduler invalidates the whole TLB before the next user process runs, so
- * freed pages are not referenced by stale TLB entries.
+ * (not the user page table), so freeing pgtbl cannot fault the kernel.
+ * la_uvm_free_pgtbl performs the deep TLB invalidation needed before freed
+ * page-table pages can be reused.
  *
  * CLONE_VM threads (shared_vm==1) share the leader's pgtbl; only the leader
  * (shared_vm==0) owns and frees it.  If the leader is freed while a sibling
@@ -138,14 +149,8 @@ void la_proc_free(struct la_proc *p)
                 break;
             }
         }
-        if (!shared_with_sibling) {
+        if (!shared_with_sibling)
             la_uvm_free_pgtbl(p->pgtbl);
-            /* la_uvm_free_pgtbl already calls la_tlb_inval_all(),
-             * but fire one more here on the current ASID to be
-             * absolutely sure no stale entries survive into the
-             * next scheduled process (QEMU invtlb erratum). */
-            la_tlb_inval_all();
-        }
         p->pgtbl = 0;
     } else if (p->shared_vm == 1) {
         /* Thread: skip pgtbl free — the leader (or owner) owns it. */
@@ -158,10 +163,44 @@ void la_proc_free(struct la_proc *p)
     }
     p->state   = LA_PROC_UNUSED;
     p->pid     = 0;
+    p->asid    = 0;
     p->is_user = 0;
     p->shared_vm = 0;
     p->clear_child_tid = 0;
     p->wait_chan = 0;
+}
+
+void la_proc_activate_user_pgtbl(struct la_proc *p)
+{
+    if (!p || !p->pgtbl)
+        return;
+
+    if (p->asid == 0)
+        p->asid = la_proc_asid_from_pid(p->pid);
+
+    la_csr_write(p->asid & LA_ASID_MASK, LA_CSR_ASID);
+    la_tlb_active_pgtbl = (uint64_t)p->pgtbl;
+    la_uvm_switch(p->pgtbl);
+
+    /* The LoongArch lp64d userland uses the hardware FPU.  EUEN defaults to
+     * disabled after boot; leave FPU enabled while this kernel does not use FP
+     * registers itself, otherwise dynamic musl/unixbench programs trap with
+     * FPD (ecode 0xf) on their first FP instruction. */
+    la_csr_write(la_csr_read(LA_CSR_EUEN) | LA_EUEN_FPE, LA_CSR_EUEN);
+}
+
+static void la_proc_restore_user_return_state(struct la_proc *p)
+{
+    if (!p || !p->is_user)
+        return;
+
+    /* A process can context-switch away while still inside a syscall
+     * implementation (wait/futex/sigtimedwait/timer preemption).  While it is
+     * asleep, the scheduler may take kernel-mode timer interrupts, which leave
+     * PRMD describing a PLV0 return.  trap_entry.S uses PRMD.PPLV to choose
+     * the final restore path before ertn, so restore the user return state
+     * whenever such a process resumes inside the kernel. */
+    la_csr_write(LA_USER_PLV | LA_PRMD_PIE, LA_CSR_PRMD);
 }
 
 /*
@@ -206,9 +245,8 @@ static void __attribute__((used)) la_proc_user_bootstrap(void)
     /* Save kernel SP so the trap handler can find it on next user trap */
     la_trap_ksp = p->kstack + LA_KSTACK_SIZE;
 
-    /* Set active page table for TLB refill handler */
-    if (p->pgtbl)
-        la_tlb_active_pgtbl = (uint64_t)p->pgtbl;
+    /* Set ASID, hardware PGD, and the software refill root. */
+    la_proc_activate_user_pgtbl(p);
 
     /* Jump to user mode — never returns */
     la_proc_return(p->tf);
@@ -248,13 +286,6 @@ struct la_proc *la_proc_create_kthread(void (*entry)(void), const char *name)
     }
 
     p->state = LA_PROC_RUNNABLE;
-
-    la_uart_puts("  proc: created '");
-    la_uart_puts(p->name);
-    la_uart_puts("' pid=");
-    la_uart_put_hex(p->pid);
-    la_uart_puts("\n");
-
     return p;
 }
 
@@ -278,6 +309,7 @@ struct la_proc *la_proc_create_user(const char *name)
     p->is_user  = 1;
     p->tf       = 0;
     p->pgtbl    = 0;
+    p->__mm.brk_base = 0;
     p->__mm.heap_top = 0;
     p->__mm.mmap_top = 0;
     p->mm       = &p->__mm;
@@ -300,12 +332,6 @@ struct la_proc *la_proc_create_user(const char *name)
 
     p->state = LA_PROC_RUNNABLE;
 
-    la_uart_puts("  proc: created user '");
-    la_uart_puts(p->name);
-    la_uart_puts("' pid=");
-    la_uart_put_hex(p->pid);
-    la_uart_puts("\n");
-
     return p;
 }
 
@@ -326,6 +352,7 @@ void la_proc_yield(void)
      */
     uint64_t crmd = la_csr_read(LA_CSR_CRMD);
     la_csr_write(crmd | LA_CRMD_IE, LA_CSR_CRMD);
+    la_proc_restore_user_return_state(p);
 }
 
 /* ---- switch to scheduler context (for sys_exit etc.) ---- */
@@ -359,22 +386,7 @@ void __attribute__((noreturn)) la_proc_exit(int code)
         for (;;) {}
     }
 
-    /* Clear ISTLBR BEFORE touching any memory.  If a spurious TLB
-     * refill exception fires while the exiting process's page table
-     * is still in PGDL, and the ISTLBR bit is set from a previous
-     * trap, the CPU misroutes the exception and corrupts
-     * TLBRERA/TLBRPRMD.  The resulting cascade kills the NEXT
-     * process instead of this one. */
-    la_csr_write(la_csr_read(LA_CSR_TLBRERA) & ~1ULL, LA_CSR_TLBRERA);
-
-    /* Also invalidate all TLB entries now — they belong to this
-     * address space, which is about to become zombie.  The scheduler
-     * will inval again before the next process, but doing it here
-     * too prevents HPTW from walking our (still live but about to
-     * be reaped) page table, which could create TLB entries that
-     * alias the next process's VAs. */
-    la_tlb_inval_all();
-
+    la_csr_write(la_csr_read(LA_CSR_TLBRERA) & ~1ULL, LA_CSR_TLBRERA);  /* clear ISTLBR */
     me->exit_code = (int)(unsigned)code;
     me->state     = LA_PROC_ZOMBIE;
     if (me->parent_pid > 0)
@@ -398,6 +410,7 @@ void la_proc_sleep(void)
     /* Re-enable interrupts after waking up */
     uint64_t crmd = la_csr_read(LA_CSR_CRMD);
     la_csr_write(crmd | LA_CRMD_IE, LA_CSR_CRMD);
+    la_proc_restore_user_return_state(p);
 }
 
 /* ---- sleep_chan: futex channel-keyed sleep ----
@@ -416,6 +429,7 @@ void la_proc_sleep_chan(void *chan)
     /* Re-enable interrupts after waking up */
     uint64_t crmd = la_csr_read(LA_CSR_CRMD);
     la_csr_write(crmd | LA_CRMD_IE, LA_CSR_CRMD);
+    la_proc_restore_user_return_state(p);
 }
 
 /* ---- wakeup: wake all SLEEPING procs with matching pid ----
@@ -486,9 +500,6 @@ void la_scheduler(void)
             if (prio > best_prio) {
                 best_prio = prio;
                 best_idx  = idx;
-            } else if (prio == best_prio && !p) {
-                /* First match at this priority — take it (round-robin via next_idx) */
-                best_idx = idx;
             }
         }
 
@@ -538,17 +549,18 @@ void la_scheduler(void)
                  * faults (INE/ADEF).  This was the root cause of the
                  * initcode 0x137c INE cascade: clone(CLONE_VM) killed a
                  * libc-bench worker; reaping freed its pgtbl root, and the
-                 * stale PGDL then killed pid4, pid2, and initcode in turn. */
-                la_tlb_active_pgtbl = (uint64_t)p->pgtbl;
-                la_uvm_switch(p->pgtbl);
-                /* Drop every global TLB entry.  Because all our mappings
-                 * are global and untagged by ASID, entries belonging to a
-                 * different process (or this one's pre-exec image) still
-                 * alias the very same VPPNs the resumed process will use.
-                 * Leaving them in causes non-deterministic wrong-PA loads.
-                 * The process refills what it needs on demand (or via
-                 * la_proc_return's fill on its first run). */
-                la_tlb_inval_all();
+                 * stale PGDL then killed pid4, pid2, and initcode in turn.
+                 *
+                 * Do not flush/refill the whole TLB on every resume.  Each
+                 * independent process has a nonzero ASID, and CLONE_VM
+                 * threads share their leader's ASID.  Repeated whole-address
+                 * tlbfill without first removing old entries can create
+                 * duplicate translations for the same ASID/VPPN; after mmap
+                 * and munmap churn, QEMU may hit a stale duplicate and write
+                 * through the wrong physical page.  PGDL/ASID activation is
+                 * enough here; new or missing translations are handled by
+                 * HPTW or by the single-page refill path. */
+                la_proc_activate_user_pgtbl(p);
             }
         }
 
@@ -558,6 +570,16 @@ void la_scheduler(void)
         la_cpu.current = 0;
 
         if (p->state == LA_PROC_ZOMBIE) {
+            /* CLONE_VM threads do not own the shared page table.  Once a
+             * thread has run sys_exit, clear_child_tid has already been
+             * zeroed and futex waiters have been woken, so the scheduler can
+             * reclaim its proc slot immediately.  wait4 deliberately skips
+             * shared_vm threads; leaving them as zombies exhausts LA_NPROC in
+             * pthread-heavy tests. */
+            if (p->shared_vm) {
+                la_proc_free(p);
+                continue;
+            }
             /* Only reap zombies that have no living parent.
              * Zombies with a parent must stay until the parent
              * calls sys_wait() to collect the exit status. */
@@ -592,24 +614,15 @@ void la_proc_return(struct la_trap_frame *tf)
     /* Switch to user page table */
     struct la_proc *p = la_current_proc();
     if (p && p->pgtbl) {
-        la_uvm_switch(p->pgtbl);
+        la_proc_activate_user_pgtbl(p);
 
-        /* ALWAYS invalidate the whole TLB before refilling.
+        /* ALWAYS invalidate the whole TLB before first user entry.
          *
-         * All our leaf PTEs are loaded with the G (global) bit and we use
-         * NO per-address-space ASID, so TLB entries are NOT tagged by
-         * process.  Entries left over from a previous image — e.g. the
-         * parent's (initcode) stack at the SAME virtual address the new
-         * image (busybox) reuses — survive across exec/fork and create
-         * DUPLICATE entries for one VPPN.  A TLB lookup may then return
-         * either the stale or the fresh entry non-deterministically, so a
-         * user load (notably musl reading AT_RANDOM to derive mallocng's
-         * ctx.secret) can hit the wrong physical page and corrupt heap
-         * metadata, crashing busybox in get_meta()'s secret check.
-         *
-         * Invalidating here guarantees only this image's mappings remain. */
+         * This path is used for a process's first user entry.  It is also the
+         * right place to clear stale entries if a proc slot/ASID was reused:
+         * after this point translations are rebuilt lazily from the current
+         * page table by HPTW or by the single-page refill handler. */
         la_tlb_inval_all();
-        la_tlb_fill_all(p->pgtbl);
     }
 
     /* Save kernel SP for next user→kernel trap */
@@ -641,6 +654,12 @@ int la_signal_pending(struct la_trap_frame *tf)
 
     uint64_t pending = p->sig_pending & ~p->sig_mask;
 
+    /* Keep SIGCHLD as a wait/sigtimedwait event only.  The current minimal
+     * signal-frame path is sufficient for simple user handlers, but shell
+     * job-control style SIGCHLD delivery is not stable yet; delivering it
+     * asynchronously can corrupt the return path. */
+    pending &= ~(1UL << LA_SIGCHLD);
+
     /* SIGKILL and SIGSTOP are always delivered */
     pending |= (p->sig_pending & (1UL << LA_SIGKILL));
     pending |= (p->sig_pending & (1UL << LA_SIGSTOP));
@@ -655,6 +674,7 @@ void la_signal_deliver(struct la_trap_frame *tf)
     if (!p || !p->is_user || !p->pgtbl) return;
 
     uint64_t pending = p->sig_pending & ~p->sig_mask;
+    pending &= ~(1UL << LA_SIGCHLD);
     /* Always deliver SIGKILL and SIGSTOP */
     pending |= (p->sig_pending & (1UL << LA_SIGKILL));
     pending |= (p->sig_pending & (1UL << LA_SIGSTOP));

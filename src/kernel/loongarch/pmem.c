@@ -15,6 +15,17 @@ struct la_page_node {
 static struct la_page_node *la_free_list;
 static uint64_t la_free_pages;
 static uint64_t la_total_pages;
+static uint8_t la_page_used[LA_LOWMEM_END / LA_PGSIZE];
+
+static int la_pmem_page_index(uint64_t addr, uint64_t *idx)
+{
+    if (addr % LA_PGSIZE != 0)
+        return -1;
+    if (addr < (uint64_t)la_kernel_end || addr >= LA_LOWMEM_END)
+        return -1;
+    *idx = addr / LA_PGSIZE;
+    return 0;
+}
 
 /* ---- init: populate free list from kernel_end to lowmem_end ---- */
 void la_pmem_init(void)
@@ -35,11 +46,14 @@ void la_pmem_init(void)
     la_free_list  = 0;
     la_free_pages = 0;
     la_total_pages = 0;
+    for (uint64_t i = 0; i < sizeof(la_page_used); i++)
+        la_page_used[i] = 1;
 
     for (uint64_t p = start; p + LA_PGSIZE <= end; p += LA_PGSIZE) {
         struct la_page_node *node = (struct la_page_node *)p;
         node->next = la_free_list;
         la_free_list = node;
+        la_page_used[p / LA_PGSIZE] = 0;
         la_free_pages++;
         la_total_pages++;
     }
@@ -60,6 +74,7 @@ void *la_pmem_alloc(void)
     struct la_page_node *page = la_free_list;
     la_free_list = page->next;
     la_free_pages--;
+    la_page_used[(uint64_t)page / LA_PGSIZE] = 1;
 
     /* zero-fill */
     uint64_t *p = (uint64_t *)page;
@@ -77,8 +92,20 @@ void la_pmem_free(void *page)
         return;
 
     uint64_t addr = (uint64_t)page;
-    if (addr % LA_PGSIZE != 0)
+    uint64_t idx = 0;
+    if (la_pmem_page_index(addr, &idx) < 0) {
+        la_uart_puts("  pmem: reject unaligned free ");
+        la_uart_put_hex(addr);
+        la_uart_puts("\n");
         return;
+    }
+    if (!la_page_used[idx]) {
+        la_uart_puts("  pmem: reject double free ");
+        la_uart_put_hex(addr);
+        la_uart_puts("\n");
+        return;
+    }
+    la_page_used[idx] = 0;
 
     struct la_page_node *node = (struct la_page_node *)page;
     node->next = la_free_list;

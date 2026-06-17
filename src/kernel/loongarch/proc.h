@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include "trap.h"
 
-#define LA_NPROC        16
+#define LA_NPROC        128
 #define LA_KSTACK_SIZE  4096   /* one page per kernel stack */
 
 /* Scheduler time slice in timer ticks (100 Hz → 10 ticks = 100 ms). */
@@ -65,7 +65,7 @@ struct la_pipe {
 
 struct la_fd {
     uint32_t ino;            /* inode number (0 = unused) */
-    uint32_t offset;         /* current read/write offset */
+    uint64_t offset;         /* current read/write offset */
     int type;                /* LA_FD_UNUSED/CONSOLE/FILE/PIPE */
     int writable;            /* 1 = write allowed */
     struct la_pipe *pipe;    /* pipe object (valid when type == LA_FD_PIPE) */
@@ -77,6 +77,7 @@ struct la_fd {
  * CLONE_VM threads point their mm at the leader's __mm so brk/mmap
  * allocators advance a single cursor across the whole thread group. */
 struct la_mm {
+    uint64_t brk_base;         /* lowest valid program break for this image */
     uint64_t heap_top;         /* user heap top (brk grows up from here) */
     uint64_t mmap_top;         /* mmap region (grows up, separate from heap) */
 };
@@ -85,7 +86,7 @@ struct la_mm {
  * When handler == 0: SIG_DFL (default action).
  * When handler == 1: SIG_IGN (ignore).
  * restorer is the user-space trampoline that calls rt_sigreturn. */
-#define LA_NSIG   32
+#define LA_NSIG   64
 #define LA_SIG_DFL 0
 #define LA_SIG_IGN 1
 
@@ -138,6 +139,7 @@ struct la_proc {
     /* User-mode state */
     struct la_trap_frame *tf;  /* user trap frame (separate page) */
     uint64_t *pgtbl;           /* user page table root */
+    uint64_t asid;             /* hardware TLB ASID; shared by CLONE_VM threads */
     struct la_mm __mm;         /* inline address-space state (owned by leader) */
     struct la_mm *mm;          /* points at &__mm normally; for CLONE_VM threads
                                 * points at the leader's __mm */
@@ -204,6 +206,7 @@ void la_proc_wakeup_chan(void *chan);   /* futex channel-keyed wake */
 struct la_proc *la_proc_by_pid(int pid);
 struct la_proc *la_proc_table(void);  /* returns la_procs array */
 void la_proc_free(struct la_proc *p); /* reap a zombie: free pgtbl + kstack, mark UNUSED */
+void la_proc_activate_user_pgtbl(struct la_proc *p);
 
 /* ---- User process helpers ---- */
 struct la_user_entry {
