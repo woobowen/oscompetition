@@ -85,6 +85,8 @@ int socket_recvfrom(socket_t *so, uint64 user_buf, uint32 len, int flags, uint64
 int socket_setsockopt(socket_t *so, int level, int optname, uint64 optval, uint32 optlen);
 int socket_getsockopt(socket_t *so, int level, int optname, uint64 optval, uint64 optlen);
 int socket_shutdown(socket_t *so, int how);
+int socket_get_nonblock(socket_t *so);
+int socket_set_nonblock(socket_t *so, int nonblock);
 int socket_poll_ready(socket_t *so, int events);
 void *socket_wait_channel(void);
 void socket_wait(void);
@@ -112,5 +114,6 @@ void fs_init();
 void device_init();
 bool device_path_lookup(const char *path, uint16 *major);
 bool device_open_check(uint16 major, uint32 open_mode);
+uint32 device_random_bytes(uint32 len, uint64 dst, bool is_user_dst);
 uint32 device_read_data(uint16 major, uint32 len, uint64 dst, bool is_user_dst);
 uint32 device_write_data(uint16 major, uint32 len, uint64 src, bool is_user_src);

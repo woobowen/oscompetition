@@ -14,6 +14,7 @@ void proc_exit(int exit_state);                     // 进程退出
 void proc_yield();                                  // 进程放弃CPU
 void proc_sleep(void *sleep_space, spinlock_t *lk); // 进程睡眠
 void proc_wakeup(void *sleep_space);                // 进程唤醒
+void proc_wakeup_force(void *sleep_space);          // futex/clear_child_tid paths must not miss pre-hint wakeups
 void proc_check_itimers(uint64 now);                // ITIMER_REAL wall-clock expiry
 void proc_sched();                                  // 进程切换到调度器
 void proc_scheduler();                              // 调度器选择合适的进程执行

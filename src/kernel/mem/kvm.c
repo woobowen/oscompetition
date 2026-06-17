@@ -4,6 +4,20 @@
 pgtbl_t kernel_pgtbl;
 uint64 kernel_pgtbl_pa = 0;
 
+extern uint32 buffer_freemem(uint32 buffer_count);
+
+#define VM_RECLAIM_ON_OOM 512
+
+static void *vm_alloc_pgtbl_page(void)
+{
+    void *pa = pmem_alloc(true);
+    if (!pa) {
+        buffer_freemem(VM_RECLAIM_ON_OOM);
+        pa = pmem_alloc(true);
+    }
+    return pa;
+}
+
 // 根据pagetable,找到va对应的pte
 // 若设置alloc=true 则在PTE无效时尝试申请一个物理页
 // 成功返回PTE, 失败返回NULL
@@ -37,7 +51,7 @@ pte_t *vm_getpte(pgtbl_t pgtbl, uint64 va, bool alloc)
             if (!alloc) return NULL;  // 不允许分配，直接返回 NULL
 
             // 允许分配新的页表
-            void *pa = pmem_alloc(true);  
+            void *pa = vm_alloc_pgtbl_page();
             if (!pa) return NULL;
             memset(pa, 0, PGSIZE); 
 
@@ -54,35 +68,40 @@ pte_t *vm_getpte(pgtbl_t pgtbl, uint64 va, bool alloc)
     return &curr[idx];
 }
 
+int vm_try_mappages(pgtbl_t pgtbl, uint64 va, uint64 pa, uint64 len, int perm)
+{
+    if (len == 0)
+        return -1;
+    if (va % PGSIZE != 0 || pa % PGSIZE != 0)
+        return -1;
+    if (va + len > VA_MAX || va + len < va)
+        return -1;
+
+    uint64 end = va + len; 
+    while (va < end) {
+        pte_t *pte = vm_getpte(pgtbl, va, true);
+        if (!pte)
+            return -1;
+        *pte = PA_TO_PTE(pa) | perm | PTE_V;
+        va += PGSIZE;
+        pa += PGSIZE;
+    }
+
+    sfence_vma();
+    return 0;
+}
+
 // 在pgtbl中建立 [va, va + len) -> [pa, pa + len) 的映射
 // 本质是找到va在页表对应位置的pte并修改它
 // 检查: va pa 应当是 page-aligned, len(字节数) > 0, va + len <= VA_MAX
 // 注意: perm 应该如何使用
 void vm_mappages(pgtbl_t pgtbl, uint64 va, uint64 pa, uint64 len, int perm)
 {
-    //参数检查
     if (len == 0)  panic("vm_mappages: len is zero");  // len(字节数) > 0
     if (va % PGSIZE != 0 || pa % PGSIZE != 0)  panic("vm_mappages: va or pa not page-aligned");  // page-aligned
-    if (va + len > VA_MAX)  panic("vm_mappages: virtual address overflow"); // va + len <= VA_MAX
-
-    //逐页映射
-    uint64 end = va + len; 
-    while (va < end) {
-        // Step 1: 获取当前虚拟地址对应的 PTE 指针(如果路径不存在，自动创建中间页表)
-        pte_t *pte = vm_getpte(pgtbl, va, true);
-        if (!pte) { panic("vm_mappages: cannot create PTE (out of memory?)"); }
-
-        // Step 2: 修改 PTE：将物理地址 pa 编码为 PPN 字段，并加上权限和 V 标志
-        *pte = PA_TO_PTE(pa) | perm | PTE_V;
-
-        // Step 3: 前进到下一页
-        va += PGSIZE;
-        pa += PGSIZE;
-    }
-
-    // 页表修改后刷新TLB，避免陈旧映射导致的内存一致性问题
-    sfence_vma();
-
+    if (va + len > VA_MAX || va + len < va)  panic("vm_mappages: virtual address overflow"); // va + len <= VA_MAX
+    if (vm_try_mappages(pgtbl, va, pa, len, perm) < 0)
+        panic("vm_mappages: cannot create PTE (out of memory?)");
 }
 
 // 解除pgtbl中[va, va+len)区域的映射

@@ -19,6 +19,7 @@ void mmap_init()
         node_list[i].next = (i + 1 < N_MMAP) ? &node_list[i + 1] : NULL;
         node_list[i].mmap.begin = 0;
         node_list[i].mmap.npages = 0;
+        node_list[i].mmap.perm = 0;
         node_list[i].mmap.next = NULL;
     }
     list_head.next = &node_list[0];
@@ -43,6 +44,7 @@ mmap_region_t *mmap_region_alloc()
     node->next = NULL;
     node->mmap.begin = 0;
     node->mmap.npages = 0;
+    node->mmap.perm = 0;
     node->mmap.next = NULL;
 
     spinlock_release(&list_lk);

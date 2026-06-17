@@ -50,6 +50,10 @@ bool device_path_lookup(const char *path, uint16 *major)
 		*major = INODE_MAJOR_RTC;
 		return true;
 	}
+	if (device_path_eq(path, "/dev/random") || device_path_eq(path, "/dev/urandom")) {
+		*major = INODE_MAJOR_RANDOM;
+		return true;
+	}
 
 	return false;
 }
@@ -159,6 +163,55 @@ static uint32 device_rtc_write(uint32 len, uint64 src, bool is_user_src)
 	return len;
 }
 
+static spinlock_t lk_random;
+static uint64 random_state;
+
+static uint64 random_next_locked(void)
+{
+	if (random_state == 0)
+		random_state = 0x6a09e667f3bcc909ull ^ r_time();
+	random_state += 0x9e3779b97f4a7c15ull;
+	uint64 z = random_state;
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+	z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+	return z ^ (z >> 31);
+}
+
+uint32 device_random_bytes(uint32 len, uint64 dst, bool is_user_dst)
+{
+	uint8 buf[64];
+	uint32 done = 0;
+	proc_t *p = myproc();
+
+	while (done < len) {
+		uint32 n = MIN((uint32)sizeof(buf), len - done);
+		uint32 produced = 0;
+
+		spinlock_acquire(&lk_random);
+		while (produced < n) {
+			uint64 x = random_next_locked();
+			for (uint32 i = 0; i < sizeof(x) && produced < n; i++) {
+				buf[produced++] = (uint8)(x & 0xff);
+				x >>= 8;
+			}
+		}
+		spinlock_release(&lk_random);
+
+		if (is_user_dst)
+			uvm_copyout(p->pgtbl, dst + done, (uint64)buf, n);
+		else
+			memmove((void *)(dst + done), buf, n);
+		done += n;
+	}
+
+	return done;
+}
+
+static uint32 device_random_read(uint32 len, uint64 dst, bool is_user_dst)
+{
+	return device_random_bytes(len, dst, is_user_dst);
+}
+
 /* 注册设备 */
 static void device_register(uint32 index, char* name,
 	uint32(*read)(uint32, uint64, bool),
@@ -172,6 +225,9 @@ static void device_register(uint32 index, char* name,
 /* 初始化device_table */
 void device_init()
 {
+	spinlock_init(&lk_random, "random");
+	random_state = 0x243f6a8885a308d3ull ^ r_time();
+
 	// 1. 清空表
 	for (int i = 0; i < (int)N_DEVICE; i++) {
 		memset(device_table[i].name, 0, MAXLEN_FILENAME);
@@ -187,6 +243,7 @@ void device_init()
     device_register(INODE_MAJOR_NULL,   "null",   device_null_read,  device_null_write);
     device_register(INODE_MAJOR_GPT0,   "gpt0",   NULL,              device_gpt0_write);
     device_register(INODE_MAJOR_RTC,    "rtc",    device_rtc_read,   device_rtc_write);
+    device_register(INODE_MAJOR_RANDOM, "random", device_random_read, NULL);
 
 	// EXT4 评测盘为只读，不在磁盘上创建 /dev 节点。
 	// /dev/* 路径由 file_open 的虚拟设备映射直接处理。
@@ -215,6 +272,8 @@ void device_init()
         {"/dev/rtc",    INODE_MAJOR_RTC},
         {"/dev/rtc0",   INODE_MAJOR_RTC},
         {"/dev/misc/rtc", INODE_MAJOR_RTC},
+        {"/dev/random", INODE_MAJOR_RANDOM},
+        {"/dev/urandom", INODE_MAJOR_RANDOM},
     };
 
 	for (int i = 0; i < (int)(sizeof(devs) / sizeof(devs[0])); i++) {

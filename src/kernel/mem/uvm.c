@@ -13,7 +13,8 @@ void uvm_copyin(pgtbl_t pgtbl, uint64 dst, uint64 src, uint32 len)
         pte_t *pte = vm_getpte(pgtbl, src, false);
         if (pte == NULL || !(*pte & PTE_V)) {
             proc_t *p = myproc();
-            if (p != NULL) uvm_ustack_grow(pgtbl, p->ustack_npage, src);
+            if (p != NULL && uvm_mmap_handle_fault(pgtbl, src) == (uint64)-1)
+                uvm_ustack_grow(pgtbl, p->ustack_npage, src);
             pte = vm_getpte(pgtbl, src, false);
             if (pte == NULL || !(*pte & PTE_V)) {
                 printf("uvm_copyin: invalid user address src=%p\n", (void *)src);
@@ -47,7 +48,8 @@ void uvm_copyout(pgtbl_t pgtbl, uint64 dst, uint64 src, uint32 len)
             // 目标用户页未映射: 若落在可增长的栈区则按需增长后重试。
             // uvm_ustack_grow 自带范围保护: dst 不在 (MMAP_END, TRAPFRAME) 时返回 -1, 无副作用。
             proc_t *p = myproc();
-            if (p != NULL) uvm_ustack_grow(pgtbl, p->ustack_npage, dst);
+            if (p != NULL && uvm_mmap_handle_fault(pgtbl, dst) == (uint64)-1)
+                uvm_ustack_grow(pgtbl, p->ustack_npage, dst);
             pte = vm_getpte(pgtbl, dst, false);
             if (pte == NULL || !(*pte & PTE_V)) {
                 printf("uvm_copyout: invalid dst=%p syscall=%d a0=%p a1=%p a2=%p\n",
@@ -103,8 +105,65 @@ void uvm_copyin_str(pgtbl_t pgtbl, uint64 dst, uint64 src, uint32 maxlen)
     }
 }
 
-// Update user leaf PTE permissions for an existing mapped range.
-// Return 0 on success, -1 if any page in the range is not mapped as a leaf.
+static mmap_region_t *uvm_mmap_region_at(proc_t *p, uint64 va)
+{
+    if (p == NULL)
+        return NULL;
+    for (mmap_region_t *m = p->mmap; m != NULL; m = m->next) {
+        uint64 begin = m->begin;
+        uint64 end = begin + (uint64)m->npages * PGSIZE;
+        if (va >= begin && va < end)
+            return m;
+    }
+    return NULL;
+}
+
+static int uvm_mmap_split_at(proc_t *p, uint64 split)
+{
+    if (p == NULL || split % PGSIZE != 0)
+        return -1;
+
+    for (mmap_region_t *m = p->mmap; m != NULL; m = m->next) {
+        uint64 begin = m->begin;
+        uint64 end = begin + (uint64)m->npages * PGSIZE;
+
+        if (split <= begin)
+            return 0;
+        if (split >= end)
+            continue;
+
+        mmap_region_t *right = mmap_region_alloc();
+        right->begin = split;
+        right->npages = (uint32)((end - split) / PGSIZE);
+        right->perm = m->perm;
+        right->next = m->next;
+
+        m->npages = (uint32)((split - begin) / PGSIZE);
+        m->next = right;
+        return 0;
+    }
+    return 0;
+}
+
+static void uvm_mmap_merge_adjacent(proc_t *p)
+{
+    if (p == NULL)
+        return;
+
+    for (mmap_region_t *m = p->mmap; m != NULL && m->next != NULL; ) {
+        mmap_region_t *next = m->next;
+        uint64 end = m->begin + (uint64)m->npages * PGSIZE;
+        if (end == next->begin && m->perm == next->perm) {
+            m->npages += next->npages;
+            m->next = next->next;
+            mmap_region_free(next);
+            continue;
+        }
+        m = m->next;
+    }
+}
+
+// Update user PTE permissions. Lazy mmap pages are allowed before allocation.
 int uvm_mprotect(pgtbl_t pgtbl, uint64 begin, uint64 len, int perm)
 {
     if (len == 0)
@@ -112,18 +171,33 @@ int uvm_mprotect(pgtbl_t pgtbl, uint64 begin, uint64 len, int perm)
     if (begin % PGSIZE != 0 || begin + len < begin || begin + len > VA_MAX)
         return -1;
 
+    proc_t *p = myproc();
     uint64 end = begin + len;
     for (uint64 va = begin; va < end; va += PGSIZE) {
         pte_t *pte = vm_getpte(pgtbl, va, false);
-        if (pte == NULL || !(*pte & PTE_V) || PTE_CHECK(*pte))
+        if (pte != NULL && (*pte & PTE_V) && !PTE_CHECK(*pte))
+            continue;
+        if (uvm_mmap_region_at(p, va) == NULL)
             return -1;
+    }
+
+    if (uvm_mmap_split_at(p, begin) < 0 || uvm_mmap_split_at(p, end) < 0)
+        return -1;
+
+    for (mmap_region_t *m = p ? p->mmap : NULL; m != NULL; m = m->next) {
+        uint64 m_begin = m->begin;
+        uint64 m_end = m_begin + (uint64)m->npages * PGSIZE;
+        if (m_begin >= begin && m_end <= end)
+            m->perm = perm;
     }
 
     for (uint64 va = begin; va < end; va += PGSIZE) {
         pte_t *pte = vm_getpte(pgtbl, va, false);
-        *pte = (*pte & ~(PTE_R | PTE_W | PTE_X)) | perm;
+        if (pte != NULL && (*pte & PTE_V) && !PTE_CHECK(*pte))
+            *pte = (*pte & ~(PTE_R | PTE_W | PTE_X)) | perm;
     }
     sfence_vma();
+    uvm_mmap_merge_adjacent(p);
     return 0;
 }
 
@@ -160,6 +234,7 @@ static void mmap_merge(mmap_region_t *mmap_1, mmap_region_t *mmap_2, bool keep_m
     } else {
         mmap_2->begin -= mmap_1->npages * PGSIZE;
         mmap_2->npages += mmap_1->npages;
+        mmap_2->perm = mmap_1->perm;
         mmap_region_free(mmap_1);
     }
 }
@@ -205,7 +280,6 @@ static uint64 uvm_mmap_find(mmap_region_t *head_mmap, uint64 len, mmap_region_t 
 // 在用户页表和进程mmap链里新增mmap区域 [begin, begin + npages * PGSIZE)
 // 调用者保证begin是page-aligned的, 页面权限为perm -> uvm_mmap里面不需要检查是否页对齐
 // 注意: 如果start==0, 意味着需要内核自主找一块足够大的空间
-// 失败则panic卡死
 // 修改为返回起始地址，方便sys_mmap使用
 uint64 uvm_mmap(uint64 begin, uint32 npages, int perm)
 {
@@ -218,12 +292,12 @@ uint64 uvm_mmap(uint64 begin, uint32 npages, int perm)
     if (begin == 0) { // 处理 begin==0 的情况
         begin = uvm_mmap_find(p->mmap, len, &prev, &curr);
         if (begin == 0) { // 未找到合适空间
-            panic("uvm_mmap: no enough mmap space");
+            return (uint64)-1;
         }
     } else {
         // 检查 begin 范围
         if (begin < MMAP_BEGIN || begin + len > MMAP_END) {
-            panic("uvm_mmap: begin out of range");
+            return (uint64)-1;
         }
 
         // 查找 mmap 链表的插入位置：mmap 是按 begin 升序排列的
@@ -234,7 +308,7 @@ uint64 uvm_mmap(uint64 begin, uint32 npages, int perm)
             }
             if (curr->begin + curr->npages * PGSIZE > begin) {
             // 与现有区域重叠：不允许！
-                panic("uvm_mmap: overlapping mmap region"); 
+                return (uint64)-1;
             }
             prev = curr;
             curr = curr->next;
@@ -245,6 +319,7 @@ uint64 uvm_mmap(uint64 begin, uint32 npages, int perm)
     mmap_region_t *node = mmap_region_alloc();
     node->begin = begin;
     node->npages = npages;
+    node->perm = perm;
     node->next = curr; 
 
     // 3. 插入 mmap 链表
@@ -256,28 +331,49 @@ uint64 uvm_mmap(uint64 begin, uint32 npages, int perm)
 
     // 4. 尝试合并
     // 先向后合并：若后继节点紧邻则合并，保留node
-    if (node->next != NULL && node->begin + node->npages * PGSIZE == node->next->begin) {
+    if (node->next != NULL && node->perm == node->next->perm &&
+        node->begin + node->npages * PGSIZE == node->next->begin) {
         mmap_region_t *next_node = node->next; // 暂存即将被合并的节点
         node->next = next_node->next; // 【关键修复】先从链表中摘除 next_node
         mmap_merge(node, next_node, true); // 然后合并并释放 next_node
     }
     // 再向前合并：若前驱节点紧邻则合并，保留前驱节点
-    if (prev != NULL && prev->begin + prev->npages * PGSIZE == node->begin) {
+    if (prev != NULL && prev->perm == node->perm &&
+        prev->begin + prev->npages * PGSIZE == node->begin) {
         prev->next = node->next; // 【关键修复】先从链表中摘除 node
         mmap_merge(prev, node, true); // 然后合并并释放 node
     }
-
-    // 5. 分配并映射物理页
-    for (uint32 i = 0; i < npages; i++) {
-        void *pa = pmem_alloc(false); // 为每一页分配物理页（非内核页）
-        if (!pa) {
-            panic("uvm_mmap: pmem_alloc failed");
-        }
-        memset(pa, 0, PGSIZE); 
-        uint64 va = begin + (uint64)i * PGSIZE;
-        vm_mappages(p->pgtbl, va, (uint64)pa, PGSIZE, perm); // 映射
-    }
     return begin;
+}
+
+uint64 uvm_mmap_handle_fault(pgtbl_t pgtbl, uint64 fault_addr)
+{
+    proc_t *p = myproc();
+    if (p == NULL)
+        return (uint64)-1;
+
+    uint64 va = (fault_addr / PGSIZE) * PGSIZE;
+    for (mmap_region_t *m = p->mmap; m != NULL; m = m->next) {
+        uint64 begin = m->begin;
+        uint64 end = begin + (uint64)m->npages * PGSIZE;
+        if (va < begin || va >= end)
+            continue;
+
+        pte_t *pte = vm_getpte(pgtbl, va, false);
+        if (pte != NULL && (*pte & PTE_V))
+            return (uint64)-1;
+
+        void *pa = pmem_alloc(false);
+        if (pa == NULL)
+            return (uint64)-1;
+        memset(pa, 0, PGSIZE);
+        if (vm_try_mappages(pgtbl, va, (uint64)pa, PGSIZE, m->perm) < 0) {
+            pmem_free((uint64)pa, false);
+            return (uint64)-1;
+        }
+        return va;
+    }
+    return (uint64)-1;
 }
 
 // 在用户页表和进程mmap链里释放mmap区域 [begin, begin + npages * PGSIZE)
@@ -304,7 +400,9 @@ void uvm_munmap(uint64 begin, uint32 npages)
             // 1. 解除交集区间的映射
             for (uint32 i = 0; i < o_npages; i++) {
                 uint64 va = o_begin + (uint64)i * PGSIZE;
-                vm_unmappages(p->pgtbl, va, PGSIZE, true);
+                pte_t *pte = vm_getpte(p->pgtbl, va, false);
+                if (pte != NULL && (*pte & PTE_V) && !PTE_CHECK(*pte))
+                    vm_unmappages(p->pgtbl, va, PGSIZE, true);
             }
 
             // 2. 根据交集在curr中的位置，处理 curr 节点
@@ -314,6 +412,7 @@ void uvm_munmap(uint64 begin, uint32 npages)
                 mmap_region_t *new_node = mmap_region_alloc();
                 new_node->begin = o_end;
                 new_node->npages = (uint32)((c_end - o_end) / PGSIZE);
+                new_node->perm = curr->perm;
                 new_node->next = curr->next;
 
                 curr->npages = (uint32)((o_begin - c_begin) / PGSIZE);
@@ -357,6 +456,15 @@ void uvm_munmap(uint64 begin, uint32 npages)
 
 /*------------------part-3: 用户空间heap和stack管理相关------------------*/
 
+static void uvm_unmap_existing_leaf_pages(pgtbl_t pgtbl, uint64 begin, uint64 end)
+{
+    for (uint64 va = begin; va < end; va += PGSIZE) {
+        pte_t *pte = vm_getpte(pgtbl, va, false);
+        if (pte != NULL && (*pte & PTE_V) && !PTE_CHECK(*pte))
+            vm_unmappages(pgtbl, va, PGSIZE, true);
+    }
+}
+
 // 用户堆空间增加, 返回新的堆顶地址 (注意栈顶最大值限制)
 uint64 uvm_heap_grow(pgtbl_t pgtbl, uint64 cur_heap_top, uint32 len, int flag) 
 {
@@ -368,7 +476,7 @@ uint64 uvm_heap_grow(pgtbl_t pgtbl, uint64 cur_heap_top, uint32 len, int flag)
     uint64 new_pages = (new_top + PGSIZE - 1) / PGSIZE;
 
     // 边界检查：不要越过 mmap 区域开始
-    if (new_pages * PGSIZE > (uint64)MMAP_BEGIN) {
+    if (new_pages * PGSIZE > (uint64)SIGTRAMPOLINE) {
         return (uint64)-1;
     }
 
@@ -376,9 +484,16 @@ uint64 uvm_heap_grow(pgtbl_t pgtbl, uint64 cur_heap_top, uint32 len, int flag)
     for (uint64 p = cur_pages ; p < new_pages; p++) {
         uint64 va = p * PGSIZE;
         void *pa = pmem_alloc(false);
-        if (!pa) return (uint64)-1;
+        if (!pa) {
+            uvm_unmap_existing_leaf_pages(pgtbl, cur_pages * PGSIZE, p * PGSIZE);
+            return (uint64)-1;
+        }
         memset(pa, 0, PGSIZE);
-        vm_mappages(pgtbl, va, (uint64)pa, PGSIZE, flag);
+        if (vm_try_mappages(pgtbl, va, (uint64)pa, PGSIZE, flag) < 0) {
+            pmem_free((uint64)pa, false);
+            uvm_unmap_existing_leaf_pages(pgtbl, cur_pages * PGSIZE, p * PGSIZE);
+            return (uint64)-1;
+        }
     }
 
     return new_top; 
@@ -435,9 +550,18 @@ uint64 uvm_ustack_grow(pgtbl_t pgtbl, uint64 old_ustack_npage, uint64 fault_addr
     for (uint64 i = old_ustack_npage+1 ; i <= need_pages; i++) {
         uint64 va = TRAPFRAME - i* PGSIZE; // 第 i 个栈页的虚拟地址
         void *pa = pmem_alloc(false);
-        if (!pa) return (uint64)-1;
+        if (!pa) {
+            uvm_unmap_existing_leaf_pages(pgtbl, TRAPFRAME - i * PGSIZE,
+                                          TRAPFRAME - old_ustack_npage * PGSIZE);
+            return (uint64)-1;
+        }
         memset(pa, 0, PGSIZE);
-        vm_mappages(pgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W | PTE_U);
+        if (vm_try_mappages(pgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W | PTE_U) < 0) {
+            pmem_free((uint64)pa, false);
+            uvm_unmap_existing_leaf_pages(pgtbl, TRAPFRAME - i * PGSIZE,
+                                          TRAPFRAME - old_ustack_npage * PGSIZE);
+            return (uint64)-1;
+        }
     }
 
     proc_t *p = myproc();
@@ -479,8 +603,14 @@ static void destroy_pgtbl(pgtbl_t pgtbl, uint32 level)
 // 页表销毁
 void uvm_destroy_pgtbl(pgtbl_t pgtbl)
 {
-    vm_unmappages(pgtbl, TRAPFRAME, PGSIZE, true);   // 可以释放，因为trapframe是每个进程独有的
-    vm_unmappages(pgtbl, TRAMPOLINE, PGSIZE, false); // 不能释放，因为所有进程共用区域
+    if (pgtbl == NULL)
+        return;
+    pte_t *tf_pte = vm_getpte(pgtbl, TRAPFRAME, false);
+    if (tf_pte != NULL && (*tf_pte & PTE_V) && !PTE_CHECK(*tf_pte))
+        vm_unmappages(pgtbl, TRAPFRAME, PGSIZE, true);   // 可以释放，因为trapframe是每个进程独有的
+    pte_t *tramp_pte = vm_getpte(pgtbl, TRAMPOLINE, false);
+    if (tramp_pte != NULL && (*tramp_pte & PTE_V) && !PTE_CHECK(*tramp_pte))
+        vm_unmappages(pgtbl, TRAMPOLINE, PGSIZE, false); // 不能释放，因为所有进程共用区域
     destroy_pgtbl(pgtbl, 3);
 }
 
@@ -504,8 +634,14 @@ static void destroy_shared_pgtbl_walk(pgtbl_t pgtbl, uint32 level)
 
 void uvm_destroy_shared_pgtbl(pgtbl_t pgtbl)
 {
-    vm_unmappages(pgtbl, TRAPFRAME, PGSIZE, true);
-    vm_unmappages(pgtbl, TRAMPOLINE, PGSIZE, false);
+    if (pgtbl == NULL)
+        return;
+    pte_t *tf_pte = vm_getpte(pgtbl, TRAPFRAME, false);
+    if (tf_pte != NULL && (*tf_pte & PTE_V) && !PTE_CHECK(*tf_pte))
+        vm_unmappages(pgtbl, TRAPFRAME, PGSIZE, true);
+    pte_t *tramp_pte = vm_getpte(pgtbl, TRAMPOLINE, false);
+    if (tramp_pte != NULL && (*tramp_pte & PTE_V) && !PTE_CHECK(*tramp_pte))
+        vm_unmappages(pgtbl, TRAMPOLINE, PGSIZE, false);
     destroy_shared_pgtbl_walk(pgtbl, 3);
 }
 
@@ -530,39 +666,125 @@ static int copy_range(pgtbl_t old, pgtbl_t new, uint64 begin, uint64 end)
         if (page == 0)
             return -1;
         memmove((char *)page, (const char *)pa, PGSIZE);
-        vm_mappages(new, va, page, PGSIZE, flags);
+        if (vm_try_mappages(new, va, page, PGSIZE, flags) < 0) {
+            pmem_free(page, false);
+            return -1;
+        }
     }
     return 0;
 }
+
+static int copy_range_sparse_walk(pgtbl_t old, pgtbl_t new, uint64 begin, uint64 end, int level, uint64 base);
 
 // 稀疏复制：跳过未映射的页
 static int copy_range_sparse(pgtbl_t old, pgtbl_t new, uint64 begin, uint64 end)
 {
-    for (uint64 va = begin; va < end; va += PGSIZE) {
-        pte_t *pte = vm_getpte(old, va, false);
-        if (!pte || !(*pte & PTE_V))
+    if (begin >= end)
+        return 0;
+    if (begin % PGSIZE != 0 || end % PGSIZE != 0 || end > VA_MAX || end < begin)
+        return -1;
+
+    return copy_range_sparse_walk(old, new, begin, end, 2, 0);
+}
+
+static int copy_range_sparse_walk(pgtbl_t old, pgtbl_t new, uint64 begin, uint64 end, int level, uint64 base)
+{
+    if (old == NULL)
+        return 0;
+
+    uint64 span = 1UL << VA_SHIFT(level);
+    int entries = PGSIZE / sizeof(pte_t);
+
+    for (int i = 0; i < entries; i++) {
+        uint64 entry_begin = base + (uint64)i * span;
+        if (entry_begin >= end)
+            break;
+        uint64 entry_end = entry_begin + span;
+        if (entry_end <= begin)
             continue;
-        uint64 pa = (uint64)PTE_TO_PA(*pte);
-        int flags = (int)PTE_FLAGS(*pte);
-        uint64 page = (uint64)pmem_alloc(false);
-        if (page == 0)
+
+        pte_t pte = old[i];
+        if (!(pte & PTE_V))
+            continue;
+
+        if (level == 0 || !PTE_CHECK(pte)) {
+            uint64 pa = (uint64)PTE_TO_PA(pte);
+            int flags = (int)PTE_FLAGS(pte);
+            uint64 va = entry_begin > begin ? entry_begin : begin;
+            uint64 va_end = entry_end < end ? entry_end : end;
+
+            for (; va < va_end; va += PGSIZE) {
+                if (va == SIGTRAMPOLINE)
+                    continue;
+                uint64 page = (uint64)pmem_alloc(false);
+                if (page == 0)
+                    return -1;
+                memmove((char *)page, (const char *)(pa + (va - entry_begin)), PGSIZE);
+                if (vm_try_mappages(new, va, page, PGSIZE, flags) < 0) {
+                    pmem_free(page, false);
+                    return -1;
+                }
+            }
+            continue;
+        }
+
+        if (copy_range_sparse_walk((pgtbl_t)PTE_TO_PA(pte), new, begin, end, level - 1, entry_begin) < 0)
             return -1;
-        memmove((char *)page, (const char *)pa, PGSIZE);
-        vm_mappages(new, va, page, PGSIZE, flags);
     }
     return 0;
 }
 
-static void share_range_sparse(pgtbl_t old, pgtbl_t new, uint64 begin, uint64 end)
+static int share_range_sparse_walk(pgtbl_t old, pgtbl_t new, uint64 begin, uint64 end, int level, uint64 base);
+
+static int share_range_sparse(pgtbl_t old, pgtbl_t new, uint64 begin, uint64 end)
 {
-    for (uint64 va = begin; va < end; va += PGSIZE) {
-        pte_t *pte = vm_getpte(old, va, false);
-        if (!pte || !(*pte & PTE_V))
+    if (begin >= end)
+        return 0;
+    if (begin % PGSIZE != 0 || end % PGSIZE != 0 || end > VA_MAX || end < begin)
+        return -1;
+
+    return share_range_sparse_walk(old, new, begin, end, 2, 0);
+}
+
+static int share_range_sparse_walk(pgtbl_t old, pgtbl_t new, uint64 begin, uint64 end, int level, uint64 base)
+{
+    if (old == NULL)
+        return 0;
+
+    uint64 span = 1UL << VA_SHIFT(level);
+    int entries = PGSIZE / sizeof(pte_t);
+
+    for (int i = 0; i < entries; i++) {
+        uint64 entry_begin = base + (uint64)i * span;
+        if (entry_begin >= end)
+            break;
+        uint64 entry_end = entry_begin + span;
+        if (entry_end <= begin)
             continue;
-        uint64 pa = (uint64)PTE_TO_PA(*pte);
-        int flags = (int)PTE_FLAGS(*pte);
-        vm_mappages(new, va, pa, PGSIZE, flags);
+
+        pte_t pte = old[i];
+        if (!(pte & PTE_V))
+            continue;
+
+        if (level == 0 || !PTE_CHECK(pte)) {
+            uint64 pa = (uint64)PTE_TO_PA(pte);
+            int flags = (int)PTE_FLAGS(pte);
+            uint64 va = entry_begin > begin ? entry_begin : begin;
+            uint64 va_end = entry_end < end ? entry_end : end;
+
+            for (; va < va_end; va += PGSIZE) {
+                if (va == SIGTRAMPOLINE)
+                    continue;
+                if (vm_try_mappages(new, va, pa + (va - entry_begin), PGSIZE, flags) < 0)
+                    return -1;
+            }
+            continue;
+        }
+
+        if (share_range_sparse_walk((pgtbl_t)PTE_TO_PA(pte), new, begin, end, level - 1, entry_begin) < 0)
+            return -1;
     }
+    return 0;
 }
 
 // 拷贝页表 (拷贝并不包括 trapframe 和 trampoline)
@@ -592,7 +814,7 @@ int uvm_copy_pgtbl(pgtbl_t old, pgtbl_t new, uint64 heap_top, uint64 ustack_npag
         uint64 begin = m->begin;
         uint64 end = m->begin + (uint64)m->npages * PGSIZE;
         if (end > begin) {
-            if (copy_range(old, new, begin, end) < 0)
+            if (copy_range_sparse(old, new, begin, end) < 0)
                 return -1;
         }
         m = m->next;
@@ -610,31 +832,32 @@ int uvm_copy_pgtbl(pgtbl_t old, pgtbl_t new, uint64 heap_top, uint64 ustack_npag
     return 0;
 }
 
-void uvm_share_pgtbl(pgtbl_t old, pgtbl_t new, uint64 heap_top, uint64 ustack_npage, mmap_region_t *mmap)
+int uvm_share_pgtbl(pgtbl_t old, pgtbl_t new, uint64 heap_top, uint64 ustack_npage, mmap_region_t *mmap)
 {
     if (heap_top > PGSIZE) {
         uint64 begin = PGSIZE;
         uint64 end = ((heap_top + PGSIZE - 1) / PGSIZE) * PGSIZE;
-        if (end > begin)
-            share_range_sparse(old, new, begin, end);
+        if (end > begin && share_range_sparse(old, new, begin, end) < 0)
+            return -1;
     }
 
     uint64 interp_begin = ((heap_top + PGSIZE - 1) / PGSIZE) * PGSIZE;
-    if (interp_begin < MMAP_BEGIN)
-        share_range_sparse(old, new, interp_begin, MMAP_BEGIN);
+    if (interp_begin < MMAP_BEGIN && share_range_sparse(old, new, interp_begin, MMAP_BEGIN) < 0)
+        return -1;
 
     mmap_region_t *m = mmap;
     while (m != NULL) {
         uint64 begin = m->begin;
         uint64 end = m->begin + (uint64)m->npages * PGSIZE;
-        if (end > begin)
-            share_range_sparse(old, new, begin, end);
+        if (end > begin && share_range_sparse(old, new, begin, end) < 0)
+            return -1;
         m = m->next;
     }
 
     if (ustack_npage > 0) {
         uint64 begin = TRAPFRAME - ustack_npage * PGSIZE;
-        if (TRAPFRAME > begin)
-            share_range_sparse(old, new, begin, TRAPFRAME);
+        if (TRAPFRAME > begin && share_range_sparse(old, new, begin, TRAPFRAME) < 0)
+            return -1;
     }
+    return 0;
 }

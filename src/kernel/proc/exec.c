@@ -16,7 +16,9 @@
 
 #define ELF_PT_INTERP 3
 #define ELF_PT_PHDR   6
+#define ELF_TYPE_DYN  3
 
+#define PIE_LOAD_BASE 0x10000UL
 #define INTERP_LOAD_BASE 0x40000000UL
 
 typedef struct {
@@ -24,6 +26,7 @@ typedef struct {
     uint16 phnum;
     uint16 phent;
     uint64 entry;
+    uint64 load_bias;
     uint64 interp_base;
     uint64 interp_entry;
     char   interp_path[128];
@@ -95,11 +98,24 @@ static int load_segment(inode_t *ip, pgtbl_t pgtbl,
     return 0;
 }
 
+static void prepare_heap_fail(const char *reason, uint64 va, uint64 len)
+{
+    uint32 kernel_free_pages = 0;
+    uint32 user_free_pages = 0;
+    proc_t *p = myproc();
+
+    pmem_stat(&kernel_free_pages, &user_free_pages);
+    printf("prepare_heap: pid=%d %s va=%p len=%p free(k=%d,u=%d)\n",
+           p ? p->pid : -1, reason, (void *)va, (void *)len,
+           kernel_free_pages, user_free_pages);
+}
+
 /* 将程序的代码区和数据区读入用户堆中, 返回new_heap_top */
 static uint64 prepare_heap(pgtbl_t new_pgtbl, inode_t *ip, elf_header_t *eh, exec_info_t *info)
 {
     program_header_t ph;
     uint64 new_heap_top = USER_BASE, old_heap_top = USER_BASE;
+    uint64 load_bias = info->load_bias;
     uint64 first_load_va = 0;
     uint64 first_load_off = 0;
     int has_first_load = 0;
@@ -111,11 +127,13 @@ static uint64 prepare_heap(pgtbl_t new_pgtbl, inode_t *ip, elf_header_t *eh, exe
 
     for (uint32 off = eh->ph_off; off < eh->ph_off + eh->ph_ent_num * sizeof(ph); off += sizeof(ph))
     {
-        if (inode_read_data(ip, off, sizeof(ph), &ph, false) != sizeof(ph))
+        if (inode_read_data(ip, off, sizeof(ph), &ph, false) != sizeof(ph)) {
+            prepare_heap_fail("read phdr failed", off, sizeof(ph));
             return -1;
+        }
 
         if (ph.type == ELF_PT_PHDR) {
-            info->phdr_addr = ph.va;
+            info->phdr_addr = load_bias + ph.va;
             continue;
         }
 
@@ -132,18 +150,27 @@ static uint64 prepare_heap(pgtbl_t new_pgtbl, inode_t *ip, elf_header_t *eh, exe
         if (ph.type != ELF_PROG_LOAD)
             continue;
 
-        if (ph.mem_size < ph.file_size)
+        if (ph.mem_size < ph.file_size) {
+            prepare_heap_fail("filesz exceeds memsz", ph.va, ph.file_size);
             return -1;
-        if (ph.va + ph.mem_size < ph.va)
+        }
+        if (ph.va + ph.mem_size < ph.va) {
+            prepare_heap_fail("segment overflow", ph.va, ph.mem_size);
             return -1;
-        if (ph.va < USER_BASE || ph.va + ph.mem_size > MMAP_BEGIN) {
+        }
+        uint64 seg_va = load_bias + ph.va;
+        if (seg_va < ph.va || seg_va + ph.mem_size < seg_va) {
+            prepare_heap_fail("biased segment overflow", seg_va, ph.mem_size);
+            return -1;
+        }
+        if (seg_va < USER_BASE || seg_va + ph.mem_size > MMAP_BEGIN) {
             printf("proc_prepare_heap: ph_idx=%d va %p mem_size %p out of user range\n",
-                   (int)((off - eh->ph_off) / sizeof(ph)), (void*)ph.va, (void*)ph.mem_size);
+                   (int)((off - eh->ph_off) / sizeof(ph)), (void*)seg_va, (void*)ph.mem_size);
             return -1;
         }
 
         if (!has_first_load) {
-            first_load_va = ph.va;
+            first_load_va = seg_va;
             first_load_off = ph.off;
             has_first_load = 1;
         }
@@ -154,20 +181,25 @@ static uint64 prepare_heap(pgtbl_t new_pgtbl, inode_t *ip, elf_header_t *eh, exe
         if(ph.flags & ELF_PROG_FLAG_EXEC) perm |= PTE_X;
 
         // 段地址必须单调递增，否则 len 下溢成天文数字，会 OOM panic
-        if (ph.va < old_heap_top) {
+        if (seg_va < old_heap_top) {
             printf("prepare_heap: va=%p < old_heap_top=%p, out of order segment\n",
-                   (void*)ph.va, (void*)old_heap_top);
+                   (void*)seg_va, (void*)old_heap_top);
             return -1;
         }
 
         new_heap_top = uvm_heap_grow(new_pgtbl, old_heap_top,
-                        ph.va + ph.mem_size - old_heap_top, perm);
-        if (new_heap_top != ph.va + ph.mem_size)
+                        seg_va + ph.mem_size - old_heap_top, perm);
+        if (new_heap_top != seg_va + ph.mem_size) {
+            prepare_heap_fail("uvm_heap_grow failed",
+                              old_heap_top, seg_va + ph.mem_size - old_heap_top);
             return -1;
+        }
         old_heap_top = new_heap_top;
 
-        if (load_segment(ip, new_pgtbl, ph.off, ph.va, ph.file_size) < 0)
+        if (load_segment(ip, new_pgtbl, ph.off, seg_va, ph.file_size) < 0) {
+            prepare_heap_fail("load_segment failed", seg_va, ph.file_size);
             return -1;
+        }
     }
 
     if (info->phdr_addr == 0 && has_first_load) {
@@ -191,7 +223,10 @@ static uint64 prepare_stack(pgtbl_t new_pgtbl, char **argv, char **envp,
     if (!ustack_page)
         return -1;
     memset((void *)ustack_page, 0, PGSIZE);
-    vm_mappages(new_pgtbl, sp_base, ustack_page, PGSIZE, PTE_R | PTE_W | PTE_U);
+    if (vm_try_mappages(new_pgtbl, sp_base, ustack_page, PGSIZE, PTE_R | PTE_W | PTE_U) < 0) {
+        pmem_free(ustack_page, false);
+        return -1;
+    }
 
     for (argc = 0; argv[argc] != NULL; argc++) {
         if (argc >= ELF_MAXARGS)
@@ -272,6 +307,8 @@ static uint64 load_interp(pgtbl_t pgtbl, char *interp_path, uint64 base)
     };
 
     inode_t *ip = path_to_inode(interp_path);
+    if (!ip && exec_basename_is(interp_path, "ld-linux-riscv64-lp64d.so.1"))
+        ip = path_to_inode("/glibc/lib/ld-linux-riscv64-lp64d.so.1");
     if (!ip) {
         for (int i = 0; i < 4; i++) {
             ip = path_to_inode((char*)fallbacks[i]);
@@ -318,7 +355,11 @@ static uint64 load_interp(pgtbl_t pgtbl, char *interp_path, uint64 base)
                 return -1;
             }
             memset(pa, 0, PGSIZE);
-            vm_mappages(pgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W | PTE_X | PTE_U);
+            if (vm_try_mappages(pgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W | PTE_X | PTE_U) < 0) {
+                pmem_free((uint64)pa, false);
+                inode_put(ip);
+                return -1;
+            }
         }
 
         if (load_segment(ip, pgtbl, ph.off, seg_va, ph.file_size) < 0) {
@@ -523,6 +564,33 @@ static void close_cloexec_files(proc_t *p)
     }
 }
 
+static void exec_free_mmap_list(mmap_region_t *mmap)
+{
+    while (mmap != NULL) {
+        mmap_region_t *next = mmap->next;
+        mmap_region_free(mmap);
+        mmap = next;
+    }
+}
+
+static void exec_destroy_old_vm(proc_t *p)
+{
+    uint8 shared_vm = p->shared_vm;
+
+    if (p->pgtbl != NULL) {
+        if (shared_vm)
+            uvm_destroy_shared_pgtbl(p->pgtbl);
+        else
+            uvm_destroy_pgtbl(p->pgtbl);
+    }
+    if (!shared_vm && p->mmap != NULL)
+        exec_free_mmap_list(p->mmap);
+
+    p->pgtbl = NULL;
+    p->tf = NULL;
+    p->mmap = NULL;
+}
+
 /*
     执行ELF文件
     输入路径和参数
@@ -622,17 +690,26 @@ static int proc_exec_with_env(char *path, char **argv, char **envp)
             return -1;
         }
     }
-    /* Basic sanity check: entry must be in user space */
-    if (eh.entry < USER_BASE || eh.entry >= TRAMPOLINE) {
+    uint64 load_bias = (eh.type == ELF_TYPE_DYN) ? PIE_LOAD_BASE : 0;
+    uint64 main_entry = load_bias + eh.entry;
+    if (main_entry < eh.entry) {
         inode_put(ip);
         uvm_destroy_pgtbl(new_pgtbl);
-        printf("proc_exec: pid=%d ELF entry %p out of user range\n", p ? p->pid : -1, (void*)eh.entry);
+        printf("proc_exec: pid=%d ELF entry overflow\n", p ? p->pid : -1);
+        return -1;
+    }
+    /* Basic sanity check: relocated entry must be in user space */
+    if (main_entry < USER_BASE || main_entry >= TRAMPOLINE) {
+        inode_put(ip);
+        uvm_destroy_pgtbl(new_pgtbl);
+        printf("proc_exec: pid=%d ELF entry %p out of user range\n", p ? p->pid : -1, (void*)main_entry);
         return -1;
     }
     
     // step-3: 按照顺序读取需要载入内存的Segment, 填充到用户堆区域
     exec_info_t dyn;
     memset(&dyn, 0, sizeof(dyn));
+    dyn.load_bias = load_bias;
     uint64 new_heap_top = prepare_heap(new_pgtbl, ip, &eh, &dyn);
     if (new_heap_top == -1) {
         inode_put(ip);
@@ -645,10 +722,10 @@ static int proc_exec_with_env(char *path, char **argv, char **envp)
     inode_put(ip);
 
     // step-4b: 如果有动态链接器, 加载它
-    dyn.entry = eh.entry;
+    dyn.entry = main_entry;
     dyn.interp_base = 0;
     dyn.interp_entry = 0;
-    uint64 entry_pc = eh.entry;
+    uint64 entry_pc = main_entry;
     if (dyn.interp_path[0] != '\0') {
         uint64 ie = load_interp(new_pgtbl, dyn.interp_path, INTERP_LOAD_BASE);
         if (ie == (uint64)-1) {
@@ -672,19 +749,15 @@ static int proc_exec_with_env(char *path, char **argv, char **envp)
 
     // step-6: 新的地址空间构建完毕, 释放旧资源
     close_cloexec_files(p);
-    uvm_destroy_pgtbl(p->pgtbl);
-    if (p->mmap) {
-        mmap_region_t *mmap = p->mmap;
-        while (mmap) {
-            mmap_region_t *next = mmap->next;
-            mmap_region_free(mmap);
-            mmap = next;
-        }
-    }
+    exec_destroy_old_vm(p);
 
     // step-7: 设置trapframe的相关字段
-    new_tf->a0 = argc;
-    new_tf->a1 = sp;
+    // RISC-V ELF startup code reads argc/argv/envp from the stack.  glibc
+    // treats entry a0 as rtld_fini, so passing argc there makes exit call a
+    // low bogus function pointer.
+    new_tf->a0 = 0;
+    new_tf->a1 = 0;
+    new_tf->a2 = 0;
     new_tf->user_to_kern_epc = entry_pc;
     new_tf->sp = sp;          
     
@@ -808,16 +881,25 @@ int proc_exec_target(int pid, char *path, char **argv)
             goto exec_fail;
         }
     }
-    /* Basic sanity check: entry must be in user space */
-    if (eh.entry < USER_BASE || eh.entry >= TRAMPOLINE) {
+    uint64 load_bias = (eh.type == ELF_TYPE_DYN) ? PIE_LOAD_BASE : 0;
+    uint64 main_entry = load_bias + eh.entry;
+    if (main_entry < eh.entry) {
         inode_put(ip);
         uvm_destroy_pgtbl(new_pgtbl);
-        printf("proc_exec_target: pid=%d ELF entry %p out of user range\n", p ? p->pid : -1, (void*)eh.entry);
+        printf("proc_exec_target: pid=%d ELF entry overflow\n", p ? p->pid : -1);
+        goto exec_fail;
+    }
+    /* Basic sanity check: relocated entry must be in user space */
+    if (main_entry < USER_BASE || main_entry >= TRAMPOLINE) {
+        inode_put(ip);
+        uvm_destroy_pgtbl(new_pgtbl);
+        printf("proc_exec_target: pid=%d ELF entry %p out of user range\n", p ? p->pid : -1, (void*)main_entry);
         goto exec_fail;
     }
 
     exec_info_t dyn;
     memset(&dyn, 0, sizeof(dyn));
+    dyn.load_bias = load_bias;
     uint64 new_heap_top = prepare_heap(new_pgtbl, ip, &eh, &dyn);
     if (new_heap_top == (uint64)-1) {
         inode_put(ip);
@@ -827,10 +909,10 @@ int proc_exec_target(int pid, char *path, char **argv)
 
     inode_put(ip);
 
-    dyn.entry = eh.entry;
+    dyn.entry = main_entry;
     dyn.interp_base = 0;
     dyn.interp_entry = 0;
-    uint64 entry_pc = eh.entry;
+    uint64 entry_pc = main_entry;
     if (dyn.interp_path[0] != '\0') {
         uint64 ie = load_interp(new_pgtbl, dyn.interp_path, INTERP_LOAD_BASE);
         if (ie == (uint64)-1) {
@@ -852,19 +934,12 @@ int proc_exec_target(int pid, char *path, char **argv)
 
     /* 释放旧资源 */
     close_cloexec_files(p);
-    uvm_destroy_pgtbl(p->pgtbl);
-    if (p->mmap) {
-        mmap_region_t *mmap = p->mmap;
-        while (mmap) {
-            mmap_region_t *next = mmap->next;
-            mmap_region_free(mmap);
-            mmap = next;
-        }
-    }
+    exec_destroy_old_vm(p);
 
     /* 设置trapframe与进程字段 */
-    new_tf->a0 = argc;
-    new_tf->a1 = sp;
+    new_tf->a0 = 0;
+    new_tf->a1 = 0;
+    new_tf->a2 = 0;
     new_tf->user_to_kern_epc = entry_pc;
     new_tf->sp = sp;
 

@@ -3,9 +3,11 @@
 static buffer_node_t buf_cache[N_BUFFER];
 static buffer_node_t buf_head_active, buf_head_inactive;
 static spinlock_t lk_buf_cache;
+static bool buf_cache_ready;
 
 // 优化：哈希表索引（链式哈希，桶数组 + 每节点的哈希next）
 #define BUFFER_HASH_SIZE 61
+#define BUFFER_RECLAIM_ON_OOM 512
 static buffer_node_t *buf_hash[BUFFER_HASH_SIZE];
 static buffer_node_t *hash_next[N_BUFFER];
 
@@ -39,6 +41,23 @@ static buffer_node_t* hash_find(uint32 block_num) {
 	return NULL;
 }
 
+static uint32 buffer_reclaim_locked(uint32 buffer_count, buffer_node_t *skip)
+{
+	uint32 freed = 0;
+	for (buffer_node_t *node = buf_head_inactive.prev; node != &buf_head_inactive && freed < buffer_count; node = node->prev) {
+		if (node == skip)
+			continue;
+		if (node->buf.ref == 0 && node->buf.data != NULL) {
+			pmem_free((uint64)node->buf.data, true);
+			node->buf.data = NULL;
+			node->buf.valid = false;
+			hash_remove(node);
+			node->buf.block_num = BLOCK_NUM_UNUSED;
+			freed++;
+		}
+	}
+	return freed;
+}
 
 /* 
 	将一个节点拿出来并插入
@@ -81,6 +100,8 @@ static void insert_node(buffer_node_t *node, bool insert_active, bool insert_nex
 */
 void buffer_init()
 {
+	buf_cache_ready = false;
+
 	// 初始化两个链表头为自环
 	buf_head_active.next = &buf_head_active;
 	buf_head_active.prev = &buf_head_active;
@@ -99,9 +120,11 @@ void buffer_init()
 		node->buf.ref = 0;
 		node->buf.data = NULL;
 		node->buf.disk = false;
+		node->buf.valid = false;
 		sleeplock_init(&node->buf.slk, "buffer");
 		insert_node(node, /*active*/false, /*insert_next*/true);
 	}
+	buf_cache_ready = true;
 }
 
 /* 磁盘读取: block -> buf */
@@ -130,16 +153,22 @@ buffer_t* buffer_get(uint32 block_num)
 	if (node) {
 		insert_node(node, /*active*/true, /*insert_next*/true);
 		node->buf.ref++;
-		int need_read=0;
 		if (node->buf.data == NULL) {  // 检查是否需要补页
 			uint64 pa = (uint64)pmem_alloc(true);
+			if (pa == 0) {
+				buffer_reclaim_locked(BUFFER_RECLAIM_ON_OOM, node);
+				pa = (uint64)pmem_alloc(true);
+			}
 			assert(pa != 0, "buffer_get: pmem_alloc failed");
 			node->buf.data = (uint8*)pa;
-			need_read=1; // 还要读磁盘数据
+			node->buf.valid = false;
 		}
 		spinlock_release(&lk_buf_cache);
 		sleeplock_acquire(&node->buf.slk);
-		if (need_read) buffer_read(&node->buf);
+		if (!node->buf.valid) {
+			buffer_read(&node->buf);
+			node->buf.valid = true;
+		}
 		return &node->buf;
 	}
 	// 2) 未命中：选择不活跃链表中最不活跃的替换
@@ -150,6 +179,10 @@ buffer_t* buffer_get(uint32 block_num)
 	// 如无物理页则分配
 	if (victim->buf.data == NULL) {
 		uint64 pa = (uint64)pmem_alloc(true);
+		if (pa == 0) {
+			buffer_reclaim_locked(BUFFER_RECLAIM_ON_OOM, victim);
+			pa = (uint64)pmem_alloc(true);
+		}
 		assert(pa != 0, "buffer_get: pmem_alloc failed (victim)");
 		victim->buf.data = (uint8*)pa;
 	}
@@ -157,6 +190,7 @@ buffer_t* buffer_get(uint32 block_num)
 	// 维护哈希：移除旧映射，插入新映射
 	hash_remove(victim);
 	victim->buf.block_num = block_num;
+	victim->buf.valid = false;
 	hash_insert(victim);
 
 	// 移动到活跃链表尾并增加引用
@@ -166,7 +200,10 @@ buffer_t* buffer_get(uint32 block_num)
 
 	// 加锁并进行磁盘读取
 	sleeplock_acquire(&victim->buf.slk);
-	buffer_read(&victim->buf);
+	if (!victim->buf.valid) {
+		buffer_read(&victim->buf);
+		victim->buf.valid = true;
+	}
 	return &victim->buf;
 }
 
@@ -193,18 +230,11 @@ void buffer_put(buffer_t *buf)
 */
 uint32 buffer_freemem(uint32 buffer_count)
 {
+	if (!buf_cache_ready)
+		return 0;
+
 	spinlock_acquire(&lk_buf_cache);
-	uint32 freed = 0;
-	for (buffer_node_t *node = buf_head_inactive.prev; node != &buf_head_inactive && freed < buffer_count; node = node->prev) {
-		// 处理无人引用的缓冲
-		if (node->buf.ref == 0 && node->buf.data != NULL) {
-			pmem_free((uint64)node->buf.data, true);
-			node->buf.data = NULL;
-			hash_remove(node); // 从哈希表移除
-			node->buf.block_num = BLOCK_NUM_UNUSED; 
-			freed++;
-		}
-	}
+	uint32 freed = buffer_reclaim_locked(buffer_count, NULL);
 	spinlock_release(&lk_buf_cache);
 	return freed;
 }

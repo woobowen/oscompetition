@@ -42,6 +42,7 @@
 #define SYS_rt_sigreturn 139     // Linux/RISC-V rt_sigreturn
 #define SYS_setgid 144           // 暂桩返回 0
 #define SYS_setuid 146           // 暂桩返回 0
+#define SYS_setsid 157           // Linux/RISC-V setsid
 #define SYS_getuid 174           // 返回 0 (root)
 #define SYS_getgid 176           // 返回 0
 #define SYS_writev 66            // Linux/RISC-V writev
@@ -73,6 +74,8 @@
 #define SYS_clock_nanosleep 115  // Linux/RISC-V clock_nanosleep
 #define SYS_syslog 116           // Linux/RISC-V syslog/klogctl
 #define SYS_kill 129             // Linux/RISC-V kill
+#define SYS_tkill 130            // Linux/RISC-V tkill
+#define SYS_tgkill 131           // Linux/RISC-V tgkill
 #define SYS_sysinfo 179          // Linux/RISC-V sysinfo
 #define SYS_madvise 233          // Linux/RISC-V madvise
 #define SYS_readlinkat 78        // Linux/RISC-V readlinkat
@@ -107,6 +110,7 @@
 #define SYS_accept4 242          // Linux/RISC-V accept4
 #define SYS_get_mempolicy 236    // Linux/RISC-V get_mempolicy
 #define SYS_prlimit64 261        // Linux/RISC-V prlimit64
+#define SYS_getrandom 278        // Linux/RISC-V getrandom
 
 #define SYS_schedstat 500        // SeaOS 私有: 拉取调度统计快照
 #define SYS_spawn     501        // SeaOS 私有: fork+exec+wait 串行执行程序
