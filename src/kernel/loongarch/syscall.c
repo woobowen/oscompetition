@@ -1403,6 +1403,16 @@ static uint64_t sys_futex(struct la_trap_frame *tf)
          * intervening swtch, and only wakeup_chan flips futex sleepers back
          * to RUNNABLE.  The caller (musl) re-validates *uaddr after wake. */
         la_proc_sleep_chan((void *)uaddr);
+
+        /* If woken by a signal (tkill/tgkill sets sig_pending + RUNNABLE),
+         * return EINTR so that musl checks its pthread cancel flag.  Without
+         * this, pthread_cancel will time out — the target thread wakes but
+         * doesn't know it was signalled. */
+        {
+            struct la_proc *me = la_current_proc();
+            if (me && me->sig_pending)
+                return (uint64_t)(-LA_EINTR);
+        }
         return 0;
     }
 
@@ -1700,7 +1710,13 @@ static void la_cancel_thread_signal(struct la_proc *target, int sig)
 }
 
 /* SYS_tkill(130): send a signal to a specific thread id.
- * a0 = tid, a1 = sig.  Used by musl pthread_cancel for SIGCANCEL. */
+ * a0 = tid, a1 = sig.  Used by musl pthread_cancel for SIGCANCEL.
+ *
+ * Treat ALL signals uniformly: set the pending bit and wake the target
+ * if it's sleeping.  Normal signal delivery (la_signal_deliver) handles
+ * the rest when the target returns to user mode.  The old sig >= 32
+ * fast-kill path bypassed musl's cancellation handlers and could leave
+ * pthread_join waiters stuck. */
 static uint64_t sys_tkill(struct la_trap_frame *tf)
 {
     int tid = (int)tf->gpr[LA_GPR_A0];
@@ -1715,11 +1731,6 @@ static uint64_t sys_tkill(struct la_trap_frame *tf)
     if (sig == 0)
         return 0;
 
-    if (sig >= 32) {
-        la_cancel_thread_signal(target, sig);
-        return 0;
-    }
-
     target->sig_pending |= (1UL << sig);
     if (target->state == LA_PROC_SLEEPING)
         target->state = LA_PROC_RUNNABLE;
@@ -1727,7 +1738,8 @@ static uint64_t sys_tkill(struct la_trap_frame *tf)
 }
 
 /* SYS_tgkill(131): send a signal to a specific thread.
- * a0 = tgid, a1 = tid, a2 = sig.  Simplified — same as kill(tid, sig). */
+ * a0 = tgid, a1 = tid, a2 = sig.  All signals go through sig_pending —
+ * see sys_tkill for rationale. */
 static uint64_t sys_tgkill(struct la_trap_frame *tf)
 {
     /* int tgid = (int)tf->gpr[LA_GPR_A0]; */  /* ignored */
@@ -1737,11 +1749,6 @@ static uint64_t sys_tgkill(struct la_trap_frame *tf)
 
     struct la_proc *target = la_proc_by_pid(tid);
     if (!target) return (uint64_t)(-LA_ESRCH);
-
-    if (sig >= 32) {
-        la_cancel_thread_signal(target, sig);
-        return 0;
-    }
 
     target->sig_pending |= (1UL << sig);
     if (target->state == LA_PROC_SLEEPING)
@@ -3376,6 +3383,12 @@ static uint64_t sys_nanosleep(struct la_trap_frame *tf)
     uint64_t start = la_timer_get_ticks();
     while (la_timer_get_ticks() - start < total_ticks) {
         la_proc_sleep();   /* ~10ms per tick; scheduler runs other procs */
+        /* Break out early if a signal arrived (pthread_cancel, etc.) */
+        {
+            struct la_proc *me = la_current_proc();
+            if (me && me->sig_pending)
+                return (uint64_t)(-LA_EINTR);
+        }
     }
     return 0;
 }

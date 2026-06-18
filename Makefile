@@ -158,6 +158,9 @@ $(TARGET)/loongarch/%.o: $(KernelPath)/loongarch/%.S $(LA_SOURCE_HDR) | $(TARGET
 $(TARGET)/loongarch/%.o: $(KernelPath)/loongarch/%.c $(LA_SOURCE_HDR) | $(TARGET)
 	$(LA_CC) $(LA_CFLAGS) -c -o $@ $<
 
+# boot.c includes initcode_la.h — recompile when the embedded binary changes
+$(TARGET)/loongarch/exec_la.o: $(LA_INITCODE_H)
+
 $(TARGET)/loongarch/userret_c.o: $(KernelPath)/loongarch/userret.c $(LA_SOURCE_HDR) | $(TARGET)
 	$(LA_CC) $(LA_CFLAGS) -c -o $@ $<
 

@@ -277,14 +277,16 @@ static void run_one(char *path, char **argv, const char *name)
         for (;;) {}
     }
 
-    /* Parent: wait for child */
-    long ret = -1;
-    if (syscall4(SYS_wait, pid, (long)&ret, 0, 0) < 0) {
+    /* Parent: wait for child.
+     * The kernel writes a 32-bit wstatus (sizeof(int)) — use int, not
+     * long, so the upper bytes aren't left as 0xff from a -1 init. */
+    int ret_val = -1;
+    if (syscall4(SYS_wait, pid, (long)&ret_val, 0, 0) < 0) {
         syscall3(SYS_write, 1,
                  (long)"initcode: fork fail!\n", 21);
         return;
     }
-    if (ret != 0) {
+    if (ret_val != 0) {
         syscall3(SYS_write, 1,
                  (long)"\n======== test fail   ========\n", 32);
         return;

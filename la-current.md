@@ -1,6 +1,6 @@
 # LoongArch (B 线) 内核开发手册
 
-> 最后更新：2026-06-18 18:20（修复 ext4 间接块映射 / 稀疏空洞 / lseek 64 位 / nanosleep / wait 注释 / newfstatat 路径）
+> 最后更新：2026-06-18 23:30（Phase 8 修复：initcode wstatus 类型 / Makefile 依赖 / tkill 信号统一 / la_proc_exit 线程清理 / futex EINTR；实测 musl 5/12 组 GROUP END）
 >
 > 本文档面向**开发者**，记录 SeaOS 项目 LoongArch 架构的设计思路、文件结构、路线图进展、以及按时间排列的开发日志。
 
@@ -161,22 +161,22 @@ src/kernel/loongarch/
 
 ### 2.3 全部分数路线图（Step 10–21 完成后，2026-06-14 制定）
 
-#### 评测全景
+#### 评测全景（2026-06-18 实测更新）
 
 ```
-/musl/ 12 组（基础分）        /glibc/ 12 组（加分）
-├─ libcbench  ✅ 已过         ├─ libcbench  🔴 需 glibc 动态链接验证
-├─ basic      🟡              ├─ basic      🔴
-├─ lua        🟡              ├─ lua        🔴
-├─ busybox    🟡              ├─ busybox    🔴
-├─ libctest   🔴 动态链接     ├─ libctest   🔴
-├─ lmbench    🔴 select/mmap  ├─ lmbench    🔴
-├─ unixbench  🔴 fstime/mmap  ├─ unixbench  🔴
-├─ iozone     🔴 TCP/mmap     ├─ iozone     🔴
-├─ cyclictest 🔴 RT 调度      ├─ cyclictest 🔴
-├─ iperf      🔴 TCP 栈       ├─ iperf      🔴
-├─ netperf    🔴 TCP 栈       ├─ netperf    🔴
-└─ ltp        🔴 长尾         └─ ltp        🔴
+/musl/ 12 组（基础分）         /glibc/ 12 组（加分）
+├─ libcbench  ✅ GROUP END    ├─ libcbench  🔴 待测
+├─ libctest   ✅ GROUP END    ├─ libctest   🔴
+├─ busybox    ✅ GROUP END    ├─ busybox    🔴
+├─ unixbench  ⏭️ SKIP         ├─ unixbench  🔴
+├─ cyclictest ✅ GROUP END    ├─ cyclictest 🔴
+├─ netperf    ✅ GROUP END    ├─ netperf    🔴
+├─ lmbench    🔄 运行极慢     ├─ lmbench    🔴
+├─ iozone     ⏳ 未到达       ├─ iozone     🔴
+├─ iperf      ⏳ 未到达       ├─ iperf      🔴
+├─ lua        ⏳ 未到达       ├─ lua        🔴
+├─ ltp        ⏳ 未到达       ├─ ltp        🔴
+└─ basic      ⏳ 未到达       └─ basic      🔴
 ```
 
 #### Step21后续的分阶段计划
@@ -662,6 +662,48 @@ P4.1 mmap 文件 ──→ P4.2 lmbench+iozone ──→ P5 LTP
 
 ---
 
+### 2026-06-18 23:30 — Phase 8 修复：initcode / 信号 / 线程退出 / EINTR 五项修复
+
+**本轮背景：** Linux 服务器（Docker `nostalgic_khayyam` + QEMU 10.0.2）实测 `sdcard-la.img`，10 分钟 QEMU 跑通 5/12 组 musl。发现 initcode `test fail` 误判、pthread 测试超时等问题。
+
+**修复 1：initcode wait wstatus 类型（`src/user/initcode_la.c`）**
+- 问题：`long ret = -1;`（8 字节）→ 内核写 `wstatus = (exit_code & 0xff) << 8`（4 字节 `sizeof(int)`）→ 高位留 0xff → `ret != 0` 恒为真 → initcode 误报 `test fail`
+- 修复：`long ret` → `int ret_val`，变量大小 = 内核写入大小
+
+**修复 2：Makefile 丢依赖（`Makefile`）**
+- 问题：`initcode_la.c` 修改后 `make build-la` 不重编 `exec_la.o`（`exec_la.c` 才是 include `initcode_la.h` 的文件，但依赖写成了 `boot.o`）
+- 修复：`$(TARGET)/loongarch/exec_la.o: $(LA_INITCODE_H)`
+
+**修复 3：tkill/tgkill sig≥32 过度杀（`syscall.c`）**
+- 问题：`sig >= 32` 走 `la_cancel_thread_signal` 立即杀线程，跳过了 musl 的 SIGCANCEL 处理和 pthread_join 清理
+- 修复：移除特殊路径，所有信号统一走 `sig_pending |= (1UL << sig)` + 唤醒 SLEEPING 线程，由 `la_signal_deliver` 正常投递
+
+**修复 4：la_proc_exit 漏 clear_child_tid（`proc.c`）**
+- 问题：信号杀线程调用 `la_signal_deliver` → `la_proc_exit(-sig)`，但不处理 `clear_child_tid`（futex 唤醒 `pthread_join` 的关键），导致 join 永久阻塞
+- 修复：`la_proc_exit` 中添加 `clear_child_tid` 零化 + `futex_wakeup_chan` + `wait_chan` 唤醒
+
+**修复 5：futex/nanosleep 被信号唤醒不返 EINTR（`syscall.c`）**
+- 问题：tkill 唤醒 SLEEPING 线程后，futex_wait 返 0（正常），musl 不检查 cancel 标志 → 线程继续跑
+- 修复：`sys_futex` 内 `la_proc_sleep_chan` 返回后检查 `sig_pending` != 0 → 返 `-EINTR`；`sys_nanosleep` 每 tick 同样检查 → 返 `-EINTR`
+
+**测试结果（10 分钟 QEMU）：**
+| 组 | 结果 | | 组 | 结果 |
+|----|------|-|----|------|
+| libcbench-musl | ✅ GROUP END + test sucess | unixbench | ⏭️ SKIP |
+| libctest-musl | ✅ GROUP END（14 子测试 FAIL） | lmbench | 🔄 运行中（CPU 密集） |
+| busybox-musl | ✅ GROUP END | 其余 6 组 | ⏳ 未到达 |
+| cyclictest-musl | ✅ GROUP END | glibc 12 组 | ⏳ 未到达 |
+| netperf-musl | ✅ GROUP END | | |
+
+**遗留问题：**
+- pthread_cancel/cond 等 7 个子测试仍 status 247 超时（EINTR 修复后表现不变，根因待 strace 对比）
+- lmbench CPU 密集型 benchmark 在 QEMU 下极慢
+- 全量测试需要 30–60 分钟以上
+
+**涉及文件：** `initcode_la.c`, `Makefile`, `syscall.c`, `proc.c`
+
+---
+
 ### 2026-06-18 00:12 — ADEF 嵌套异常修复（commit 2d3186d 包含）+ 文档更新
 
 **问题回顾：** 2026-06-12 23:07 报告的 ADEF→INE 级联崩溃在 2d3186d 中随同 ISTLBR/PGDL 防御性修复一并根治，libcbench-musl 现在能正常打印 `GROUP END`。
@@ -715,22 +757,5 @@ I/O multiplex: pselect6(72) ppoll(73)
       getrlimit(163) getrusage(165) sysinfo(179) umask(166)
       getrandom(278) rseq(293) get_mempolicy(236)
 ```
-文件: open(56) close(57) read(63) write(64) writev(66) lseek(62)
-      dup(23) dup3(24) fstat(80) get_dentries(61) ioctl(29) fcntl(25)
-      newfstatat(79) faccessat(48) readlinkat(78) statx(291)
-目录: chdir(49) mkdir(34)
-内存: brk(214) mmap(222) munmap(215) mprotect(226) msync(144)
-管道: pipe2(59)
-时间: clock_gettime(113) gettimeofday(169) times(153) nanosleep(101)
-调度: sched_yield(124) sched_setaffinity(122) sched_getaffinity(123)
-      sched_setscheduler(119) getcpu(168)
-资源: prlimit64(261)
-信息: uname(160) getuid/euid/gid/egid(174-177)
-Socket: socket(198) bind(200) listen(201) accept(202) connect(203)
-        sendto(206) recvfrom(207) getsockname(204) getpeername(205)
-        全部返回 -ENOSYS
-Select: pselect6(72) ppoll(73) — -ENOSYS
-系统: shutdown(502)
-```
 
-运行时 **0 个 UNKNOWN syscall**。
+运行时 **0 个 UNKNOWN syscall**。Loopback TCP/UDP 完整实现（`socket_la.c/h`）。

@@ -387,6 +387,22 @@ void __attribute__((noreturn)) la_proc_exit(int code)
     }
 
     la_csr_write(la_csr_read(LA_CSR_TLBRERA) & ~1ULL, LA_CSR_TLBRERA);  /* clear ISTLBR */
+
+    /* Clear the child tid and wake pthread_join waiters.  This must happen
+     * regardless of the exit path — sys_exit, signal delivery (la_signal_deliver),
+     * or la_cancel_thread_signal.  sys_exit already zeroes clear_child_tid
+     * before calling us, so this is a no-op in that path. */
+    if (me->clear_child_tid) {
+        uint32_t zero = 0;
+        la_copy_to_user(me->clear_child_tid, &zero, sizeof(zero));
+        la_proc_wakeup_chan((void *)me->clear_child_tid);
+        me->clear_child_tid = 0;
+    }
+
+    /* Wake any futex waiters on this thread's wait channel */
+    if (me->wait_chan)
+        la_proc_wakeup_chan(me->wait_chan);
+
     me->exit_code = (int)(unsigned)code;
     me->state     = LA_PROC_ZOMBIE;
     if (me->parent_pid > 0)
