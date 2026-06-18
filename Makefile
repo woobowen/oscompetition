@@ -66,6 +66,9 @@ USER_TEST_ELF = $(USER_TEST_C:$(UserPath)/%.c=$(TARGET)/user/%.elf)
 
 .SECONDARY: $(USER_LIB_OBJ) $(USER_TEST_OBJ)
 
+DEPFILES = $(KernelOBJ:.o=.d) $(USER_INIT_OBJ:.o=.d) $(USER_LIB_OBJ:.o=.d) $(USER_TEST_OBJ:.o=.d)
+-include $(DEPFILES)
+
 # QEMU 模拟器配置
 QEMU     = qemu-system-riscv64
 QEMU_LA  = qemu-system-loongarch64

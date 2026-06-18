@@ -193,6 +193,7 @@ typedef struct proc
     uint64 sig_pending;           // 待投递信号位图 (bit N-1 = signal N)
     uint8  sig_delivering;        // 正在投递信号中(防嵌套)
     uint8 shared_vm;              // CLONE_VM thread: page-table leaves are shared
+    uint8 reparented_to_init;      // orphan adopted by proczero; safe for background reap
     uint64 clear_child_tid;        // CLONE_CHILD_CLEARTID futex address
     // ITIMER_REAL
     uint64 itimer_expire;         // 到期时的 CLINT 时间 (0=未激活)

@@ -48,7 +48,7 @@ extern char ALLOC_BEGIN[];
 extern char ALLOC_END[];
 
 // 可分配回收的区域中内核持有前KERN_PAGES个页面
-#define KERN_PAGES 16384
+#define KERN_PAGES 65536
 
 /*---------------------------------- 关于虚拟内存 ---------------------------------------*/
 
@@ -151,8 +151,8 @@ typedef struct mmap_region_node
     struct mmap_region_node *next;
 } mmap_region_node_t;
 
-/* 最大支持256个mmap_region_node */
-#define N_MMAP 256
+/* 最大支持8192个mmap_region_node */
+#define N_MMAP 8192
 
 // 映射区域的终点 (给ustack留16MB内存空间)
 #define MMAP_END (TRAPFRAME - 16 * 256 * PGSIZE)

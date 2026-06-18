@@ -4,7 +4,7 @@
 > 返回值约定：成功返回结果（uint64）；失败返回 (uint64)(-EXXX)，见 docs/DECISIONS.md D1/D2。
 > 分发表上限 SYS_MAX_NUM=502（src/kernel/syscall/type.h）。
 
-## 已实现（共 101 个分发表入口，含 3 个 SeaOS 私有入口）
+## 已实现（共 111 个分发表入口，含 3 个 SeaOS 私有入口）
 | 号 | 名 | 备注 |
 |---|---|---|
 | 4 | fork | SeaOS |
@@ -38,11 +38,13 @@
 | 79 | newfstatat | 按路径 stat |
 | 80 | fstat | 输出 Linux `struct stat` |
 | 81 | sync | 桩，返回 0 |
+| 82 | fsync | 最小兼容：有效 fd 返回 0 |
+| 83 | fdatasync | 最小兼容：有效 fd 返回 0 |
 | 88 | utimensat | 最小时间戳更新/存在性检查 |
 | 93 | exit | |
 | 94 | exit_group | 单线程下等价 exit |
 | 96 | set_tid_address | 返回 pid（D3 最小实现） |
-| 98 | futex | 最小 WAIT/WAKE 语义 |
+| 98 | futex | 最小 WAIT/WAKE/WAIT_BITSET；支持粗粒度 timeout，超时返回 `-ETIMEDOUT` |
 | 99 | set_robust_list | 桩返回 0 |
 | 100 | get_robust_list | 桩返回 0 |
 | 101 | nanosleep(兼容) | |
@@ -60,13 +62,18 @@
 | 123 | sched_getaffinity | 单核 mask bit0=1 |
 | 124 | sched_yield | 调用 proc_yield |
 | 129 | kill | 最小 pid/signal 校验；有效目标返回成功 |
+| 130 | tkill | 最小线程 signal 兼容 |
+| 131 | tgkill | 最小线程组 signal 兼容 |
 | 133 | rt_sigsuspend | 最小让出 CPU |
 | 134 | rt_sigaction | 读 musl sigaction，存 handler/restorer |
 | 135 | rt_sigprocmask | 桩，返回 0 |
 | 139 | rt_sigreturn | 从用户栈恢复 signal frame |
 | 144 | setgid | 桩，返回 0 |
 | 146 | setuid | 桩，返回 0 |
+| 157 | setsid | 返回调用进程 pid 作为最小 session id |
 | 160 | uname | |
+| 163 | getrlimit | 支持 `RLIMIT_NOFILE` |
+| 164 | setrlimit | 支持 `RLIMIT_NOFILE`；验证用户指针但不改变静态 fd 表 |
 | 165 | getrusage | 零填充桩 |
 | 166 | umask | 桩，返回 0 |
 | 169 | gettimeofday | |
@@ -94,18 +101,69 @@
 | 211 | sendmsg | 明确返回 `-EOPNOTSUPP` |
 | 212 | recvmsg | 明确返回 `-EOPNOTSUPP` |
 | 214 | brk | |
-| 215 | munmap | |
+| 215 | munmap | `addr` 必须页对齐；`len` 按 Linux 语义向上页对齐 |
 | 220 | clone | musl fork/pthread 依赖；按 flag 区分 parent_tid、child_tid 与 clear_child_tid |
 | 221 | execve | 支持动态链接 ELF (D4) |
 | 222 | mmap | len 自动 page 对齐 |
 | 226 | mprotect | 最小权限更新：已有映射按 prot 调整 PTE_R/W/X |
+| 227 | msync | 最小兼容：校验参数后返回 0 |
 | 228 | mlock | 最小兼容，返回 0 |
 | 233 | madvise | 桩返回 0 |
 | 236 | get_mempolicy | 最小 NUMA default node 0 兼容 |
 | 242 | accept4 | accept + `SOCK_CLOEXEC` |
 | 260 | wait4 | |
+| 261 | prlimit64 | 支持当前进程 `RLIMIT_NOFILE` |
 | 276 | renameat2 | 无 flags 时转 `renameat`，其他 flags 返回 `-EINVAL` |
+| 278 | getrandom | 非阻塞伪随机字节，支持 Linux flags 子集 |
 | 500/501/502 | schedstat/spawn/shutdown | SeaOS 私有 |
+
+## 2026-06-18 状态更新：glibc 压力组推进到 `lmbench-glibc`
+
+本轮按固定 docker 命令复跑，RISC-V 串口日志已到 `sys_shutdown`。主表已同步到当前 `src/kernel/syscall/syscall.c` 分发表：共 111 个入口，其中 108 个 Linux/RISC-V ABI 或兼容入口，3 个 SeaOS 私有入口。
+
+最终 `os_serial_out_rv.txt` 确认以下组均到 `GROUP END` 且随后出现 `test sucess`：
+
+```text
+unixbench-musl
+busybox-musl
+cyclictest-musl
+netperf-musl
+lmbench-musl
+iperf-musl
+unixbench-glibc
+libcbench-glibc
+libctest-glibc
+busybox-glibc
+cyclictest-glibc
+netperf-glibc
+lmbench-glibc
+```
+
+本轮新增或补强的 syscall/语义：
+
+| 号 | 名 | 当前语义/修正 |
+|---|---|---|
+| 82 | fsync | 主表补记；有效 fd 最小成功返回。 |
+| 83 | fdatasync | 主表补记；同 `fsync`。 |
+| 98 | futex | 从 WAIT/WAKE 扩展为最小 WAIT/WAKE/WAIT_BITSET；带 timeout 的等待按 SeaOS tick 粗粒度超时并返回 `-ETIMEDOUT`。 |
+| 130/131 | tkill/tgkill | 主表补记；最小线程 signal 兼容。 |
+| 157 | setsid | 主表补记；返回调用者 pid 作为 session id。 |
+| 163/164/261 | getrlimit/setrlimit/prlimit64 | 主表补记；支持当前进程 `RLIMIT_NOFILE` 的静态 fd 表语义。 |
+| 215 | munmap | `addr` 页对齐校验，`len` 按 Linux 语义向上页对齐。 |
+| 227 | msync | 主表补记；最小兼容成功路径。 |
+| 278 | getrandom | 主表补记；非阻塞伪随机字节。 |
+
+相关非 syscall 分发表但影响 syscall 行为的生命周期修正：
+
+- `CLONE_VM` 线程退出后由调度器后台回收线程壳，避免 pthread 压力测试耗尽进程槽。
+- `clear_child_tid` 在正常退出和强制清理 descendants 时都会清零并 futex wake。
+- 被 `proc_reparent()` 过继给 `proczero` 的孤儿 zombie 用 `reparented_to_init` 标记，后台只回收这些孤儿；initcode 直接启动的测试子进程仍由 `wait4` 正常收尾并打印 `test sucess/test fail`。
+- `N_MMAP` 提高到 8192，避免 glibc pthread stack/guard 映射 churn 触发 `mmap_region_node` 枯竭。
+
+仍保留的兼容噪声：
+
+- `rt_sigtimedwait(137)` 尚未实现，`libctest-glibc` 内部 wrapper 会打印 `unknown syscall 137` / `Function not implemented`，但组级结果已通过。
+- glibc netperf 内部仍可能打印 netserver/control 失败文本；当前测评脚本仍给出组级 `test sucess`。
 
 ## 近期状态更新（2026-06-06）
 
