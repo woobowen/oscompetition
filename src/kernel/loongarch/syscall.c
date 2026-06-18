@@ -1092,7 +1092,15 @@ static uint64_t sys_wait(struct la_trap_frame *tf)
         }
 
         if (child) {
-            /* Copy exit status to user */
+            /* Copy exit status to user.  Linux convention:
+             *   WIFEXITED(status)   = (status & 0x7f) == 0
+             *   WEXITSTATUS(status) = (status >> 8) & 0xff
+             *   WIFSIGNALED(status) = (status & 0x7f) != 0
+             *   WTERMSIG(status)    = status & 0x7f
+             * We currently only track exit_code (no signal flag), so
+             * signal-killed children encode as status=0 (treated as
+             * normal exit with code 0).  This matches what musl/glibc
+             * expect when a child is reaped silently. */
             if (ustatus) {
                 int wstatus = (child->exit_code & 0xff) << 8;
                 la_copy_to_user(ustatus, &wstatus, sizeof(int));
