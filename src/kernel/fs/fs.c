@@ -323,19 +323,21 @@ static uint32 procfs_get_dents(file_t *file, uint64 user_dst, uint32 len)
 	return copied;
 }
 
-#define MEMFS_NODES 512
+#define MEMFS_NODES 2048
 #define MEMFS_DATA_SIZE 16384
 #define MEMFS_LOGICAL_MAX 0xffffffffU
 
 typedef struct memfs_node {
 	bool used;
 	bool is_dir;
+	uint32 hash;
 	char path[128];
 	uint8 data[MEMFS_DATA_SIZE];
 	uint32 size;
 } memfs_node_t;
 
 static memfs_node_t memfs_nodes[MEMFS_NODES];
+static int memfs_alloc_hint;
 
 static const char unixbench_sort_src_data[] =
 	"version=\"1.2\"\n"
@@ -370,15 +372,35 @@ static void memfs_normalize(char *dst, char *path)
 	dst[i] = 0;
 }
 
+static uint32 memfs_hash_key(const char *s)
+{
+	uint32 h = 2166136261u;
+	while (*s != 0) {
+		h ^= (uint8)*s;
+		h *= 16777619u;
+		s++;
+	}
+	return h == 0 ? 1 : h;
+}
+
+static int memfs_find_key(const char *key, uint32 hash)
+{
+	for (int i = 0; i < MEMFS_NODES; i++) {
+		if (memfs_nodes[i].used && memfs_nodes[i].hash == hash &&
+			streq(memfs_nodes[i].path, key))
+			return i;
+	}
+	return -1;
+}
+
 static int memfs_find(char *path)
 {
 	char key[128];
 	memfs_normalize(key, path);
-	for (int i = 0; i < MEMFS_NODES; i++) {
-		if (memfs_nodes[i].used && streq(memfs_nodes[i].path, key))
-			return i;
-	}
-	return -1;
+	if (key[0] == 0)
+		return -1;
+	uint32 hash = memfs_hash_key(key);
+	return memfs_find_key(key, hash);
 }
 
 static int memfs_create(char *path, bool is_dir)
@@ -387,19 +409,30 @@ static int memfs_create(char *path, bool is_dir)
 	memfs_normalize(key, path);
 	if (key[0] == 0)
 		return -1;
-	int existing = memfs_find(key);
+	uint32 hash = memfs_hash_key(key);
+	int existing = memfs_find_key(key, hash);
 	if (existing >= 0)
 		return existing;
-	for (int i = 0; i < MEMFS_NODES; i++) {
+	for (int step = 0; step < MEMFS_NODES; step++) {
+		int i = (memfs_alloc_hint + step) % MEMFS_NODES;
 		if (!memfs_nodes[i].used) {
-			memset(&memfs_nodes[i], 0, sizeof(memfs_nodes[i]));
-			memfs_nodes[i].used = true;
-			memfs_nodes[i].is_dir = is_dir;
-			memmove(memfs_nodes[i].path, key, strlen(key) + 1);
+			memfs_node_t *node = &memfs_nodes[i];
+			node->used = true;
+			node->is_dir = is_dir;
+			node->hash = hash;
+			node->size = 0;
+			memset(node->path, 0, sizeof(node->path));
+			memmove(node->path, key, strlen(key) + 1);
+			memfs_alloc_hint = (i + 1) % MEMFS_NODES;
 			return i;
 		}
 	}
 	return -1;
+}
+
+static bool memfs_should_fast_create(char *path)
+{
+	return starts_with(path, "/tmp/") || starts_with(path, "/var/tmp/");
 }
 
 static int memfs_seed_readonly_file(char *path)
@@ -435,24 +468,38 @@ int memfs_mkdir(char *path)
 
 int memfs_unlink(char *path)
 {
-	int idx = memfs_find(path);
+	char key[128];
+	memfs_normalize(key, path);
+	if (key[0] == 0)
+		return -1;
+	uint32 hash = memfs_hash_key(key);
+	int idx = memfs_find_key(key, hash);
 	if (idx < 0)
 		return -1;
-	memset(&memfs_nodes[idx], 0, sizeof(memfs_nodes[idx]));
+	memfs_nodes[idx].used = false;
+	memfs_nodes[idx].is_dir = false;
+	memfs_nodes[idx].hash = 0;
+	memfs_nodes[idx].size = 0;
+	memfs_nodes[idx].path[0] = 0;
+	memfs_alloc_hint = idx;
 	return 0;
 }
 
 int memfs_rename(char *old_path, char *new_path)
 {
-	int old_idx = memfs_find(old_path);
-	if (old_idx < 0 || memfs_find(new_path) >= 0)
+	char old_key[128], new_key[128];
+	memfs_normalize(old_key, old_path);
+	memfs_normalize(new_key, new_path);
+	if (old_key[0] == 0 || new_key[0] == 0)
 		return -1;
-	char key[128];
-	memfs_normalize(key, new_path);
-	if (key[0] == 0)
+	uint32 old_hash = memfs_hash_key(old_key);
+	uint32 new_hash = memfs_hash_key(new_key);
+	int old_idx = memfs_find_key(old_key, old_hash);
+	if (old_idx < 0 || memfs_find_key(new_key, new_hash) >= 0)
 		return -1;
 	memset(memfs_nodes[old_idx].path, 0, sizeof(memfs_nodes[old_idx].path));
-	memmove(memfs_nodes[old_idx].path, key, strlen(key) + 1);
+	memmove(memfs_nodes[old_idx].path, new_key, strlen(new_key) + 1);
+	memfs_nodes[old_idx].hash = new_hash;
 	return 0;
 }
 
@@ -672,8 +719,13 @@ uint32 pipe_write(pipe_t *pi, uint64 addr, uint32 n, bool is_user)
 void pipe_close(pipe_t *pi, bool writable)
 {
 	spinlock_acquire(&pi->lk);
-	if (writable) { pi->writeopen = 0; proc_wakeup(&pi->nread); }
-	else          { pi->readopen = 0;  proc_wakeup(&pi->nwrite); }
+	if (writable) {
+		pi->writeopen = 0;
+		proc_wakeup(&pi->nread);
+	} else {
+		pi->readopen = 0;
+		proc_wakeup(&pi->nwrite);
+	}
 	int both_closed = (pi->readopen == 0 && pi->writeopen == 0);
 	spinlock_release(&pi->lk);
 	if (both_closed)
@@ -710,6 +762,27 @@ file_t* file_alloc()
 	}
 	spinlock_release(&lk_file_table);
 	return NULL; // 分配失败
+}
+
+static file_t *memfs_open_index(int mem_idx, bool want_r, bool want_w, uint32 open_mode)
+{
+	file_t *mf = file_alloc();
+	if (mf == NULL)
+		return NULL;
+
+	memfs_node_t *node = &memfs_nodes[mem_idx];
+	if (node->is_dir && want_w) {
+		file_close(mf);
+		return NULL;
+	}
+	if (!node->is_dir && (open_mode & FILE_OPEN_TRUNC))
+		node->size = 0;
+	mf->is_mem = true;
+	mf->mem_index = mem_idx;
+	mf->readable = want_r;
+	mf->writbale = want_w;
+	mf->offset = (open_mode & FILE_OPEN_APPEND) ? node->size : 0;
+	return mf;
 }
 
 /*
@@ -762,34 +835,27 @@ file_t* file_open(char *path, uint32 open_mode)
 		return devf;
 	}
 
+	int mem_idx = memfs_find(path);
+	if (mem_idx >= 0)
+		return memfs_open_index(mem_idx, want_r, want_w, open_mode);
+	if (fs_readonly_ext4 && (open_mode & FILE_OPEN_CREATE) &&
+		memfs_should_fast_create(path)) {
+		mem_idx = memfs_create(path, false);
+		if (mem_idx >= 0)
+			return memfs_open_index(mem_idx, want_r, want_w, open_mode);
+	}
+
 	// 1. 先按路径找 inode
 	inode_t *ip = path_to_inode(path);
 
-	int mem_idx = memfs_find(path);
 	if (ip == NULL) {
 		if (mem_idx < 0 && fs_readonly_ext4 && want_r && !want_w &&
 			!(open_mode & (FILE_OPEN_CREATE | FILE_OPEN_TRUNC)))
 			mem_idx = memfs_seed_readonly_file(path);
 		if (mem_idx < 0 && (open_mode & FILE_OPEN_CREATE))
 			mem_idx = memfs_create(path, false);
-		if (mem_idx >= 0) {
-			file_t *mf = file_alloc();
-			if (mf == NULL)
-				return NULL;
-			memfs_node_t *node = &memfs_nodes[mem_idx];
-			if (node->is_dir && want_w) {
-				file_close(mf);
-				return NULL;
-			}
-			if (!node->is_dir && (open_mode & FILE_OPEN_TRUNC))
-				node->size = 0;
-			mf->is_mem = true;
-			mf->mem_index = mem_idx;
-			mf->readable = want_r;
-			mf->writbale = want_w;
-			mf->offset = (open_mode & FILE_OPEN_APPEND) ? node->size : 0;
-			return mf;
-		}
+		if (mem_idx >= 0)
+			return memfs_open_index(mem_idx, want_r, want_w, open_mode);
 	}
 
 	// 2. 不存在且允许创建：创建 DATA 文件

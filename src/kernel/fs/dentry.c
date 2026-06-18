@@ -430,6 +430,24 @@ static inode_t* __path_to_inode(char *path, char *name, bool find_parent_inode)
 	基于path寻找inode
 	失败返回NULL
 */
+static bool path_eq(const char *a, const char *b)
+{
+	if (a == NULL || b == NULL)
+		return false;
+	return strlen(a) == strlen(b) && strncmp(a, b, (uint32)strlen(b)) == 0;
+}
+
+static char *glibc_lib_alias(char *path)
+{
+	if (path_eq(path, "/lib/ld-linux-riscv64-lp64d.so.1"))
+		return "/glibc/lib/ld-linux-riscv64-lp64d.so.1";
+	if (path_eq(path, "/lib/libc.so.6") || path_eq(path, "/lib/libc.so"))
+		return "/glibc/lib/libc.so.6";
+	if (path_eq(path, "/lib/libm.so.6") || path_eq(path, "/lib/libm.so"))
+		return "/glibc/lib/libm.so.6";
+	return NULL;
+}
+
 inode_t* path_to_inode(char *path)
 {
 	if (ext4_is_active()) {
@@ -441,13 +459,22 @@ inode_t* path_to_inode(char *path)
 			if (p != NULL && p->cwd != NULL && p->cwd->inode_num != INVALID_INODE_NUM)
 				start = p->cwd->inode_num;   // 相对路径: 从 cwd 起查
 		}
-		if (ext4_lookup_path(start, path, &inode_num, &inode_type) < 0)
-			return NULL;
+		if (ext4_lookup_path(start, path, &inode_num, &inode_type) < 0) {
+			char *alias = glibc_lib_alias(path);
+			if (alias == NULL || ext4_lookup_path(0, alias, &inode_num, &inode_type) < 0)
+				return NULL;
+		}
 		return inode_get(inode_num);
 	}
 
 	char name[MAXLEN_FILENAME];
-	return __path_to_inode(path, name, false);
+	inode_t *ip = __path_to_inode(path, name, false);
+	if (ip == NULL) {
+		char *alias = glibc_lib_alias(path);
+		if (alias != NULL)
+			ip = __path_to_inode(alias, name, false);
+	}
+	return ip;
 }
 
 /* 

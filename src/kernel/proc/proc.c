@@ -12,6 +12,7 @@ extern uint64 timer_get_ticks();
 #define MKV_R_SLEEP 0
 #define MKV_R_EXPIRE 1
 #define MKV_R_HIGHER 2
+#define PROC_PGTBL_RECLAIM_ON_OOM 512
 
 static int mkv_burst_class(uint64 run_ticks)
 {
@@ -97,6 +98,94 @@ static proc_t *proczero;
 static int global_pid;
 static spinlock_t pid_lk;
 
+#define SLEEPCHAN_HINT_SLOTS 256
+typedef struct sleepchan_hint {
+    void *chan;
+    uint32 count;
+} sleepchan_hint_t;
+
+static sleepchan_hint_t sleepchan_hints[SLEEPCHAN_HINT_SLOTS];
+static uint32 sleepchan_overflow;
+static spinlock_t sleepchan_lk;
+
+static uint64 sleepchan_hash(void *chan)
+{
+    return (((uint64)chan) >> 4) % SLEEPCHAN_HINT_SLOTS;
+}
+
+static void sleepchan_inc(void *chan)
+{
+    if (chan == NULL)
+        return;
+
+    spinlock_acquire(&sleepchan_lk);
+    uint64 start = sleepchan_hash(chan);
+    for (uint64 off = 0; off < SLEEPCHAN_HINT_SLOTS; off++) {
+        uint64 i = (start + off) % SLEEPCHAN_HINT_SLOTS;
+        if (sleepchan_hints[i].chan == chan || sleepchan_hints[i].chan == NULL) {
+            sleepchan_hints[i].chan = chan;
+            sleepchan_hints[i].count++;
+            spinlock_release(&sleepchan_lk);
+            return;
+        }
+    }
+    sleepchan_overflow++;
+    spinlock_release(&sleepchan_lk);
+}
+
+static void sleepchan_dec(void *chan)
+{
+    if (chan == NULL)
+        return;
+
+    spinlock_acquire(&sleepchan_lk);
+    uint64 start = sleepchan_hash(chan);
+    for (uint64 off = 0; off < SLEEPCHAN_HINT_SLOTS; off++) {
+        uint64 i = (start + off) % SLEEPCHAN_HINT_SLOTS;
+        if (sleepchan_hints[i].chan == chan) {
+            if (sleepchan_hints[i].count > 0)
+                sleepchan_hints[i].count--;
+            if (sleepchan_hints[i].count == 0)
+                sleepchan_hints[i].chan = NULL;
+            spinlock_release(&sleepchan_lk);
+            return;
+        }
+    }
+    if (sleepchan_overflow > 0)
+        sleepchan_overflow--;
+    spinlock_release(&sleepchan_lk);
+}
+
+static int sleepchan_has_waiter(void *chan)
+{
+    if (chan == NULL)
+        return 0;
+
+    spinlock_acquire(&sleepchan_lk);
+    uint64 start = sleepchan_hash(chan);
+    for (uint64 off = 0; off < SLEEPCHAN_HINT_SLOTS; off++) {
+        uint64 i = (start + off) % SLEEPCHAN_HINT_SLOTS;
+        if (sleepchan_hints[i].chan == chan && sleepchan_hints[i].count > 0) {
+            spinlock_release(&sleepchan_lk);
+            return 1;
+        }
+    }
+    int has = sleepchan_overflow > 0;
+    spinlock_release(&sleepchan_lk);
+    return has;
+}
+
+static void proc_free_mmap_list(proc_t *p)
+{
+    mmap_region_t *mmap = p->mmap;
+    while (mmap != NULL) {
+        mmap_region_t *next = mmap->next;
+        mmap_region_free(mmap);
+        mmap = next;
+    }
+    p->mmap = NULL;
+}
+
 /* 获取一个pid */
 static int alloc_pid()
 {
@@ -137,6 +226,9 @@ void proc_init()
     // 初始化全局 pid 与其锁
     global_pid = 1;
     spinlock_init(&pid_lk, "pid_lock");
+    memset(sleepchan_hints, 0, sizeof(sleepchan_hints));
+    sleepchan_overflow = 0;
+    spinlock_init(&sleepchan_lk, "sleepchan");
 
     // 初始化MLFQ调度器
     mlfq_init();
@@ -257,6 +349,8 @@ void proc_free(proc_t *p)
             uvm_destroy_pgtbl(p->pgtbl);
         p->pgtbl = NULL;
     }
+    if (!p->shared_vm && p->mmap)
+        proc_free_mmap_list(p);
 
     // open_file 和 cwd 已由 proc_exit 关闭，这里只做防御性清理
     for (int i = 0; i < N_OPEN_FILE_PER_PROC; i++)
@@ -342,13 +436,19 @@ pgtbl_t proc_pgtbl_init(uint64 trapframe)
     // 1. 分配一页作为用户根页表
     pgtbl_t upgtbl = (pgtbl_t)pmem_alloc(true);
     if (!upgtbl) {
-        panic("proc_pgtbl_init: pmem_alloc failed");
+        buffer_freemem(PROC_PGTBL_RECLAIM_ON_OOM);
+        upgtbl = (pgtbl_t)pmem_alloc(true);
     }
+    if (!upgtbl)
+        return NULL;
     memset(upgtbl, 0, PGSIZE);  // 清零
 
     // 2. 在用户页表中映射 trampoline 与 trapframe
-    vm_mappages(upgtbl, (uint64)TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);  // 可读、不可写、可执行
-    vm_mappages(upgtbl, (uint64)TRAPFRAME, (uint64)trapframe, PGSIZE, PTE_R | PTE_W);  //需要读写
+    if (vm_try_mappages(upgtbl, (uint64)TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X) < 0 ||
+        vm_try_mappages(upgtbl, (uint64)TRAPFRAME, (uint64)trapframe, PGSIZE, PTE_R | PTE_W) < 0) {
+        uvm_destroy_pgtbl(upgtbl);
+        return NULL;
+    }
 
     return upgtbl;
 }
@@ -464,6 +564,12 @@ int proc_fork()
     child->parent = parent;
     child->exit_code = 0;
     child->pgtbl = proc_pgtbl_init((uint64)tf);
+    if (!child->pgtbl) {
+        pmem_free((uint64)tf, false);
+        child->tf = NULL;
+        spinlock_release(&child->lk);
+        return -1;
+    }
     child->heap_top = parent->heap_top;
     child->ustack_npage = parent->ustack_npage;
     child->mmap = NULL; // 子进程初始无mmap
@@ -738,7 +844,7 @@ void proc_exit(int exit_code)
     if (p->clear_child_tid != 0) {
         uint32 zero = 0;
         uvm_copyout(p->pgtbl, p->clear_child_tid, (uint64)&zero, sizeof(zero));
-        proc_wakeup((void *)p->clear_child_tid);
+        proc_wakeup_force((void *)p->clear_child_tid);
     }
     // 关闭所有打开的文件描述符（必须在获取进程锁前完成，因为 file_close 可能 sleep）
     for (int i = 0; i < N_OPEN_FILE_PER_PROC; i++) {
@@ -784,6 +890,11 @@ int proc_wait4(int64 wait_pid, uint64 user_addr, int wnohang)
             if (p->parent == parent && p->state != UNUSED) {
                 // pid过滤：-1=任意，>0=特定pid
                 if (wait_pid > 0 && p->pid != (int)wait_pid) {
+                    if (parent == proczero && p->state == ZOMBIE) {
+                        proc_free(p);
+                        spinlock_release(&p->lk);
+                        continue;
+                    }
                     spinlock_release(&p->lk);
                     continue;
                 }
@@ -839,7 +950,10 @@ void proc_sleep(void *sleep_space, spinlock_t *lock)
     // 应对外设中断处理程序调用proc_sleep的情况
     if (lock != &p->lk) {
         spinlock_acquire(&p->lk);
+        sleepchan_inc(sleep_space);
         spinlock_release(lock);
+    } else {
+        sleepchan_inc(sleep_space);
     }
 
     // 开始睡眠
@@ -858,6 +972,7 @@ void proc_sleep(void *sleep_space, spinlock_t *lock)
 
     // 被唤醒
     // printf("proc %d is wakeup!\n", p->pid);
+    sleepchan_dec(sleep_space);
 
     // 恢复原样
     if (lock != &p->lk) {
@@ -870,8 +985,11 @@ void proc_sleep(void *sleep_space, spinlock_t *lock)
     唤醒所有等待sleep_space的进程
     SLEEPING -> RUNNABLE
 */
-void proc_wakeup(void *sleep_space)
+static void proc_wakeup_scan(void *sleep_space, int use_hint)
 {
+    if (use_hint && !sleepchan_has_waiter(sleep_space))
+        return;
+
     for (int i = 0; i < N_PROC; i++) {
         proc_t *p = &proc_list[i];
         spinlock_acquire(&p->lk);
@@ -891,6 +1009,16 @@ void proc_wakeup(void *sleep_space)
         }
         spinlock_release(&p->lk);
     }
+}
+
+void proc_wakeup(void *sleep_space)
+{
+    proc_wakeup_scan(sleep_space, 1);
+}
+
+void proc_wakeup_force(void *sleep_space)
+{
+    proc_wakeup_scan(sleep_space, 0);
 }
 
 /* 查找pid对应的进程并返回（返回时持有该进程锁），找不到返回NULL */

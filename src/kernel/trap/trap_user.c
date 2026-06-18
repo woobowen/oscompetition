@@ -15,6 +15,29 @@ extern char kernel_vector[]; // 内核态trap处理流程, 进入内核后应当
 extern char *interrupt_info[16]; // 中断错误信息
 extern char *exception_info[16]; // 异常错误信息
 
+static int map_user_sigtrampoline(proc_t *p)
+{
+    pte_t *pte = vm_getpte(p->pgtbl, SIGTRAMPOLINE, false);
+    if (pte != NULL && (*pte & PTE_V))
+        return 0;
+
+    uint32 code[] = {
+        0x08b00893, /* li a7, SYS_rt_sigreturn */
+        0x00000073, /* ecall */
+        0x0000006f, /* j . */
+    };
+    void *pa = pmem_alloc(false);
+    if (pa == NULL)
+        return -1;
+    memset(pa, 0, PGSIZE);
+    memcpy(pa, code, sizeof(code));
+    if (vm_try_mappages(p->pgtbl, SIGTRAMPOLINE, (uint64)pa, PGSIZE, PTE_R | PTE_X | PTE_U) < 0) {
+        pmem_free((uint64)pa, false);
+        return -1;
+    }
+    return 0;
+}
+
 // 在user_vector()里面调用
 // 用户态trap处理的核心逻辑
 void trap_user_handler()
@@ -69,7 +92,9 @@ void trap_user_handler()
             case 15:
             {
                 uint64 fault_addr = r_stval();
-                uint64 res = uvm_ustack_grow(p->pgtbl, p->ustack_npage, fault_addr);
+                uint64 res = uvm_mmap_handle_fault(p->pgtbl, fault_addr);
+                if (res == (uint64)-1)
+                    res = uvm_ustack_grow(p->pgtbl, p->ustack_npage, fault_addr);
                 if (res == (uint64)-1) {
                     if (!p->sig_delivering && p->sig_handler[SIGSEGV] > 1) {
                         p->sig_pending |= (1UL << (SIGSEGV - 1));
@@ -101,7 +126,7 @@ void trap_user_handler()
             }
             if (p->sig_handler[sig] == 0) {
                 if (sig == SIGINT || sig == SIGTERM || sig == SIGKILL || sig == SIGHUP ||
-                    sig == SIGSEGV || sig == SIGBUS)
+                    sig == SIGABRT || sig == SIGSEGV || sig == SIGBUS)
                     proc_exit(128 + sig);
                 p->sig_pending &= ~(1UL << (sig - 1));
                 continue;
@@ -147,10 +172,20 @@ void trap_user_handler()
             uint64 new_sp = (tf->sp - 256) & ~0xFUL;
             uvm_copyout(p->pgtbl, new_sp, (uint64)frame, sizeof(frame));
 
+            uint64 restorer = p->sig_restorer;
+            if (restorer == 0) {
+                if (map_user_sigtrampoline(p) < 0) {
+                    printf("signal: pid=%d map sigtrampoline failed\n", p->pid);
+                    proc_exit(-12);
+                    break;
+                }
+                restorer = SIGTRAMPOLINE;
+            }
+
             tf->user_to_kern_epc = p->sig_handler[sig];
             tf->a0 = (uint64)sig;
             tf->sp = new_sp;
-            tf->ra = p->sig_restorer;
+            tf->ra = restorer;
 
             break;
         }

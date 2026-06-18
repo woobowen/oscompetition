@@ -48,7 +48,7 @@ extern char ALLOC_BEGIN[];
 extern char ALLOC_END[];
 
 // 可分配回收的区域中内核持有前KERN_PAGES个页面
-#define KERN_PAGES 4096
+#define KERN_PAGES 16384
 
 /*---------------------------------- 关于虚拟内存 ---------------------------------------*/
 
@@ -140,6 +140,7 @@ typedef struct mmap_region
 {
     uint64 begin;             // 起始地址
     uint32 npages;            // 管理的页面数量
+    int perm;                 // PTE permission used for lazy mmap faults
     struct mmap_region *next; // 链表指针
 } mmap_region_t;
 
@@ -158,3 +159,6 @@ typedef struct mmap_region_node
 
 // 映射区域的起点 (单个进程的mmap_reagion最大占据64MB内存空间)
 #define MMAP_BEGIN (MMAP_END - 64 * 256 * PGSIZE)
+
+// User-space signal-return trampoline page, kept below mmap and above heap.
+#define SIGTRAMPOLINE (MMAP_BEGIN - PGSIZE)
