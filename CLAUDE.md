@@ -211,7 +211,7 @@ sudo docker run --rm \
 
 ---
 
-## 六、当前状态（2026-06-14）
+## 六、当前状态（2026-06-18）
 
 ### 已完成（Phase 1–5，全部实施）
 
@@ -221,24 +221,29 @@ sudo docker run --rm \
 
 - `make build-la`：**0 错误 0 警告**（source 模式）
 - `make check-la`：8s 冒烟通过（boot → kernel ready → timer heartbeat）
-- `sdcard-la.img` 10min 测试：libcbench-musl 全部 6 个子测试 `exit=0`，**0 次崩溃，0 UNKNOWN syscall**
-- Syscall dispatch 入口 **101**（95 真实实现 + 3 ENOSYS stub 残留：sendmsg/recvmsg/sendfile）
+- `sdcard-la.img` 测试：**libcbench-musl** ✅ GROUP END，`libctest-musl` ✅ GROUP END
+- **0 次崩溃，0 UNKNOWN syscall**（ADEF→INE 级联 bug 已修复）
+- Syscall dispatch 入口 **106**（95+ 真实实现 + 3 ENOSYS stub：sendmsg/recvmsg/sendfile）
 - 新增文件：`socket_la.c`（390行）+ `socket_la.h`（114行），loopback TCP/UDP 完整实现
 - 所有核心子系统通路：进程/文件/管道/信号/线程/内存/定时器/动态链接/块缓存/网络/socket
 
-### 已知问题
+### 当前阻塞
 
 | 问题 | 影响 | 根因 | 计划 |
 |------|------|------|------|
-| libcbench 退出阶段 ADEF 嵌套异常 | GROUP END 未打印（子测试 6/6 全部 exit=0） | QEMU 10.0.2 `invtlb` 不可靠 + ISTLBR 级联，ERA 被污染（0x20104c 附近） | 明日继续排查；症状稳定可复现，era 在 `la_exception_entry` 内部 |
+| unixbench-musl 卡死 | 阻止后续 10 个 musl 测试组启动 | dhrystone/whetstone 是 CPU 密集型紧循环，QEMU 10.0.2 模拟下需数十分钟/组 | QEMU 无 KVM 加速；不可跳过用户程序（项目硬约束）；只能让测试长跑或等更快的硬件 |
+| libctest 子测试 FAIL | 不影响 GROUP END（子测试级别） | pthread_cond/sem_init 需要 `CLOCK_MONOTONIC` futex 超时；stat 需要 `/dev/null`；socket/utime 需要更多实现 | 后续可逐步修复 |
 
 ### 关键修复（历史记录）
 
-1. **ADEF→INE 级联（过时 TLB 条目）**：QEMU 10.0.2 广播 `invtlb` 不可靠。修复：`la_uvm_free_pgtbl` 中逐 VA `invtlb 0x6` 失效 + `la_tlb_inval_all()` 额外全刷。验证 180s 内 0 崩溃。
-2. **busybox 启动崩溃（mallocng）**：TLB 一致性——exec 后全局 TLB 条目残留。修复：调度器每次切换用户地址空间前 `la_tlb_inval_all` + `la_tlb_fill_all`。
+1. **ADEF→INE 级联（过时 TLB 条目）**：QEMU 10.0.2 广播 `invtlb` 不可靠。修复：分离 TLB refill 入口（`la_tlb_refill_entry`）显式置位 ISTLBR + `la_uvm_free_pgtbl` 中全刷。验证多轮测试 0 崩溃。
+2. **busybox 启动崩溃（mallocng）**：TLB 一致性——exec 后全局 TLB 条目残留。修复：调度器使用 ASID 区分地址空间，进程切换时不再无脑全刷。
 3. **物理内存耗尽**：exec/exit 从不释放页表。修复：`la_uvm_free_pgtbl` + `la_proc_free`（Step 19），`fork fail!` 13→0。
 4. **memfs cwd 相对路径**：memfs 创建文件使用原始路径，chdir 后相对路径找不到。修复：`la_resolve_memfs_path` 解析 cwd→绝对路径。
 5. **调度器优先级**：轮转调度改为优先级感知（SCHED_FIFO 1-99 > SCHED_OTHER 0），同级内轮转。
+6. **ext4 indirect block mapping**：老式 inode（无 EXTENTS_FL）原本直接 FAIL。修复：添加 direct + single/double/triple indirect block pointer 解析。
+7. **ext4 sparse hole**：`lbn2pb` 返回 -1 时直接 break。修复：在 `e4_read_file` 中填充零，长文件读取不再中断。
+8. **nanosleep 假实现**：原本只 sleep 1 tick。修复：基于 `la_timer_get_ticks()` 的实际时长 sleep。
 
 ---
 
