@@ -3345,12 +3345,30 @@ static uint64_t sys_rseq(struct la_trap_frame *tf)
 /* ---- LTP / general syscall stubs ---- */
 
 /* SYS_nanosleep(101): sleep for specified nanoseconds.  a0=req, a1=rem.
- * struct timespec: sec(8) + nsec(8).  Minimal: sleep 1 tick. */
+ * struct timespec: sec(8) + nsec(8).  Sleeps in 1-tick (10ms) increments
+ * so the cooperative scheduler can interleave other runnable procs. */
 static uint64_t sys_nanosleep(struct la_trap_frame *tf)
 {
-    /* uint64_t ureq = tf->gpr[LA_GPR_A0]; */
-    (void)tf;
-    la_proc_sleep();  /* ~10 ms at 100 Hz */
+    uint64_t ureq = tf->gpr[LA_GPR_A0];
+    if (!ureq) return (uint64_t)(-LA_EFAULT);
+
+    struct { int64_t tv_sec; int64_t tv_nsec; } ts;
+    if (la_copy_from_user(&ts, ureq, sizeof(ts)) != sizeof(ts))
+        return (uint64_t)(-LA_EFAULT);
+    if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000LL)
+        return (uint64_t)(-LA_EINVAL);
+
+    /* Convert to ticks at LA_TIMER_HZ (100 Hz → 10ms per tick).  Round up
+     * so a sub-tick request still sleeps at least one tick. */
+    uint64_t total_ticks = (uint64_t)ts.tv_sec * LA_TIMER_HZ
+                         + ((uint64_t)ts.tv_nsec * LA_TIMER_HZ
+                            + 99999999ULL) / 100000000ULL;
+    if (total_ticks == 0) total_ticks = 1;
+
+    uint64_t start = la_timer_get_ticks();
+    while (la_timer_get_ticks() - start < total_ticks) {
+        la_proc_sleep();   /* ~10ms per tick; scheduler runs other procs */
+    }
     return 0;
 }
 

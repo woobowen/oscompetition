@@ -28,6 +28,9 @@ typedef unsigned long long uint64;
 #define SYS_getpid     172
 #define SYS_exec       221
 #define SYS_wait       260
+#define SYS_kill        129
+#define SYS_clock_gettime 113
+#define SYS_nanosleep   101
 #define SYS_shutdown   502
 
 /* ---- File open flags ---- */
