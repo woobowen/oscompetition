@@ -748,7 +748,8 @@ static uint32_t sea_get_dentries(uint32_t dir_ino, void *dst, uint32_t len)
     return written;
 }
 
-static uint32_t e4_get_dentries(uint32_t dir_ino, void *dst, uint32_t len)
+static uint32_t e4_get_dentries(uint32_t dir_ino, void *dst, uint32_t len,
+                                 uint64_t *pos)
 {
     e4_inode_t ip;
     if (e4_read_inode(dir_ino, &ip) < 0) return 0;
@@ -757,23 +758,26 @@ static uint32_t e4_get_dentries(uint32_t dir_ino, void *dst, uint32_t len)
 
     uint8_t *out = (uint8_t *)dst;
     uint32_t written = 0;
-    uint32_t pos = 0;
 
-    while ((uint64_t)pos + 8 <= sz) {
+    while ((uint64_t)*pos + 8 <= sz) {
         e4_dh_t h;
-        if (e4_read_file(dir_ino, pos, &h, 8) != 8) break;
+        if (e4_read_file(dir_ino, (uint32_t)*pos, &h, 8) != 8) break;
         if (h.rec_len < 8) break;
-        if ((uint64_t)pos + h.rec_len > sz) break;
+        if ((uint64_t)*pos + h.rec_len > sz) break;
 
         if (h.inode != 0 && h.name_len > 0 && h.name_len <= LA_MAXNAME) {
             char name[LA_MAXNAME + 1];
             la_memset(name, 0, sizeof(name));
-            if (e4_read_file(dir_ino, pos + 8, name, h.name_len) == h.name_len) {
+            if (e4_read_file(dir_ino, (uint32_t)*pos + 8, name, h.name_len) == h.name_len) {
                 uint32_t namelen = h.name_len;
 
                 /* dirent64 record */
                 uint16_t reclen = (uint16_t)((19 + namelen + 1 + 7) & ~7U);
-                if (written + reclen > len) break;
+                if (written + reclen > len) {
+                    /* This entry doesn't fit — stop here, caller will
+                     * resume from *pos on the next call. */
+                    return written;
+                }
 
                 /* EXT4 file_type: 1=REG→DT_REG(8), 2=DIR→DT_DIR(4) */
                 uint8_t dtype = LA_DT_UNKNOWN;
@@ -786,7 +790,7 @@ static uint32_t e4_get_dentries(uint32_t dir_ino, void *dst, uint32_t len)
                 }
 
                 uint64_t d_ino = h.inode;
-                uint64_t d_off = written + reclen;
+                uint64_t d_off = *pos + h.rec_len;
                 la_memmove(out + written, &d_ino, 8);
                 la_memmove(out + written + 8, &d_off, 8);
                 la_memmove(out + written + 16, &reclen, 2);
@@ -799,15 +803,16 @@ static uint32_t e4_get_dentries(uint32_t dir_ino, void *dst, uint32_t len)
                 written += reclen;
             }
         }
-        pos += h.rec_len;
+        *pos += h.rec_len;
     }
     return written;
 }
 
-uint32_t la_fs_get_dentries(uint32_t dir_ino, void *dst, uint32_t len)
+uint32_t la_fs_get_dentries(uint32_t dir_ino, void *dst, uint32_t len,
+                            uint64_t *pos)
 {
     if (sea.active) return sea_get_dentries(dir_ino, dst, len);
-    if (e4.active)  return e4_get_dentries(dir_ino, dst, len);
+    if (e4.active)  return e4_get_dentries(dir_ino, dst, len, pos);
     return 0;
 }
 

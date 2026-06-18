@@ -98,7 +98,7 @@ uint32_t la_fs_read_file(uint32_t inode_num, uint32_t offset,
 void    la_fs_list_dir(uint32_t dir_ino);
 int     la_fs_inode_type(uint32_t ino);
 uint32_t la_fs_inode_size(uint32_t ino);
-uint32_t la_fs_get_dentries(uint32_t dir_ino, void *dst, uint32_t len);
+uint32_t la_fs_get_dentries(uint32_t dir_ino, void *dst, uint32_t len, uint64_t *pos);
 int     la_fs_is_sea(void);
 
 /* ---- Memory filesystem (writable) ---- */

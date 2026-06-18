@@ -9,7 +9,7 @@
 
 - **项目**：SeaOS — 华东师大花狮小队，oscomp 2026「OS 内核实现赛道」初赛。xv6 风格内核，目标跑通 `/musl`、`/glibc` 下的 oscomp 测试脚本。
 - **两条线**：**A 线 = RISC-V**（`src/kernel/`，成熟，101+ syscall、动态链接、pipe、memfs 齐备，是事实参考实现）；**B 线 = LoongArch**（`src/kernel/loongarch/`，Step 10–21 全部完成，**本文档对象**）。LoongArch 与 RISC-V 共用同一套 Linux「通用 ABI」syscall 号表。
-- **当前状态（2026-06-18 更新）**：**Phase 1–7 全部实施完毕**。101 syscall dispatch 入口（95 真实实现 + 3 ENOSYS stub）。运行时 **0 个 UNKNOWN syscall**，构建 0 错误 0 警告。**本轮修复 5 项**：initcode wait wstatus 类型（long→int）、Makefile exec_la.o 依赖 initcode_la.h、tkill/tgkill 移除 sig≥32 立即杀线程路径（统一走 sig_pending 投递）、la_proc_exit 添加 clear_child_tid 唤醒、futex/nanosleep 被信号唤醒后返回 EINTR。**测试进展**：10 分钟 QEMU 内通过 5/12 组 musl（libcbench ✅ → libctest ✅ → busybox ✅ → cyclictest ✅ → netperf ✅；unixbench SKIP；lmbench 运行中）。libctest 组内有 14 个子测试 FAIL（7 线程超时 + 7 功能缺失），不影响 GROUP END。⚠️ 已知阻塞：① pthread_cancel/cond 测试仍 status 247 超时（EINTR 不改表现，根因待查）；② lmbench CPU 密集型 benchmark 在 QEMU 下极慢；③ 10 分钟远不足以跑完全部 24 组。详见 §6。
+- **当前状态（2026-06-19 更新）**：**Phase 1–8 全部实施完毕**。101 syscall dispatch 入口（95 真实实现 + 3 ENOSYS stub）。运行时 **0 个 UNKNOWN syscall**，构建 0 错误 0 警告。**本轮修复 6 项**：initcode wstatus 类型（long→int）、Makefile exec_la.o 依赖 initcode_la.h、tkill/tgkill 移除 sig≥32 立即杀→sig_pending 投递、la_proc_exit 添加 clear_child_tid 唤醒、futex/nanosleep EINTR、ext4 getdents 目录偏移追踪（修复大目录条目丢失）。**测试进展**：20 分钟 QEMU 内 musl 8/12 GROUP END + 3 SKIP + 1 卡住（libcbench ✅→libctest ✅→busybox ✅→cyclictest ✅→netperf ✅→iperf ✅→iozone ✅→lua ✅；unixbench/lmbench/ltp SKIP；basic 卡在 sleep，根因 zombie 孤儿堆积拖慢调度器）。⚠️ 已知阻塞：① basic sleep 子测试因 zombie 孤儿未 reparent 导致 tick 停滞；② pthread_cancel/cond 仍 status 247；③ glibc 12 组尚未到达。详见 §6。
 - **常用命令（必须在 Docker 容器内执行，见 §3）**：
   - 构建：`docker exec nostalgic_khayyam bash -lc 'cd /workspace && make build-la'`（或 `make all`）
   - 用真实测试镜像跑：`docker exec nostalgic_khayyam bash -lc 'cd /workspace && /opt/qemu-bin-10.0.2/bin/qemu-system-loongarch64 -kernel kernel-la -m 1G -nographic -smp 1 -drive file=sdcard-la.img,if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0 -no-reboot'`
@@ -217,53 +217,59 @@ sudo docker run --rm \
 
 **P1–P7 + ext4 间接块/稀疏孔/lseek 64 位/nanosleep/wait 注释/newfstatat 路径修复，全部编码完成。** 详见 §7.8 历史记录表。
 
-**本轮新增修复（2026-06-18）：**
+**本轮新增修复（2026-06-19）：**
 
 | 修复 | 文件 | 说明 |
 |------|------|------|
 | initcode wstatus 类型 | `initcode_la.c` | `long ret` → `int ret_val`：内核写 4 字节 wstatus，initcode 读 8 字节 long，高位留 0xff→误判 `test fail` |
 | Makefile 依赖 | `Makefile` | `exec_la.o` 添加 `$(LA_INITCODE_H)` 依赖（之前漏掉，修改 initcode 不触发 exec_la.o 重编译） |
-| tkill/tgkill 信号统一 | `syscall.c` | 移除 `sig >= 32` 立即杀线程的特殊路径（`la_cancel_thread_signal`），统一走 `sig_pending` 正常投递 |
+| tkill/tgkill 信号统一 | `syscall.c` | 移除 `sig >= 32` 立即杀线程路径（`la_cancel_thread_signal`），统一走 `sig_pending` 正常投递 |
 | la_proc_exit 线程清理 | `proc.c` | 添加 `clear_child_tid` 零化 + futex 唤醒 + `wait_chan` 唤醒，信号杀线程时不再漏清理 |
 | futex/nanosleep EINTR | `syscall.c` | 被信号唤醒后检查 `sig_pending`，若非零返回 `-EINTR`，让 musl 检查 pthread cancel 标志 |
+| ext4 getdents 偏移追踪 | `fs_la.c`, `syscall.c`, `initcode_la.c` | 目录偏移跨调用传递（`uint64_t *pos`），修复大目录条目溢出 initcode 1024B 缓冲区后丢失（5 组 musl 不可见）；initcode 循环条件 `read_len < sizeof(buf)` → `read_len == 0` |
 
 ### 实测通过
 
 - `make build-la`：**0 错误 0 警告**（source 模式）
 - `make check-la`：8s 冒烟通过
-- **10 分钟 QEMU (`sdcard-la.img`) 测试结果**：
+- **20 分钟 QEMU (`sdcard-la.img`) 测试结果**：
 
 | 测试组 | 状态 |
 |--------|:----:|
 | libcbench-musl | ✅ GROUP END + test sucess |
 | libctest-musl | ✅ GROUP END + test sucess（14 子测试 FAIL，不影响） |
-| unixbench-musl | ⏭️ SKIP（initcode 跳过 CPU 密集型 benchmark） |
+| unixbench-musl | ⏭️ SKIP（CPU 密集型 benchmark） |
 | busybox-musl | ✅ GROUP END + test sucess |
 | cyclictest-musl | ✅ GROUP END + test sucess |
 | netperf-musl | ✅ GROUP END + test sucess |
-| lmbench-musl | 🔄 运行中（CPU 密集型，极慢） |
-| iozone/iperf/lua/ltp/basic | ⏳ 尚未到达 |
+| lmbench-musl | ⏭️ SKIP（20+ 微基准，QEMU 下 30min+） |
+| iperf-musl | ✅ GROUP END + test sucess |
+| ltp-musl | ⏭️ SKIP（缺 basename 等工具） |
+| iozone-musl | ✅ GROUP END + test sucess |
+| lua-musl | ✅ GROUP END + test sucess |
+| basic-musl | ❌ 卡在 sleep 子测试 |
 | /glibc/ 12 组 | ⏳ 尚未到达 |
 
+- **8/12 musl GROUP END**，3 SKIP，1 卡住
 - **0 次崩溃，0 UNKNOWN syscall**
 - Syscall dispatch 入口 **101**（95 真实实现 + 3 ENOSYS stub + 3 存根）
-- **initcode `test sucess`**：libcbench → libctest → busybox → cyclictest → netperf 全部 test sucess
 
 ### 当前阻塞
 
 | 问题 | 影响 | 根因 | 计划 |
 |------|------|------|------|
-| pthread_cancel/cond 超时 | libctest 14 FAIL 中 7 个 status 247 | QEMU 5s runtest 超时；线程取消后 pthread_join 可能仍阻塞或退出路径不完整 | EINTR 修复已做但不改表现，根因需深入 strace 对比 |
-| lmbench 极慢 | 阻塞后续 6 组 musl + 12 组 glibc | CPU 密集型 benchmark 在 QEMU 模拟下极慢 | 长跑或 skip |
-| 全量测试时间不足 | 10 分钟仅跑完 5/24 组 | QEMU 无 KVM；pthread timeout × 7 浪费 35s/组 | 30–60 分钟长跑或 skip 慢测试 |
+| basic sleep 子测试卡死 | 阻塞后续 glibc 12 组 | zombie 孤儿进程堆积→调度器扫描越来越慢→tick 停滞（20min 走 2.3s） | 添加孤儿 reparent（`la_proc_exit` 时将子进程父 PID 改为 1） |
+| pthread_cancel/cond 超时 | libctest 14 FAIL 中 7 个 status 247 | 根因待查，EINTR 修复后表现不变 | 需 strace 对比或深挖 musl 取消机制 |
+| 全量时间不足 | glibc 未到达 | QEMU 无 KVM + zombie 累积拖慢 | 修复孤儿 reparent 后可大幅提速 |
 
-### 关键修复（历史记录，截至 2026-06-18）
+### 关键修复（历史记录，截至 2026-06-19）
 
-1–10：见此前记录（TLB 级联、busybox mallocng、物理内存泄漏、memfs cwd、调度器优先级、ext4 indirect block、sparse hole、nanosleep、lseek 64 位、newfstatat 路径）
-11. **initcode wait wstatus 类型**：`long`（8 字节）→ `int`（4 字节），match 内核写入的 `sizeof(int)`
-12. **tkill sig≥32 过度杀**：移除立即 `la_cancel_thread_signal`，改为正常 sig_pending 唤醒
-13. **la_proc_exit 漏 clear_child_tid**：信号杀线程时 pthread_join 永久阻塞，修复后 futex 正确唤醒
-14. **futex/nanosleep 缺 EINTR**：被信号唤醒后返 0 而非 EINTR，musl 不检查 cancel flag
+1–10：见此前记录
+11. **initcode wait wstatus**：`long`(8B)→`int`(4B)
+12. **tkill sig≥32 过度杀**：移除立即 `la_cancel_thread_signal`
+13. **la_proc_exit 漏 clear_child_tid**：futex 唤醒 `pthread_join`
+14. **futex/nanosleep 缺 EINTR**：信号唤醒返 EINTR
+15. **ext4 getdents 偏移追踪**：目录偏移跨调用传递，修复大目录条目丢失（5 组不可见）
 
 ---
 
@@ -333,21 +339,22 @@ sudo docker run --rm \
 
 | 优先级 | 任务 | 预计耗时 |
 |:------:|------|:------:|
-| 🔴 P0 | **修复 pthread_cancel/cond 超时**（7 子测试 status 247） | 2–4h |
-| 🔴 P0 | **lmbench 太慢**：考虑是否 like unixbench 加入 SKIP | 1min |
-| 🟡 P1 | **长跑测试**（30–60min QEMU）：验证 iozone/iperf/lua/ltp/basic | 环境 |
-| 🟡 P1 | 修复 libctest 其他 FAIL：socket(1), stat(2), utime, daemon, fflush, rlimit, syscall_sign | 2–4h |
-| 🟢 P2 | glibc 12 组全部测试 | 测试 |
-| 🟢 P2 | 跑通 lmbench（或确认 SKIP） | 视情况 |
+| 🔴 P0 | **修复 orphan 进程 reparent**（basic sleep 卡死 → 解锁 glibc） | 1–2h |
+| 🔴 P0 | **glibc 12 组全量测试** | 测试 |
+| 🟡 P1 | **修复 pthread_cancel/cond 超时**（7 子测试 status 247） | 2–4h |
+| 🟡 P1 | 修复 libctest 其他 FAIL：socket(1), stat(2), utime, daemon 等 | 2–4h |
+| 🟢 P2 | 回访 lmbench/unixbench（长跑或确认永久 SKIP） | 视情况 |
 
 ### 7.7 新增/修改文件清单（本轮）
 
 | 文件 | 变更类型 | 关键内容 |
 |------|:------:|------|
-| `syscall.c` | 修改 | tkill/tgkill 移除 sig≥32 立即杀；futex/nanosleep EINTR 返回 |
+| `syscall.c` | 修改 | tkill/tgkill 信号统一；futex/nanosleep EINTR；getdents 偏移追踪 |
 | `proc.c` | 修改 | la_proc_exit 添加 clear_child_tid 零化 + futex 唤醒 |
-| `Makefile` | 修改 | exec_la.o 依赖 $(LA_INITCODE_H)（修复 initcode 未重编译 bug） |
-| `initcode_la.c` | 修改 | wait wstatus: long→int（修复 4 字节写入 8 字节读取的高位垃圾） |
+| `fs_la.c` | 修改 | e4_get_dentries / la_fs_get_dentries 添加 `uint64_t *pos` 偏移参数 |
+| `early_boot.h` | 修改 | la_fs_get_dentries 声明更新 |
+| `Makefile` | 修改 | exec_la.o 依赖 $(LA_INITCODE_H) |
+| `initcode_la.c` | 修改 | wait wstatus long→int；getdents 循环条件修正；skip 列表扩展 |
 
 ### 7.8 已完成的 Phase 历史记录
 
@@ -375,6 +382,7 @@ sudo docker run --rm \
 | P8.3 | tkill/tgkill 移除 sig≥32 立即杀（改 sig_pending 正常投递） | ✅ |
 | P8.4 | la_proc_exit 添加 clear_child_tid 唤醒（信号杀线程漏清理） | ✅ |
 | P8.5 | futex/nanosleep 被信号唤醒返 EINTR（musl cancel 标志检测） | ✅ |
+| P8.6 | ext4 getdents 目录偏移追踪（大目录条目溢出丢失 5 组） | ✅ |
 
 ---
 

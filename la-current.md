@@ -1,6 +1,6 @@
 # LoongArch (B 线) 内核开发手册
 
-> 最后更新：2026-06-18 23:30（Phase 8 修复：initcode wstatus 类型 / Makefile 依赖 / tkill 信号统一 / la_proc_exit 线程清理 / futex EINTR；实测 musl 5/12 组 GROUP END）
+> 最后更新：2026-06-19 00:30（Phase 8 完成：+ext4 getdents 偏移追踪 + musl 8/12 GROUP END；下一目标 orphan reparent 解锁 basic + glibc）
 >
 > 本文档面向**开发者**，记录 SeaOS 项目 LoongArch 架构的设计思路、文件结构、路线图进展、以及按时间排列的开发日志。
 
@@ -161,7 +161,7 @@ src/kernel/loongarch/
 
 ### 2.3 全部分数路线图（Step 10–21 完成后，2026-06-14 制定）
 
-#### 评测全景（2026-06-18 实测更新）
+#### 评测全景（2026-06-19 实测更新）
 
 ```
 /musl/ 12 组（基础分）         /glibc/ 12 组（加分）
@@ -171,13 +171,15 @@ src/kernel/loongarch/
 ├─ unixbench  ⏭️ SKIP         ├─ unixbench  🔴
 ├─ cyclictest ✅ GROUP END    ├─ cyclictest 🔴
 ├─ netperf    ✅ GROUP END    ├─ netperf    🔴
-├─ lmbench    🔄 运行极慢     ├─ lmbench    🔴
-├─ iozone     ⏳ 未到达       ├─ iozone     🔴
-├─ iperf      ⏳ 未到达       ├─ iperf      🔴
-├─ lua        ⏳ 未到达       ├─ lua        🔴
-├─ ltp        ⏳ 未到达       ├─ ltp        🔴
-└─ basic      ⏳ 未到达       └─ basic      🔴
+├─ lmbench    ⏭️ SKIP         ├─ lmbench    🔴
+├─ iperf      ✅ GROUP END    ├─ iperf      🔴
+├─ ltp        ⏭️ SKIP         ├─ ltp        🔴
+├─ iozone     ✅ GROUP END    ├─ iozone     🔴
+├─ lua        ✅ GROUP END    ├─ lua        🔴
+└─ basic      ❌ sleep 卡死   └─ basic      🔴
 ```
+
+> ✅ = GROUP END + test sucess。⏭️ = initcode SKIP。❌ = 卡住阻塞后续。
 
 #### Step21后续的分阶段计划
 
@@ -659,6 +661,38 @@ P4.1 mmap 文件 ──→ P4.2 lmbench+iozone ──→ P5 LTP
 - 与 memfs 分支统一，行为一致
 
 **涉及文件：** `syscall.c`
+
+---
+
+### 2026-06-19 00:30 — Phase 8.6：ext4 getdents 偏移追踪 + musl 8/12 通过
+
+**新增修复 6：ext4 getdents 目录偏移追踪**
+- 问题：`e4_get_dentries` 每次从偏移 0 读取，大目录（/musl/ 含 41 条目 ≈ 1300+ 字节）溢出 initcode 的 1024 字节缓冲区后，剩余 5 条 `*_testcode.sh` 条目永远不可见。同时 initcode 的 `read_len < sizeof(buf) → break` 逻辑拒绝第二次 `get_dentries` 调用。
+- 修复（`fs_la.c`）：`e4_get_dentries` / `la_fs_get_dentries` 添加 `uint64_t *pos` 参数，跨调用保存/恢复偏移；缓冲区满时精确停在未完成条目位置，下一次调用从该处继续。
+- 修复（`syscall.c`）：`sys_get_dentries` 传递 `&p->fds[fd].offset` 作为偏移追踪变量。
+- 修复（`initcode_la.c`）：循环终止条件 `read_len < sizeof(de_buf)`→`read_len == 0`，允许增量读取大目录。
+
+**SKIP 列表扩充：**
+- `lmbench`：20+ 微基准（lat_ctx/bw_mmap_rd 等），迭代数千次，QEMU 下 30min+
+- `ltp`：需 `basename` 等外部工具，测试环境不完整
+
+**测试结果（20 分钟 QEMU）：**
+
+| 组 | 结果 | | 组 | 结果 |
+|----|------|-|----|------|
+| libcbench-musl | ✅ | | iperf-musl | ✅ |
+| libctest-musl | ✅ | | ltp-musl | ⏭️ SKIP |
+| unixbench-musl | ⏭️ SKIP | | iozone-musl | ✅ |
+| busybox-musl | ✅ | | lua-musl | ✅ |
+| cyclictest-musl | ✅ | | basic-musl | ❌ sleep 卡死 |
+| netperf-musl | ✅ | | glibc 12 组 | ⏳ 未到达 |
+| lmbench-musl | ⏭️ SKIP | | | |
+
+**新发现阻塞：basic sleep 子测试卡死**
+- 根因：zombie 孤儿进程累积——子进程退出后其子进程未 reparent 到 init(pid=1)，僵尸永不被收割→进程表堆积→调度器每 tick 扫描全部槽位→tick 速率雪崩（20min 只推进 2.3s）
+- 计划：`la_proc_exit` 中添加孤儿 reparent 逻辑
+
+**涉及文件：** `fs_la.c`, `syscall.c`, `early_boot.h`, `initcode_la.c`
 
 ---
 

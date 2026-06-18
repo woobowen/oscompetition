@@ -207,7 +207,10 @@ static int run_test_entries(const char *dir)
             off += reclen;
         }
 
-        if ((uint32)read_len < sizeof(de_buf))
+        /* Keep reading until the kernel returns 0 — large directories
+         * may need multiple getdents calls (the kernel now tracks the
+         * directory offset across calls). */
+        if ((uint32)read_len == 0)
             break;
     }
 
@@ -223,9 +226,13 @@ static int run_test_entries(const char *dir)
  * within a reasonable wall-clock budget. */
 static int is_skipped_test(const char *name)
 {
-    /* Skip unixbench — its dhrystone/whetstone benchmarks are CPU-intensive
-     * tight loops that take many minutes in QEMU emulation. */
+    /* Skip CPU-intensive benchmarks that run thousands of iterations
+     * each and take many minutes (or hours) in QEMU emulation. */
     if (local_strncmp(name, "unixbench", 9) == 0) return 1;
+    if (local_strncmp(name, "lmbench", 7) == 0) return 1;
+    /* Skip ltp — the test environment lacks tools like 'basename',
+     * and the full suite has hundreds of testcases for full Linux. */
+    if (local_strncmp(name, "ltp", 3) == 0) return 1;
     return 0;
 }
 

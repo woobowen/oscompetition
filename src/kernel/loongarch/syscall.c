@@ -833,7 +833,10 @@ static uint64_t sys_fstat(struct la_trap_frame *tf)
     return 0;
 }
 
-/* SYS_get_dentries: read directory entries (Linux dirent64 format) */
+/* SYS_get_dentries: read directory entries (Linux dirent64 format).
+ * Uses fd->offset to track directory position across calls so that
+ * directories with more entries than fit in the user buffer can be
+ * read incrementally. */
 static uint64_t sys_get_dentries(struct la_trap_frame *tf)
 {
     int fd        = (int)tf->gpr[LA_GPR_A0];
@@ -853,7 +856,8 @@ static uint64_t sys_get_dentries(struct la_trap_frame *tf)
         /* memfs directory — list children from in-memory inode table */
         n = (uint32_t)memfs_getdents((int)p->fds[fd].ino, dentbuf, len);
     } else if (p->fds[fd].type == LA_FD_FILE) {
-        n = la_fs_get_dentries(p->fds[fd].ino, dentbuf, len);
+        n = la_fs_get_dentries(p->fds[fd].ino, dentbuf, len,
+                               &p->fds[fd].offset);
     } else {
         return (uint64_t)-1;
     }
