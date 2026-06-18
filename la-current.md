@@ -1,6 +1,6 @@
 # LoongArch (B 线) 内核开发手册
 
-> 最后更新：2026-06-14 22:00
+> 最后更新：2026-06-18 18:20（修复 ext4 间接块映射 / 稀疏空洞 / lseek 64 位 / nanosleep / wait 注释 / newfstatat 路径）
 >
 > 本文档面向**开发者**，记录 SeaOS 项目 LoongArch 架构的设计思路、文件结构、路线图进展、以及按时间排列的开发日志。
 
@@ -568,6 +568,117 @@ P4.1 mmap 文件 ──→ P4.2 lmbench+iozone ──→ P5 LTP
 - syscall dispatch 入口: **101**（原 ~60），95 真实实现 + 3 ENOSYS stub
 
 ---
+
+### 2026-06-18 00:12 — ext4 稀疏空洞填充 + 间接块映射 + lseek 64 位偏移
+
+**Commit:** `2d3186d loongarch: 实现 ext4 稀疏空洞填充 + 间接块映射 + lseek 64 位偏移`
+
+**问题背景：** sdcard-la.img 中的部分 inode 没有 `EXTENTS_FL` 标志位（老式 ext4），原有 `e4_lbn2pb` 直接返回 -1 导致读取失败；部分文件有 sparse hole（块指针为 0），`e4_read_file` 遇到 -1 就 break 导致长文件截断；`fd.offset` 是 `uint32_t` 限制了 >4GB 文件。
+
+**ext4 indirect block mapping（fs_la.c）：**
+- 在 `e4_lbn2pb` 开头加 fallback：如果 `EXTENTS_FL` 未设置，走传统 block-map 路径
+- 直接块：lbn 0-11 → `bp[lbn]`
+- 间接块：lbn 12+ → `bp[12]`（单）、`bp[13]`（双）、`bp[14]`（三）
+- 每个间接块 `e4.bsz / 4 = 1024` 个条目
+- 间接块通过 `bio_read()` 读，零指针返回 -1（表示 hole）
+
+**ext4 extent → block-map fallback：**
+- 如果 ext 路径走完 `r < 0`（magic 不匹配、corrupt tree），自动尝试 block-map
+- 处理混合元数据 inode（ext 标志位被设但 i_block 仍是直接指针）
+
+**ext4 sparse hole 支持：**
+- `e4_read_file` 中 `e4_lbn2pb` 返回 -1 时，填充零到用户缓冲（而非 break）
+- 长文件读取不再中断
+
+**lseek 64 位（proc.h + syscall.c）：**
+- `struct la_fd.offset`: `uint32_t` → `uint64_t`
+- `sys_lseek`: 改用 `uint64_t` 算术
+- 支持 >4GB 文件
+
+**verbose serial 输出精简（syscall.c + proc.c）：**
+- 删除 `proc: created user 'name' pid=X` 打印
+- 删除 `clone: thread pid=X sp=Y parent=Z` 打印
+- 删除 `exit: code=X pid=Y` 打印（保留 shared_vm 即线程的退出打印）
+- 删除 `getdents: ino=n` / `n=` 打印
+- 减少 QEMU 串口 I/O 瓶颈
+
+**涉及文件：**
+- 修改: `fs_la.c`, `proc.c`, `proc.h`, `syscall.c`, `pmem.c`, `tlb_la.c`, `trap.c`, `exec_la.c`, `early_boot.h`, `entry.S`, `memfs_la.c`, `memfs_la.h`
+- 新增: `docs/PHASE4_PROPOSAL.md`
+
+---
+
+### 2026-06-18 18:02 — nanosleep 真实时长睡眠
+
+**Commit:** `88658a2 loongarch: 实现 nanosleep 真实时长睡眠 + initcode 清理`
+
+**问题背景：** `sys_nanosleep` 原本只 `la_proc_sleep()` 一次（~10ms），不读取用户传入的 `struct timespec` 参数，调用方传 5s 也只睡 10ms。
+
+**修复（syscall.c）：**
+- 从 `a0` 读用户 `struct timespec { tv_sec, tv_nsec }`（8+8 字节）
+- 校验：`tv_sec >= 0`, `0 <= tv_nsec < 1e9`
+- 换算成 tick：`total = tv_sec * LA_TIMER_HZ + (tv_nsec * HZ + 99999999) / 100000000`
+- 循环：`la_timer_get_ticks()` 比较 + `la_proc_sleep()` 让出 CPU
+- 这样调度器还能调度其他 RUNNABLE 进程
+
+**initcode 清理：**
+- 移除之前实验加入的 watchdog 看门狗代码（原本想用 fork+nanosleep+kill 实现 per-test 超时，引入 bug 后回退）
+
+**涉及文件：** `syscall.c`, `src/user/initcode_la.c`
+
+---
+
+### 2026-06-18 18:03 — wait syscall wstatus 注释 + initcode 清理
+
+**Commit:** `b3f908b loongarch: 完善 wait syscall wstatus 注释 + initcode 清理`
+
+**修改（syscall.c）：**
+- `sys_wait` 注释补充 Linux `wstatus` 编码规范：
+  - `WIFEXITED(status)   = (status & 0x7f) == 0`
+  - `WEXITSTATUS(status) = (status >> 8) & 0xff`
+  - `WIFSIGNALED(status) = (status & 0x7f) != 0`
+  - `WTERMSIG(status)    = status & 0x7f`
+- 当前实现：信号杀死的子进程编码为 `status=0`（按正常退出处理，exit code=0）
+- 已知限制：未实现信号标记位（`WIFSIGNALED`）路径
+
+**initcode 清理（src/user/initcode_la.c）：**
+- 之前提交的 watchdog 代码已删除
+
+**涉及文件：** `syscall.c`, `src/kernel/loongarch/initcode_la.h`, `src/user/initcode_la.c`
+
+---
+
+### 2026-06-18 18:03 — newfstatat 使用解析后的绝对路径
+
+**Commit:** `1f51e84 loongarch: newfstatat 使用解析后的绝对路径进行 ext4 查找`
+
+**问题背景：** `sys_newfstatat` 之前对 memfs 用 `la_resolve_memfs_path()` 解析的 `abs_path`，但对 ext4 调用 `la_fs_lookup()` 时仍用原始 `path`。这导致 stat 相对路径（如 `stat("t", &st)`）在 ext4 子目录中找不到文件。
+
+**修复（syscall.c）：**
+- `sys_newfstatat` 中 `la_fs_lookup()` 调用改用 `abs_path`（已解析的绝对路径）
+- 与 memfs 分支统一，行为一致
+
+**涉及文件：** `syscall.c`
+
+---
+
+### 2026-06-18 00:12 — ADEF 嵌套异常修复（commit 2d3186d 包含）+ 文档更新
+
+**问题回顾：** 2026-06-12 23:07 报告的 ADEF→INE 级联崩溃在 2d3186d 中随同 ISTLBR/PGDL 防御性修复一并根治，libcbench-musl 现在能正常打印 `GROUP END`。
+
+**关键修复（在 2d3186d 中已应用）：**
+- proc.c: `la_proc_exit` 退出前清 ISTLBR + 调度器切用户态时 `la_proc_activate_user_pgtbl()` 严格按 ASID 激活 PGDL
+- uvm_la.c: `la_uvm_free_pgtbl` 全 TLB 冲刷改为 `la_tlb_inval_all()`
+- 验证：多轮 sdcard-la.img 测试 0 次崩溃，0 UNKNOWN syscall
+
+**CLAUDE.md / la-current.md 更新：**
+- 当前状态更新为 2026-06-18
+- 关键修复历史表添加 6-18 的新条目
+- 已知问题表更新为：unixbench-musl 卡死（CPU 紧循环在 QEMU 模拟下太慢，无法在合理时间内完成）
+
+---
+
+## 第四部分：累计统计
 
 ### 2.4 系统调用覆盖统计
 

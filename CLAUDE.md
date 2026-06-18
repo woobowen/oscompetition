@@ -9,7 +9,7 @@
 
 - **项目**：SeaOS — 华东师大花狮小队，oscomp 2026「OS 内核实现赛道」初赛。xv6 风格内核，目标跑通 `/musl`、`/glibc` 下的 oscomp 测试脚本。
 - **两条线**：**A 线 = RISC-V**（`src/kernel/`，成熟，101+ syscall、动态链接、pipe、memfs 齐备，是事实参考实现）；**B 线 = LoongArch**（`src/kernel/loongarch/`，Step 10–21 全部完成，**本文档对象**）。LoongArch 与 RISC-V 共用同一套 Linux「通用 ABI」syscall 号表。
-- **当前状态（2026-06-14）**：**Phase 1–5 全部实施完毕**（P1 memfs/glibc/busybox → P2 loopback TCP/UDP → P3 RT调度+select → P4 mmap文件映射 → P5 LTP syscall补齐）。101 syscall dispatch 入口（95 真实实现 + 3 ENOSYS stub）。新增 `socket_la.c/h` loopback 网络栈。运行时 **0 个 UNKNOWN syscall**，构建 0 错误 0 警告。libcbench-musl 6/6 exit=0。⚠️ 已知问题：libcbench 退出阶段 ADEF 嵌套异常（QEMU invtlb 缺陷），阻止 GROUP END 打印但不影响子测试结果（均 exit=0）。详见 §6。
+- **当前状态（2026-06-18）**：**Phase 1–7 全部实施完毕**（P1 memfs/glibc/busybox → P2 loopback TCP/UDP → P3 RT调度+select → P4 mmap文件映射 → P5 LTP syscall补齐 → P6 ext4间接块/稀疏孔/ext-fallback → P7 lseek 64位/nanosleep/wait 注释/newfstatat 路径/verbose 精简）。101 syscall dispatch 入口（95 真实实现 + 3 ENOSYS stub）。新增 `socket_la.c/h` loopback 网络栈 + `docs/PHASE4_PROPOSAL.md`。运行时 **0 个 UNKNOWN syscall**，构建 0 错误 0 警告。libcbench-musl/libctest-musl ✅ GROUP END。⚠️ 已知阻塞：unixbench-musl 因 dhrystone/whetstone 紧循环在 QEMU 模拟下耗时过长而卡住（项目硬约束禁止跳过用户程序）。详见 §6。
 - **常用命令（必须在 Docker 容器内执行，见 §3）**：
   - 构建：`docker exec nostalgic_khayyam bash -lc 'cd /workspace && make build-la'`（或 `make all`）
   - 用真实测试镜像跑：`docker exec nostalgic_khayyam bash -lc 'cd /workspace && /opt/qemu-bin-10.0.2/bin/qemu-system-loongarch64 -kernel kernel-la -m 1G -nographic -smp 1 -drive file=sdcard-la.img,if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0 -no-reboot'`
@@ -213,17 +213,17 @@ sudo docker run --rm \
 
 ## 六、当前状态（2026-06-18）
 
-### 已完成（Phase 1–5，全部实施）
+### 已完成（Phase 1–5 + 内核稳定性修复，全部实施）
 
-**P1 memfs/glibc/busybox + P2 loopback TCP/UDP + P3 RT调度+select + P4 mmap文件映射 + P5 LTP syscall 补齐，全部编码完成。** 详见 §7.8 历史记录表。
+**P1 memfs/glibc/busybox + P2 loopback TCP/UDP + P3 RT调度+select + P4 mmap文件映射 + P5 LTP syscall 补齐 + ext4 间接块映射/稀疏空洞/lseek 64 位/nanosleep 真实时长/wait 注释/newfstatat 路径修复，全部编码完成。** 详见 §7.8 历史记录表。
 
 ### 实测通过
 
 - `make build-la`：**0 错误 0 警告**（source 模式）
 - `make check-la`：8s 冒烟通过（boot → kernel ready → timer heartbeat）
 - `sdcard-la.img` 测试：**libcbench-musl** ✅ GROUP END，`libctest-musl` ✅ GROUP END
-- **0 次崩溃，0 UNKNOWN syscall**（ADEF→INE 级联 bug 已修复）
-- Syscall dispatch 入口 **106**（95+ 真实实现 + 3 ENOSYS stub：sendmsg/recvmsg/sendfile）
+- **0 次崩溃，0 UNKNOWN syscall**（ADEF→INE 级联 bug 已修复，含 ISTLBR 显式置位 + ASID 区分地址空间）
+- Syscall dispatch 入口 **101**（95 真实实现 + 3 ENOSYS stub + 3 存根：sendmsg/recvmsg/sendfile）
 - 新增文件：`socket_la.c`（390行）+ `socket_la.h`（114行），loopback TCP/UDP 完整实现
 - 所有核心子系统通路：进程/文件/管道/信号/线程/内存/定时器/动态链接/块缓存/网络/socket
 
@@ -244,6 +244,8 @@ sudo docker run --rm \
 6. **ext4 indirect block mapping**：老式 inode（无 EXTENTS_FL）原本直接 FAIL。修复：添加 direct + single/double/triple indirect block pointer 解析。
 7. **ext4 sparse hole**：`lbn2pb` 返回 -1 时直接 break。修复：在 `e4_read_file` 中填充零，长文件读取不再中断。
 8. **nanosleep 假实现**：原本只 sleep 1 tick。修复：基于 `la_timer_get_ticks()` 的实际时长 sleep。
+9. **lseek 32 位上限**：`fd.offset` 为 `uint32_t`，>4GB 文件出错。修复：改为 `uint64_t`。
+10. **newfstatat 路径不一致**：对 ext4 用了原始相对路径，memfs 用了绝对路径。修复：ext4 查找也改用 `abs_path`。
 
 ---
 
@@ -348,6 +350,14 @@ sudo docker run --rm \
 | P3.2 | select/poll 实现 | ✅ |
 | P4.1 | mmap 文件映射 (MAP_PRIVATE) | ✅ |
 | P5 | LTP syscall 补齐 (+20 syscall) | ✅ |
+| P6.1 | ext4 老式 inode 间接块映射 (direct+单/双/三级 indirect) | ✅ |
+| P6.2 | ext4 sparse hole 填充零 (替代 break) | ✅ |
+| P6.3 | ext4 ext→block-map fallback (混合元数据) | ✅ |
+| P7.1 | lseek 64 位偏移 (fd.offset: u32→u64) | ✅ |
+| P7.2 | nanosleep 真实时长 (la_timer_get_ticks 循环) | ✅ |
+| P7.3 | wait syscall wstatus 注释 (Linux 编码规范) | ✅ |
+| P7.4 | newfstatat 路径一致化 (ext4 也用 abs_path) | ✅ |
+| P7.5 | verbose 串口精简 (proc create/clone/exit/getdents) | ✅ |
 
 ---
 
