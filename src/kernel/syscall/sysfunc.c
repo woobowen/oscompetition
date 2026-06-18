@@ -162,14 +162,18 @@ uint64 sys_mmap()
 uint64 sys_munmap()
 {
     uint64 start; // 璧峰鍦板潃
-    uint32 len;   // 鍦板潃鑼冨洿
+    uint64 len;   // 鍦板潃鑼冨洿
     arg_uint64(0, &start);
-    arg_uint32(1, &len);
+    arg_uint64(1, &len);
 
-    if (len == 0) return (uint64)-1;
-    if (start % PGSIZE != 0 || len % PGSIZE != 0) return (uint64)-1;
+    if (len == 0) return (uint64)(-EINVAL);
+    if (start % PGSIZE != 0) return (uint64)(-EINVAL);
+    if (start + len < start) return (uint64)(-EINVAL);
 
-    uint32 npages = len / PGSIZE;
+    uint64 aligned_len = (len + PGSIZE - 1) & ~(PGSIZE - 1);
+    if (aligned_len < len) return (uint64)(-EINVAL);
+    if (aligned_len / PGSIZE > 0xffffffffUL) return (uint64)(-EINVAL);
+    uint32 npages = (uint32)(aligned_len / PGSIZE);
     uvm_munmap(start, npages);
 
     // // 璋冭瘯
@@ -388,31 +392,90 @@ uint64 sys_set_tid_address()
     return (uint64)(myproc()->pid);
 }
 
+// qemu virt time CSR frequency: INTERVAL=1e6 cycles ~= 0.1s, so timebase is 10MHz.
+#define FUTEX_TIMEBASE_HZ 10000000ull
+
+#define FUTEX_WAIT_OP 0
+#define FUTEX_WAKE_OP 1
+#define FUTEX_WAIT_BITSET_OP 9
+#define FUTEX_PRIVATE_FLAG 128
+#define FUTEX_CLOCK_REALTIME 256
+
+static uint64 futex_rel_timeout_ticks(uint64 timeout_addr)
+{
+    if (timeout_addr == 0)
+        return 0;
+    uint64 ts[2] = {0, 0};
+    uvm_copyin(myproc()->pgtbl, (uint64)ts, timeout_addr, sizeof(ts));
+    uint64 ticks = ts[0] * 10;
+    if (ts[1] > 0)
+        ticks++;
+    return ticks;
+}
+
+static uint64 futex_abs_timeout_ticks(uint64 timeout_addr)
+{
+    if (timeout_addr == 0)
+        return 0;
+    uint64 ts[2] = {0, 0};
+    uvm_copyin(myproc()->pgtbl, (uint64)ts, timeout_addr, sizeof(ts));
+    uint64 max_u64 = ~0ull;
+    if (ts[0] > max_u64 / FUTEX_TIMEBASE_HZ)
+        return max_u64 / INTERVAL;
+    uint64 deadline = ts[0] * FUTEX_TIMEBASE_HZ + ts[1] / 100;
+    uint64 now = r_time();
+    if (deadline <= now)
+        return 0;
+    return (deadline - now + INTERVAL - 1) / INTERVAL;
+}
+
+static int futex_wait_current(uint64 uaddr, uint32 val)
+{
+    uint32 cur = 0;
+    uvm_copyin(myproc()->pgtbl, (uint64)&cur, uaddr, sizeof(cur));
+    return cur == val;
+}
+
 // 98 futex(uaddr, op, val, timeout, uaddr2, val3): minimal WAIT/WAKE.
 uint64 sys_futex()
 {
     uint64 uaddr = arg_raw(0);
-    int op = (int)arg_raw(1) & 0x7f;
+    int raw_op = (int)arg_raw(1);
+    int op = raw_op & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
     uint32 val = (uint32)arg_raw(2);
+    uint64 timeout_addr = arg_raw(3);
 
     if (uaddr == 0)
         return (uint64)(-EFAULT);
-    if (op == 1) {
+    if (op == FUTEX_WAKE_OP) {
         proc_wakeup_force((void *)uaddr);
         return 1;
     }
-    if (op == 0) {
+    if (op == FUTEX_WAIT_OP || op == FUTEX_WAIT_BITSET_OP) {
         proc_t *p = myproc();
-        uint32 cur = 0;
         spinlock_acquire(&p->lk);
-        uvm_copyin(p->pgtbl, (uint64)&cur, uaddr, sizeof(cur));
-        if (cur != val) {
+        if (!futex_wait_current(uaddr, val)) {
             spinlock_release(&p->lk);
             return (uint64)(-EAGAIN);
         }
-        proc_sleep((void *)uaddr, &p->lk);
+        if (timeout_addr == 0) {
+            proc_sleep((void *)uaddr, &p->lk);
+            spinlock_release(&p->lk);
+            return 0;
+        }
         spinlock_release(&p->lk);
-        return 0;
+
+        uint64 ticks = (op == FUTEX_WAIT_BITSET_OP) ?
+            futex_abs_timeout_ticks(timeout_addr) :
+            futex_rel_timeout_ticks(timeout_addr);
+        if (ticks == 0)
+            return (uint64)(-ETIMEDOUT);
+        while (ticks-- > 0) {
+            timer_wait(1);
+            if (!futex_wait_current(uaddr, val))
+                return 0;
+        }
+        return (uint64)(-ETIMEDOUT);
     }
     return 0;
 }
@@ -1474,7 +1537,7 @@ uint64 sys_setsid()
 }
 
 // qemu virt 鐨?time CSR 棰戠巼: INTERVAL=1e6 cycle鈮?.1s => 10MHz
-#define TIMEBASE_HZ 10000000ull
+#define TIMEBASE_HZ FUTEX_TIMEBASE_HZ
 
 // 113 clock_gettime锛氳幏鍙栨椂閽熸椂闂达紙楂樼簿搴︼級
 uint64 sys_clock_gettime()

@@ -323,6 +323,7 @@ proc_t *proc_alloc()
             p->sig_pending = 0;
             p->sig_delivering = 0;
             p->clear_child_tid = 0;
+            p->reparented_to_init = 0;
             p->itimer_expire = 0;
             p->itimer_interval = 0;
             p->ub_looper_secs = 0;
@@ -420,11 +421,27 @@ void proc_free(proc_t *p)
     p->sig_pending = 0;
     p->sig_delivering = 0;
     p->clear_child_tid = 0;
+    p->reparented_to_init = 0;
     p->itimer_expire = 0;
     p->itimer_interval = 0;
     p->ub_looper_secs = 0;
 
     p->state = UNUSED;
+}
+
+static void proc_reap_background_zombies(void)
+{
+    for (int i = 0; i < N_PROC; i++) {
+        proc_t *p = &proc_list[i];
+        spinlock_acquire(&p->lk);
+        if (p != proczero && p->state == ZOMBIE &&
+            (p->shared_vm || (p->parent == proczero && p->reparented_to_init))) {
+            proc_free(p);
+            spinlock_release(&p->lk);
+            continue;
+        }
+        spinlock_release(&p->lk);
+    }
 }
 
 /* 
@@ -717,6 +734,7 @@ static void proc_reparent(proc_t *parent)
         spinlock_acquire(&p->lk);
         if (p->state != UNUSED && p->parent == parent) {
             p->parent = proczero;
+            p->reparented_to_init = 1;
         }
         spinlock_release(&p->lk);
     }
@@ -738,11 +756,13 @@ static void proc_kill_descendants(proc_t *parent)
         if (child) {
             file_t *files[N_OPEN_FILE_PER_PROC];
             inode_t *cwd;
+            uint64 clear_child_tid;
 
             proc_kill_descendants(p);
 
             memset(files, 0, sizeof(files));
             cwd = NULL;
+            clear_child_tid = 0;
             spinlock_acquire(&p->lk);
             if (p->state != UNUSED && p->state != ZOMBIE) {
                 for (int fd = 0; fd < N_OPEN_FILE_PER_PROC; fd++) {
@@ -757,10 +777,17 @@ static void proc_kill_descendants(proc_t *parent)
                 p->itimer_expire = 0;
                 p->itimer_interval = 0;
                 p->ub_looper_secs = 0;
+                clear_child_tid = p->clear_child_tid;
+                p->clear_child_tid = 0;
                 p->state = ZOMBIE;
             }
             spinlock_release(&p->lk);
 
+            if (clear_child_tid != 0) {
+                uint32 zero = 0;
+                uvm_copyout(p->pgtbl, clear_child_tid, (uint64)&zero, sizeof(zero));
+                proc_wakeup_force((void *)clear_child_tid);
+            }
             for (int fd = 0; fd < N_OPEN_FILE_PER_PROC; fd++) {
                 if (files[fd] != NULL)
                     file_close(files[fd]);
@@ -1060,6 +1087,8 @@ void proc_scheduler()
         intr_on(); // 开启中断，否则所有进程 sleep 时 CPU 会死锁在关中断状态！
         c->proc = NULL;
 
+        proc_reap_background_zombies();
+
         // Lab-11: 该 CPU 处于 scheduler 循环中(不在运行进程)
         mlfq_set_cpu_running(mycpuid(), 0);
 
@@ -1103,6 +1132,8 @@ void proc_scheduler()
 
         // 从进程切回调度器后，仍持有 p->lk
         p->sched_ctx_switches++;
+        if (p->state == ZOMBIE && p->shared_vm)
+            proc_free(p);
         spinlock_release(&p->lk);
     }
 }
