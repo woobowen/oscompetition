@@ -2320,7 +2320,7 @@ static uint64_t sys_newfstatat(struct la_trap_frame *tf)
         fsize = memfs_inode_size(mi);
         ino   = (uint32_t)mi;
     } else {
-        if (la_fs_lookup(path, &ino) < 0)
+        if (la_fs_lookup(abs_path, &ino) < 0)
             return (uint64_t)-1;
         ftype = la_fs_inode_type(ino);
         fsize = la_fs_inode_size(ino);
