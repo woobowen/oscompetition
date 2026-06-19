@@ -403,6 +403,25 @@ void __attribute__((noreturn)) la_proc_exit(int code)
     if (me->wait_chan)
         la_proc_wakeup_chan(me->wait_chan);
 
+    /* Reparent orphan children to init (pid 1).  If we don't do this,
+     * every shell→command fork cycle leaves behind zombies whose parent_pid
+     * points to a dead process.  Those zombies are never reaped and
+     * accumulate in the process table, making the scheduler scan slower
+     * each tick until the timer effectively stalls. */
+    {
+        struct la_proc *procs = la_proc_table();
+        for (int i = 0; i < LA_NPROC; i++) {
+            if (procs[i].state != LA_PROC_UNUSED &&
+                procs[i].parent_pid == me->pid) {
+                procs[i].parent_pid = 1;
+                /* If the orphan is already a zombie, wake init so it can
+                 * reap it on its next wait cycle. */
+                if (procs[i].state == LA_PROC_ZOMBIE)
+                    la_proc_wakeup_pid(1);
+            }
+        }
+    }
+
     me->exit_code = (int)(unsigned)code;
     me->state     = LA_PROC_ZOMBIE;
     if (me->parent_pid > 0)
