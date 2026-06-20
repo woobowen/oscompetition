@@ -9,7 +9,7 @@
 
 - **项目**：SeaOS — 华东师大花狮小队，oscomp 2026「OS 内核实现赛道」初赛。xv6 风格内核，目标跑通 `/musl`、`/glibc` 下的 oscomp 测试脚本。
 - **两条线**：**A 线 = RISC-V**（`src/kernel/`，成熟，101+ syscall、动态链接、pipe、memfs 齐备，是事实参考实现）；**B 线 = LoongArch**（`src/kernel/loongarch/`，Step 10–21 全部完成，**本文档对象**）。LoongArch 与 RISC-V 共用同一套 Linux「通用 ABI」syscall 号表。
-- **当前状态（2026-06-19 更新）**：**Phase 1–8 全部实施完毕**。101 syscall dispatch 入口（95 真实实现 + 3 ENOSYS stub）。运行时 **0 个 UNKNOWN syscall**，构建 0 错误 0 警告。**本轮修复 6 项**：initcode wstatus 类型（long→int）、Makefile exec_la.o 依赖 initcode_la.h、tkill/tgkill 移除 sig≥32 立即杀→sig_pending 投递、la_proc_exit 添加 clear_child_tid 唤醒、futex/nanosleep EINTR、ext4 getdents 目录偏移追踪（修复大目录条目丢失）。**测试进展**：20 分钟 QEMU 内 musl 8/12 GROUP END + 3 SKIP + 1 卡住（libcbench ✅→libctest ✅→busybox ✅→cyclictest ✅→netperf ✅→iperf ✅→iozone ✅→lua ✅；unixbench/lmbench/ltp SKIP；basic 卡在 sleep，根因 zombie 孤儿堆积拖慢调度器）。⚠️ 已知阻塞：① basic sleep 子测试因 zombie 孤儿未 reparent 导致 tick 停滞；② pthread_cancel/cond 仍 status 247；③ glibc 12 组尚未到达。详见 §6。
+- **当前状态（2026-06-19 更新）**：**Phase 1–8 全部实施完毕**。101 syscall dispatch 入口（95 真实实现 + 3 ENOSYS stub）。运行时 **0 个 UNKNOWN syscall**，构建 0 错误 0 警告。**本轮修复 8 项**：initcode wstatus、Makefile 依赖、tkill/tgkill 信号统一、la_proc_exit 清理、futex/nanosleep EINTR、ext4 getdents 偏移追踪、孤儿进程 reparent、statx+exec busybox fallback。**测试进展**：musl 10/12 GROUP END + 2 SKIP（libcbench/libctest/busybox/cyclictest/netperf/iperf/iozone/lua/basic ✅；unixbench/lmbench SKIP；ltp basename 已通但 abort01 卡住→暂 SKIP）。⚠️ 下一目标：**glibc 12 组**——此前测试中 glibc libcbench 触发 TLB refill FAIL(badv=0x3)→级联 kill initcode，根因疑为 glibc ld 对 auxv/TLS/特定 syscall 的硬依赖。详见 §6、§7.6。
 - **常用命令（必须在 Docker 容器内执行，见 §3）**：
   - 构建：`docker exec nostalgic_khayyam bash -lc 'cd /workspace && make build-la'`（或 `make all`）
   - 用真实测试镜像跑：`docker exec nostalgic_khayyam bash -lc 'cd /workspace && /opt/qemu-bin-10.0.2/bin/qemu-system-loongarch64 -kernel kernel-la -m 1G -nographic -smp 1 -drive file=sdcard-la.img,if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0 -no-reboot'`
@@ -221,6 +221,57 @@ sudo docker run --rm \
 
 | 修复 | 文件 | 说明 |
 |------|------|------|
+| initcode wstatus 类型 | `initcode_la.c` | `long ret` → `int ret_val` |
+| Makefile 依赖 | `Makefile` | `exec_la.o` 依赖 `$(LA_INITCODE_H)` |
+| tkill/tgkill 信号统一 | `syscall.c` | 移除 `sig>=32` 立即杀→sig_pending 投递 |
+| la_proc_exit 清理 | `proc.c` | clear_child_tid + orphan reparent 到 pid=1 |
+| futex/nanosleep EINTR | `syscall.c` | 信号唤醒后返 -EINTR |
+| ext4 getdents 偏移 | `fs_la.c`, `syscall.c`, `initcode_la.c` | 大目录增量读取 |
+| statx+exec fallback | `syscall.c` | `/bin/*` statx 伪造存在 + exec 自动 fallback busybox |
+| UART quiet mode | `boot.c`, `syscall.c` | boot 后关内核调试输出，QEMU 提 ~5× |
+
+### 实测通过
+
+- `make build-la`：**0 错误 0 警告**
+- **musl 10/12 GROUP END**（unixbench/lmbench 永久 SKIP）
+- **0 次崩溃，0 UNKNOWN syscall**
+
+| 测试组 | 状态 |
+|--------|:----:|
+| libcbench-musl | ✅ |
+| libctest-musl | ✅（14 FAIL） |
+| unixbench-musl | ⏭️ SKIP |
+| busybox-musl | ✅ |
+| cyclictest-musl | ✅ |
+| netperf-musl | ✅ |
+| lmbench-musl | ⏭️ SKIP |
+| iperf-musl | ✅ |
+| ltp-musl | ⏭️ SKIP（basename 已通，abort01 待修） |
+| iozone-musl | ✅ |
+| lua-musl | ✅ |
+| basic-musl | ✅ |
+
+### 当前阻塞
+
+| 问题 | 影响 | 根因 | 计划 |
+|------|------|------|------|
+| glibc 未到达 | 12 组加分 | glibc libcbench 触发 TLB refill FAIL (badv=0x3) → 级联杀 initcode | 见 §7.6 glibc 计划 |
+| ltp abort01 卡死 | 1 组 musl | SIGABRT 信号处理不完整 | 后续修复 |
+| pthread_cancel/cond 超时 | libctest 7 FAIL | 根因待查 | 后续深挖 |
+
+### 关键修复（历史记录，截至 2026-06-19）
+
+1–10：见此前记录
+11. **initcode wstatus**：long→int
+12. **tkill sig≥32**：立即杀改 sig_pending
+13. **la_proc_exit**：clear_child_tid + orphan reparent
+14. **futex/nanosleep EINTR**：信号唤醒返 EINTR
+15. **ext4 getdents**：目录偏移追踪
+16. **statx+exec fallback**：busybox applet 透明可用
+17. **UART quiet**：boot 后内核调试静音
+
+| 修复 | 文件 | 说明 |
+|------|------|------|
 | initcode wstatus 类型 | `initcode_la.c` | `long ret` → `int ret_val`：内核写 4 字节 wstatus，initcode 读 8 字节 long，高位留 0xff→误判 `test fail` |
 | Makefile 依赖 | `Makefile` | `exec_la.o` 添加 `$(LA_INITCODE_H)` 依赖（之前漏掉，修改 initcode 不触发 exec_la.o 重编译） |
 | tkill/tgkill 信号统一 | `syscall.c` | 移除 `sig >= 32` 立即杀线程路径（`la_cancel_thread_signal`），统一走 `sig_pending` 正常投递 |
@@ -337,13 +388,45 @@ sudo docker run --rm \
 
 ### 7.6 当前阻塞 & 下一步
 
+#### P0：glibc 12 组全量测试
+
+**已知崩溃**：此前运行 `/glibc/libcbench_testcode.sh` 时，glibc libcbench 加载阶段触发：
+```
+TLB refill FAIL badv=0x0000000000000003 pc=0x0000000000000000
+trap: kill user proc (segv) pid=0xc7f
+trap: kill user proc (fault) pid=0x0000000000000001  ← initcode 被级联杀死
+```
+
+**诊断**：`badv=0x3` 是极低地址（NULL+3），`pc=0x0` 说明跳转到了零地址。典型原因是 glibc 动态链接器（`/glibc/lib/ld-linux-loongarch-lp64d.so.1`）在初始化阶段访问了未正确设置的 auxv / TLS / 特定 syscall 返回值，导致 NULL 指针解引用。
+
+**glibc vs musl 关键差异**（需要逐项核对）：
+
+| 类别 | musl 需求 | glibc 额外需求 |
+|------|----------|---------------|
+| auxv | AT_PHDR, AT_PHENT, AT_BASE, AT_ENTRY | AT_RANDOM, AT_PAGESZ, AT_HWCAP, AT_UID? |
+| TLS | 基本支持 | ELF 的 PT_TLS 段加载 + `set_tls_area`? |
+| syscall | 宽松（-ENOSYS 可容错） | 严格（某些 -ENOSYS 会导致 ld 崩溃） |
+| 线程本地存储 | 简单 | 需要 `arch_prctl` / `set_tls` 类 syscall? |
+| vDSO | 不需要 | 可能需要 `AT_SYSINFO_EHDR`? |
+
+**执行计划**：
+
+| 步骤 | 内容 | 方法 |
+|:----:|------|------|
+| G1 | 获取崩溃现场 exact 信息 | 临时关 UART quiet，捕获完整 trap dump（ERA/PRMD/badv/PTE） |
+| G2 | 反汇编 glibc ld | `objdump -d /glibc/lib/ld-linux-*.so.1`，定位 pc=0x0 的前一跳指令 |
+| G3 | 补齐 auxv | 对比 RV 内核 auxv 输出，添加 glibc 必需的 AT_* 条目 |
+| G4 | 补齐缺失 syscall | 运行中观察 UNKNOWN syscall，逐个实现或 stub |
+| G5 | 逐组验证 | libcbench→libctest→busybox→... 逐个启动，观察崩溃模式 |
+| G6 | glibc 全量通过 | 12 组 GROUP END |
+
 | 优先级 | 任务 | 预计耗时 |
 |:------:|------|:------:|
-| 🔴 P0 | **修复 orphan 进程 reparent**（basic sleep 卡死 → 解锁 glibc） | 1–2h |
-| 🔴 P0 | **glibc 12 组全量测试** | 测试 |
-| 🟡 P1 | **修复 pthread_cancel/cond 超时**（7 子测试 status 247） | 2–4h |
-| 🟡 P1 | 修复 libctest 其他 FAIL：socket(1), stat(2), utime, daemon 等 | 2–4h |
-| 🟢 P2 | 回访 lmbench/unixbench（长跑或确认永久 SKIP） | 视情况 |
+| 🔴 P0 | **G1–G3**：诊断 + auxv/syscall 补齐 | 2–4h |
+| 🔴 P0 | **G4–G6**：验证 + 全量通过 | 2–4h |
+| 🟡 P1 | ltp abort01 信号修复 | 1–2h |
+| 🟡 P1 | pthread_cancel/cond 超时 | 2–4h |
+| 🟢 P2 | unixbench/lmbench 回访 | 视情况 |
 
 ### 7.7 新增/修改文件清单（本轮）
 

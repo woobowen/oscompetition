@@ -10,28 +10,35 @@
 
 /* ---- early UART I/O (polled, no interrupts) ---- */
 
+int la_uart_quiet;  /* set to 1 after boot to silence kernel debug noise */
+
 void la_uart_putc(char c)
 {
+    if (la_uart_quiet)
+        return;
     volatile unsigned char *uart = (volatile unsigned char *)LA_UART_BASE;
     *uart = (unsigned char)c;
 }
 
 void la_uart_puts(const char *s)
 {
+    if (la_uart_quiet)
+        return;
     while (*s) {
-        la_uart_putc(*s);
+        volatile unsigned char *uart = (volatile unsigned char *)LA_UART_BASE;
+        *uart = (unsigned char)(*s);
         s++;
     }
 }
 
 void la_uart_put_hex(uint64_t value)
 {
+    if (la_uart_quiet)
+        return;
     static const char hex[] = "0123456789abcdef";
-
     la_uart_puts("0x");
-    for (int shift = 60; shift >= 0; shift -= 4) {
+    for (int shift = 60; shift >= 0; shift -= 4)
         la_uart_putc(hex[(value >> shift) & 0xfU]);
-    }
 }
 
 /* ---- main boot sequence ---- */
@@ -98,5 +105,6 @@ void la_boot_main(void)
 
     /* 10  Enter scheduler — never returns */
     la_uart_puts("[init] entering scheduler\n");
+    la_uart_quiet = 1;   /* silence kernel debug, user write() still works */
     la_scheduler();
 }

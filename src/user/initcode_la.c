@@ -31,6 +31,7 @@ typedef unsigned long long uint64;
 #define SYS_kill        129
 #define SYS_clock_gettime 113
 #define SYS_nanosleep   101
+#define SYS_mkdir      34
 #define SYS_shutdown   502
 
 /* ---- File open flags ---- */
@@ -230,8 +231,9 @@ static int is_skipped_test(const char *name)
      * each and take many minutes (or hours) in QEMU emulation. */
     if (local_strncmp(name, "unixbench", 9) == 0) return 1;
     if (local_strncmp(name, "lmbench", 7) == 0) return 1;
-    /* Skip ltp — the test environment lacks tools like 'basename',
-     * and the full suite has hundreds of testcases for full Linux. */
+    /* ltp: statx+exec busybox fallback works (basename found, abort01
+     * started), but the first test binary hangs — likely SIGABRT signal
+     * handling incomplete.  Re-enable after signal fixes. */
     if (local_strncmp(name, "ltp", 3) == 0) return 1;
     return 0;
 }
@@ -301,6 +303,54 @@ static void run_one(char *path, char **argv, const char *name)
 
     syscall3(SYS_write, 1,
              (long)"\n======== test sucess ========\n", 31);
+}
+
+/* ---- Create busybox wrapper scripts in /bin so shell scripts that
+ *      call 'basename', 'dirname', etc. find them.  Without these,
+ *      busybox sh's internal statx check fails before exec is called,
+ *      so a kernel-level exec fallback never gets a chance. */
+static void create_busybox_wrappers(void)
+{
+    /* Create /bin directory.  Our kernel's mkdir is the old-style
+     * mkdir(path, mode) — a0 = path, NOT mkdirat(dirfd, path, mode). */
+    syscall2(SYS_mkdir, (long)"/bin", 0);
+
+    /* Helper: create /bin/<name> containing "#!/musl/busybox\nexec $0 "$@"\n"
+     * but for simplicity, just create a one-line shebang that exec's
+     * busybox with argv[0]=name.  busybox sh will run this as a script,
+     * and exec replaces sh with busybox. */
+    static const char *wrappers[] = {
+        "basename",
+        "dirname",
+        "tr",
+        "cut",
+        "sort",
+        "uniq",
+        "xargs",
+        "expr",
+        "seq",
+        0
+    };
+    for (int i = 0; wrappers[i]; i++) {
+        char wpath[64];
+        int pos = 0;
+        wpath[pos++] = '/'; wpath[pos++] = 'b'; wpath[pos++] = 'i';
+        wpath[pos++] = 'n'; wpath[pos++] = '/';
+        for (int j = 0; wrappers[i][j]; j++)
+            wpath[pos++] = wrappers[i][j];
+        wpath[pos] = 0;
+
+        /* O_CREAT | O_WRONLY = 0x40 | 0x01 = 0x41 */
+        long fd = syscall4(SYS_open, AT_FDCWD, (long)wpath, 0x41, 0);
+        if (fd < 0) continue;
+
+        /* Write a minimal non-ELF, non-shebang file.  When exec tries
+         * to run it, the kernel returns ENOENT, and sys_exec's busybox
+         * fallback retries with /musl/busybox while preserving argv[0]
+         * (the wrapper name).  This lets busybox run as the applet. */
+        syscall3(SYS_write, fd, (long)"\n", 1);
+        syscall1(SYS_close, fd);
+    }
 }
 
 /* ---- Entry point ---- */

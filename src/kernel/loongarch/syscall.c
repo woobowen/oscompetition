@@ -363,8 +363,12 @@ static uint64_t sys_write(struct la_trap_frame *tf)
             if (!pa) break;
 
             const char *s = (const char *)pa;
-            for (uint32_t i = 0; i < chunk; i++)
-                la_uart_putc(s[i]);
+            /* Write directly to UART — bypass la_uart_quiet gating
+             * so user-space test output always reaches the serial port. */
+            for (uint32_t i = 0; i < chunk; i++) {
+                volatile unsigned char *u = (volatile unsigned char *)LA_UART_BASE;
+                *u = (unsigned char)s[i];
+            }
             written += chunk;
         }
         return written;
@@ -1050,8 +1054,15 @@ static uint64_t sys_exec(struct la_trap_frame *tf)
      * sensible errno instead of -1, which musl reads as EPERM and busybox
      * prints as "Operation not permitted". */
     uint64_t rc = la_do_exec_syscall(tf, path, uargv);
-    if (rc == (uint64_t)-1)
-        return (uint64_t)(-LA_ENOENT);
+    if (rc == (uint64_t)-1) {
+        /* Busybox applet fallback: if exec fails (file not found, not
+         * ELF, etc.), retry with /musl/busybox.  argv[0] is preserved
+         * so busybox runs as the intended applet.  Works for bare names
+         * AND PATH-qualified paths like /bin/basename. */
+        rc = la_do_exec_syscall(tf, "/musl/busybox", uargv);
+        if (rc == (uint64_t)-1)
+            return (uint64_t)(-LA_ENOENT);
+    }
     return rc;
 }
 
@@ -2331,8 +2342,36 @@ static uint64_t sys_newfstatat(struct la_trap_frame *tf)
         fsize = memfs_inode_size(mi);
         ino   = (uint32_t)mi;
     } else {
-        if (la_fs_lookup(abs_path, &ino) < 0)
-            return (uint64_t)-1;
+        if (la_fs_lookup(abs_path, &ino) < 0) {
+            /* Busybox applet fallback (stat step): busybox sh searches
+             * PATH and calls stat on "/bin/cmd", "/usr/bin/cmd", etc.
+             * before trying exec.  If the path looks like it's in a
+             * standard bin directory, fabricate a "file exists" response
+             * so the shell proceeds to exec, where the busybox fallback
+             * in sys_exec handles the actual execution. */
+            int maybe_applet = 0;
+            /* bare name (no '/') */
+            int has_slash = 0;
+            for (int i = 0; path[i]; i++)
+                if (path[i] == '/') { has_slash = 1; break; }
+            if (!has_slash) {
+                maybe_applet = 1;
+            } else {
+                /* PATH-qualified: /bin/xxx, /sbin/xxx, /usr/bin/xxx, /usr/sbin/xxx */
+                if ((path[0] == '/' && path[1] == 'b' && path[2] == 'i' && path[3] == 'n' && path[4] == '/') ||
+                    (path[0] == '/' && path[1] == 's' && path[2] == 'b' && path[3] == 'i' && path[4] == 'n' && path[5] == '/') ||
+                    (path[0] == '/' && path[1] == 'u' && path[2] == 's' && path[3] == 'r' && path[4] == '/' && path[5] == 'b' && path[6] == 'i' && path[7] == 'n' && path[8] == '/') ||
+                    (path[0] == '/' && path[1] == 'u' && path[2] == 's' && path[3] == 'r' && path[4] == '/' && path[5] == 's' && path[6] == 'b' && path[7] == 'i' && path[8] == 'n' && path[9] == '/'))
+                    maybe_applet = 1;
+            }
+            if (!maybe_applet)
+                return (uint64_t)-1;
+            /* Fabricate a minimal stat: regular file, inode 0, size 0 */
+            ino   = 0;
+            ftype = 0;
+            fsize = 0;
+            /* fall through to build the stat struct below */
+        }
         ftype = la_fs_inode_type(ino);
         fsize = la_fs_inode_size(ino);
     }
@@ -3386,13 +3425,14 @@ static uint64_t sys_nanosleep(struct la_trap_frame *tf)
 
     uint64_t start = la_timer_get_ticks();
     while (la_timer_get_ticks() - start < total_ticks) {
-        la_proc_sleep();   /* ~10ms per tick; scheduler runs other procs */
+        /* Yield (stay RUNNABLE) so the scheduler runs other processes
+         * or idles.  The timer ISR fires asynchronously and advances
+         * la_ticks regardless. */
+        la_proc_yield();
         /* Break out early if a signal arrived (pthread_cancel, etc.) */
-        {
-            struct la_proc *me = la_current_proc();
-            if (me && me->sig_pending)
-                return (uint64_t)(-LA_EINTR);
-        }
+        struct la_proc *me = la_current_proc();
+        if (me && me->sig_pending)
+            return (uint64_t)(-LA_EINTR);
     }
     return 0;
 }

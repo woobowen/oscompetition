@@ -1,6 +1,6 @@
 # LoongArch (B 线) 内核开发手册
 
-> 最后更新：2026-06-19 00:30（Phase 8 完成：+ext4 getdents 偏移追踪 + musl 8/12 GROUP END；下一目标 orphan reparent 解锁 basic + glibc）
+> 最后更新：2026-06-19 02:00（Phase 8 全部修复 + musl 10/12 GROUP END；ltp basename 已通 / abort01 待修；启动 glibc 12 组攻关）
 >
 > 本文档面向**开发者**，记录 SeaOS 项目 LoongArch 架构的设计思路、文件结构、路线图进展、以及按时间排列的开发日志。
 
@@ -165,7 +165,7 @@ src/kernel/loongarch/
 
 ```
 /musl/ 12 组（基础分）         /glibc/ 12 组（加分）
-├─ libcbench  ✅ GROUP END    ├─ libcbench  🔴 待测
+├─ libcbench  ✅ GROUP END    ├─ libcbench  🔴 TLB refill FAIL (badv=0x3)
 ├─ libctest   ✅ GROUP END    ├─ libctest   🔴
 ├─ busybox    ✅ GROUP END    ├─ busybox    🔴
 ├─ unixbench  ⏭️ SKIP         ├─ unixbench  🔴
@@ -173,13 +173,14 @@ src/kernel/loongarch/
 ├─ netperf    ✅ GROUP END    ├─ netperf    🔴
 ├─ lmbench    ⏭️ SKIP         ├─ lmbench    🔴
 ├─ iperf      ✅ GROUP END    ├─ iperf      🔴
-├─ ltp        ⏭️ SKIP         ├─ ltp        🔴
+├─ ltp        ⏭️ SKIP(basename已通  ├─ ltp     🔴
+│             abort01卡住)    │
 ├─ iozone     ✅ GROUP END    ├─ iozone     🔴
 ├─ lua        ✅ GROUP END    ├─ lua        🔴
-└─ basic      ❌ sleep 卡死   └─ basic      🔴
+└─ basic      ✅ GROUP END    └─ basic      🔴
 ```
 
-> ✅ = GROUP END + test sucess。⏭️ = initcode SKIP。❌ = 卡住阻塞后续。
+> ✅ = GROUP END + test sucess。⏭️ = initcode SKIP。
 
 #### Step21后续的分阶段计划
 
@@ -661,6 +662,43 @@ P4.1 mmap 文件 ──→ P4.2 lmbench+iozone ──→ P5 LTP
 - 与 memfs 分支统一，行为一致
 
 **涉及文件：** `syscall.c`
+
+---
+
+### 2026-06-19 02:00 — glibc 攻关启动：问题诊断与执行计划
+
+**当前状态：**
+- musl 10/12 GROUP END（libcbench/libctest/busybox/cyclictest/netperf/iperf/iozone/lua/basic ✅；unixbench/lmbench 永久 SKIP；ltp basename 已通但 abort01 待修）
+- statx+exec fallback 已就绪，ltp 脚本的 `$(basename "$file")` 可正常工作
+- 孤儿 reparent + UART quiet mode + ext4 getdents 偏移，musl 所有可通过的组均已达 GROUP END
+
+**glibc 崩溃现象（此前测试）：**
+```
+run /glibc/libcbench_testcode.sh
+GROUP START libcbench-glibc
+TLB refill FAIL badv=0x0000000000000003 pc=0x0000000000000000
+trap: kill user proc (segv) pid=0xc7f
+trap: kill user proc (fault) pid=0x1 (initcode)
+```
+
+**根因分析：**
+- `badv=0x3` 是 NULL+3，`pc=0x0` 是零地址跳转
+- glibc 动态链接器 `/glibc/lib/ld-linux-loongarch-lp64d.so.1` 由 `la_load_interp` 加载到 `0x40000000`
+- 加载本身成功（musl 的 ld 也走同一路径），但 glibc ld 初始化时需要更丰富的 auxv / TLS / syscall 支持
+- 某处 NULL 解引用 → 页错误 → 子进程被杀 → 父进程（initcode）被级联异常
+
+**执行计划（6 步）：**
+
+| 步骤 | 内容 | 方法 |
+|:----:|------|------|
+| G1 | 临时关 UART quiet，捕获完整 trap dump | 查看 ERA/PRMD/badv/PTE，定位崩溃精确地址 |
+| G2 | 反汇编 glibc ld | `objdump -d ld-linux-*.so.1`，定位 pc→0x0 的调用链 |
+| G3 | 补齐 auxv | 对比 RV auxv，添加 AT_RANDOM/AT_PAGESZ/AT_HWCAP 等 |
+| G4 | 补齐缺失 syscall | 关 UART quiet 观察 UNKNOWN syscall |
+| G5 | 逐组验证 | libcbench→libctest→... 逐个启动 |
+| G6 | 全量通过 | 12 组 GROUP END |
+
+**涉及文件（待修改）：** `exec_la.c`（auxv 构造）、`syscall.c`（缺 syscall 补齐）、`boot.c`（临时关 UART quiet 以便诊断）
 
 ---
 

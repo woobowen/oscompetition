@@ -50,31 +50,6 @@ void la_timer_interrupt(void)
     la_csr_write(1, LA_CSR_TICLR);
 
     la_ticks++;
-
-    /* Heartbeat every second (100 ticks) */
-    if (la_ticks % 100 == 0) {
-        la_uart_puts("[tick ");
-        la_uart_put_hex(la_ticks / 100);
-        la_uart_puts(" s] refills=");
-        la_uart_put_hex(la_tlb_refill_count);
-        la_uart_puts("\n");
-    }
-
-    /* Wake SLEEPING processes that use wait_chan==0 (nanosleep tick
-     * waiters, wait4 sleepers).  Without this, nanosleep would never
-     * return because nothing else wakes a process sleeping via
-     * la_proc_sleep().  wait4 sleepers are harmless to wake — they
-     * re-scan for zombie children, find none, and go back to sleep. */
-    {
-        struct la_proc *procs = la_proc_table();
-        for (int i = 0; i < LA_NPROC; i++) {
-            if (procs[i].state == LA_PROC_SLEEPING &&
-                procs[i].wait_chan == 0 &&
-                procs[i].pid > 0) {
-                procs[i].state = LA_PROC_RUNNABLE;
-            }
-        }
-    }
 }
 
 uint64_t la_timer_get_ticks(void)
