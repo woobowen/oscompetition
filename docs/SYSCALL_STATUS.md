@@ -103,11 +103,11 @@
 | 211 | sendmsg | 明确返回 `-EOPNOTSUPP` |
 | 212 | recvmsg | 明确返回 `-EOPNOTSUPP` |
 | 214 | brk | `CLONE_VM` heap grow 同步 live sibling 页表和 `heap_top`；shrink 仍是最小当前线程语义 |
-| 215 | munmap | `addr` 必须页对齐；`len` 按 Linux 语义向上页对齐 |
+| 215 | munmap | `addr` 必须页对齐；`len` 按 Linux 语义向上页对齐；`CLONE_VM` live siblings 同步清 PTE 并单次释放 PA |
 | 216 | mremap | 最小兼容；收缩/同尺寸返回原地址，增长返回 `-ENOMEM` |
 | 220 | clone | musl fork/pthread 依赖；按 flag 区分 parent_tid、child_tid 与 clear_child_tid |
 | 221 | execve | 支持动态链接 ELF (D4) |
-| 222 | mmap | len 自动 page 对齐 |
+| 222 | mmap | len 自动 page 对齐；lazy fault 在 `CLONE_VM` live siblings 间复用/同步同 VA 的 PA |
 | 226 | mprotect | 最小权限更新：已有映射按 prot 调整 PTE_R/W/X |
 | 227 | msync | 最小兼容：校验参数后返回 0 |
 | 228 | mlock | 最小兼容，返回 0 |
@@ -152,7 +152,7 @@ lmbench-glibc
 | 130/131 | tkill/tgkill | 主表补记；最小线程 signal 兼容。 |
 | 157 | setsid | 主表补记；返回调用者 pid 作为 session id。 |
 | 163/164/261 | getrlimit/setrlimit/prlimit64 | 主表补记；支持当前进程 `RLIMIT_NOFILE` 的静态 fd 表语义。 |
-| 215 | munmap | `addr` 页对齐校验，`len` 按 Linux 语义向上页对齐。 |
+| 215 | munmap | `addr` 页对齐校验，`len` 按 Linux 语义向上页对齐；`CLONE_VM` live siblings 同步清 PTE 并单次释放 PA。 |
 | 227 | msync | 主表补记；最小兼容成功路径。 |
 | 278 | getrandom | 主表补记；非阻塞伪随机字节。 |
 

@@ -1,4 +1,4 @@
-# SeaOS RISC-V Current State (2026-06-21)
+# SeaOS RISC-V Current State (2026-06-22)
 
 ## Baseline Command
 
@@ -17,11 +17,11 @@ Before each rerun, remove only the root-level temporary files `sdcard-rv.img`, `
 
 Generated log: `os_serial_out_rv.txt`
 
-The latest regenerated RISC-V run used the fixed docker command from 2026-06-21 08:55:31 to 2026-06-21 10:49:32 Asia/Shanghai. The docker container exited with status 0, and the serial log reaches `sys_shutdown` at line 2880.
+The latest regenerated RISC-V run used the fixed docker command from 2026-06-21 23:31:00 to 2026-06-22 01:33:26 Asia/Shanghai. The docker container exited with status 0, completed under the 2.5 hour cap, and the serial log reaches `sys_shutdown` at line 2865.
 
 ## Important Interpretation Rule
 
-`======== test end    ========` is an initcode/test-wrapper marker written by this project. It only proves that the wrapper reached its own cleanup point. It is not proof that the testsuite really passed. Older logs may contain a misleading spelling; treat it as the same wrapper end marker, not as success evidence.
+`======== test end    ========` is an initcode/test-wrapper marker. It only proves that the wrapper reached its own cleanup point. It is not proof that the testsuite really passed.
 
 Real status must come from the actual `testsuits-for-oskernel/` program and script output. Internal markers such as `FAIL`, `[SEGV]`, `end: fail`, `Function not implemented`, `Interrupted system call`, `panic`, `fork fail`, `no more mmap`, `unknown syscall`, or group-level `test fail` remain real defects even if the wrapper later prints its end marker.
 
@@ -31,50 +31,49 @@ Real status must come from the actual `testsuits-for-oskernel/` program and scri
 |---|---|---|
 | `unixbench-musl` | `GROUP END` line 100, wrapper end line 102 | No focused failure marker in the latest run. |
 | `busybox-musl` | `GROUP END` line 347, wrapper end line 349 | No focused failure marker in the latest run. |
-| `cyclictest-musl` | `GROUP END` line 402, wrapper end line 404 | Includes `kill hackbench: success`. `SENDER: write (error: No error information)` appears while terminating hackbench workers at lines 395-399. |
-| `netperf-musl` | `GROUP END` line 461, wrapper end line 463 | `UDP_STREAM`, `TCP_STREAM`, `UDP_RR`, `TCP_RR`, and `TCP_CRR` print `end: success`. |
-| `lmbench-musl` | `GROUP END` line 509, wrapper end line 511 | No focused failure marker in the latest run. |
-| `iperf-musl` | `GROUP END` line 635, wrapper end line 637 | No focused failure marker in the latest run. |
-| `unixbench-glibc` | `GROUP END` line 670, wrapper end line 672 | No focused failure marker in the latest run. |
-| `libcbench-glibc` | `GROUP END` line 758, wrapper end line 760 | Not clean. `free(): invalid pointer` remains at line 696, before `b_malloc_thread_stress`; the first pthread-area `[SEGV]` remains at line 730 (`pc=0x236a6`, `stval=0xf0`, `ra=0x112d8`). |
-| `libctest-glibc` | `GROUP END` line 2499, wrapper end line 2501 | Not clean. Still has many real `FAIL` lines, `Interrupted system call` at line 2439, `[SEGV]` at lines 2037 and 2235, and the PC=0 cascade at lines 2466-2484. |
-| `busybox-glibc` | `GROUP END` line 2746, wrapper end line 2748 | No focused failure marker in the latest run. |
-| `cyclictest-glibc` | `GROUP END` line 2796, wrapper end line 2798 | Includes `kill hackbench: success`; group wrapper completes under hackbench pressure. |
-| `netperf-glibc` | `GROUP END` line 2829, wrapper end line 2831 | Not clean. All five subtests still print `end: fail` at lines 2808, 2813, 2818, 2823, and 2828. Four subtests also report `[SEGV] pc=0x3ffb1392e0` at lines 2810, 2815, 2820, and 2825. |
-| `lmbench-glibc` | `GROUP END` line 2877, wrapper end line 2879 | No focused failure marker in the latest run. |
+| `cyclictest-musl` | `GROUP END` line 397, wrapper end line 399 | Includes `kill hackbench: success`. |
+| `netperf-musl` | `GROUP END` line 455, wrapper end line 457 | `UDP_STREAM`, `TCP_STREAM`, `UDP_RR`, `TCP_RR`, and `TCP_CRR` print `end: success`. |
+| `lmbench-musl` | `GROUP END` line 503, wrapper end line 505 | No focused failure marker in the latest run. |
+| `iperf-musl` | `GROUP END` line 629, wrapper end line 631 | No focused failure marker in the latest run. |
+| `unixbench-glibc` | `GROUP END` line 664, wrapper end line 666 | No focused failure marker in the latest run. |
+| `libcbench-glibc` | `GROUP END` line 751, wrapper end line 753 | Improved but not clean. The earlier `free(): invalid pointer` lines are gone. The first remaining internal failure is `[SEGV]` line 723 (`pc=0x236a6`, `stval=0xf0`, `ra=0x112d8`) after `b_pthread_createjoin_serial1`, before `b_pthread_create_serial1`. |
+| `libctest-glibc` | `GROUP END` line 2494, wrapper end line 2496 | Not clean. Many `FAIL` lines remain. Current first true failure is `FAIL clocale_mbfuncs [status 1]` at line 1079. `Interrupted system call` remains at lines 1173, 1232, and 1581. Many status-127 failures remain later in static tests. |
+| `busybox-glibc` | `GROUP END` line 2741, wrapper end line 2743 | No focused failure marker in the latest run. |
+| `cyclictest-glibc` | `GROUP END` line 2791, wrapper end line 2793 | Includes `kill hackbench: success`; group wrapper completes under hackbench pressure. |
+| `netperf-glibc` | `GROUP END` line 2824, wrapper end line 2826 | Not clean. `UDP_STREAM`, `TCP_STREAM`, `UDP_RR`, `TCP_RR`, and `TCP_CRR` still print `end: fail` at lines 2803, 2808, 2813, 2818, and 2823. Four subtests also report `[SEGV] pc=0x3ffb1392e0` at lines 2805, 2810, 2815, and 2820. |
+| `lmbench-glibc` | `GROUP END` line 2862, wrapper end line 2864 | No focused failure marker in the latest run. |
 
 Focused checks in the final log:
 
 ```text
+sys_shutdown=True
 panic=False
+pmem_alloc=False
 fork_fail=False
 no_more_mmap=False
 unknown_syscall=False
 group_test_fail=False
-pmem_alloc=False
+free_invalid_pointer=False
 segv=True
 ```
 
 ## This Iteration
 
-- Retained one narrow RISC-V kernel change: `brk(214)` grow now synchronizes newly mapped heap leaves and `heap_top` to live same-`vm_owner` siblings. This is documented in `docs/DECISIONS.md` D34 and `docs/SYSCALL_STATUS.md`.
-- Tested and reverted two narrower hypotheses because they did not improve `libcbench-glibc`: `munmap` sibling stale-PTE cleanup and `clone` tid-page prefault before sharing.
-- Final evidence still shows the same first `libcbench-glibc` corruption path: `free(): invalid pointer` in the malloc-thread section, followed later by `[SEGV] pc=0x236a6 stval=0xf0` in the pthread create/join area. This suggests the first useful next step is to instrument or reason from the two-thread malloc stress path and shared address-space/page-table semantics, not to treat the wrapper end marker as success.
+- Retained D34: `brk(214)` grow synchronizes newly mapped heap leaves and `heap_top` to live same-`vm_owner` siblings.
+- Added D35: mmap lazy faults now reuse/synchronize the same PA for the same VA across live `CLONE_VM` siblings; `munmap` clears live sibling PTEs and frees the PA once; `proc_free()` avoids freeing shared leaves while same-owner siblings are still live.
+- This removes the earliest `libcbench-glibc` malloc-thread symptom (`free(): invalid pointer`) that previously appeared immediately after `b_malloc_big2`.
+- It does not hide or fix the later `libcbench-glibc` pthread-area `[SEGV] pc=0x236a6 stval=0xf0`; that remains the next libcbench target.
 
-## Current Boundary
+## Remaining Real Gaps
 
-The RISC-V kernel currently boots, runs the visible script sequence through `lmbench-glibc`, and reaches `sys_shutdown` under the fixed docker command after regenerating `kernel-rv` with `make all`. That is a regression baseline, not a claim that every testsuite is clean.
+1. `libcbench-glibc`: first remaining real failure is `[SEGV]` at line 723, `pc=0x236a6`, `stval=0xf0`, after `b_pthread_createjoin_serial1`.
+2. `libctest-glibc`: many true `FAIL` lines remain, starting with `clocale_mbfuncs`; `Interrupted system call` remains in wrapper wait paths.
+3. `netperf-glibc`: all five real subtests still end in `fail`, with four repeated user `[SEGV]` reports in the response path.
 
-Remaining real gaps to prioritize:
+Do not treat wrapper `test end` as testsuite success.
 
-1. `libcbench-glibc` still has pthread/malloc corruption (`free(): invalid pointer`) and the first pthread-area `[SEGV]` at `pc=0x236a6`.
-2. `libctest-glibc` still has many real `FAIL` lines, `Interrupted system call`, and multiple user `[SEGV]` reports, including the later PC=0 cascade.
-3. `netperf-glibc` still has real UDP/TCP subtest failures (`end: fail`) plus current SEGVs in four subtests.
+## Public-Path Risk Notes
 
-Do not hide these by relying on wrapper `test end` or the historical misleading spelling. The next useful work is to reduce one real internal failure at a time while keeping the current regression baseline from going backwards.
-
-## Public-File Risk Notes
-
-This iteration touches `src/kernel/syscall/sysfunc.c`, `src/kernel/proc/method.h`, `src/kernel/proc/proc.c`, `docs/SYSCALL_STATUS.md`, and `docs/DECISIONS.md`. Risk: `brk`, process, and page-table behavior are shared paths; mistakes can affect fork/clone, pthread shared address spaces, heap growth, or later mmap/munmap behavior. The final fixed docker run above is the regression evidence for the retained state.
+This iteration investigated `libcbench-glibc` line 723 and tried a stricter `PROT_NONE`/`mprotect` propagation patch. The strict `PROT_NONE` trial hung in `libcbench-glibc` under the 2.5 hour cap; the narrower `mprotect` propagation trial did not improve the libcbench `[SEGV]` and introduced a `cyclictest-glibc` `kill hackbench: fail` regression, so both code changes were rolled back. The retained source state is the prior D35 baseline; only docs/status/log files were updated in this round.
 
 The forbidden grader images `data/sdcard-rv.img.gz` and `data/sdcard-la.img.gz` were not modified.
