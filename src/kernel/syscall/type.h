@@ -6,6 +6,7 @@
 #define SYS_brk 214              // Linux/RISC-V brk
 #define SYS_mmap 222             // Linux/RISC-V mmap
 #define SYS_munmap 215           // Linux/RISC-V munmap
+#define SYS_mremap 216           // Linux/RISC-V mremap
 #define SYS_fork 4               // SeaOS fork
 #define SYS_wait 260             // Linux/RISC-V wait4
 #define SYS_exit 93              // Linux/RISC-V exit
@@ -18,6 +19,7 @@
 #define SYS_read 63              // Linux/RISC-V read
 #define SYS_write 64             // Linux/RISC-V write
 #define SYS_readv 65             // Linux/RISC-V readv
+#define SYS_pread64 67           // Linux/RISC-V pread64
 #define SYS_lseek 62             // Linux/RISC-V lseek
 #define SYS_dup 23               // Linux/RISC-V dup
 #define SYS_fstat 80             // Linux/RISC-V fstat
@@ -39,6 +41,7 @@
 #define SYS_utimensat 88         // Linux/RISC-V utimensat
 #define SYS_rt_sigsuspend 133    // Linux/RISC-V rt_sigsuspend
 #define SYS_rt_sigprocmask 135   // 信号屏蔽 (暂桩)
+#define SYS_rt_sigtimedwait 137  // Linux/RISC-V rt_sigtimedwait
 #define SYS_rt_sigreturn 139     // Linux/RISC-V rt_sigreturn
 #define SYS_setgid 144           // 暂桩返回 0
 #define SYS_setuid 146           // 暂桩返回 0

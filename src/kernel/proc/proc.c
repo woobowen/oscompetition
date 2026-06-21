@@ -186,6 +186,25 @@ static void proc_free_mmap_list(proc_t *p)
     p->mmap = NULL;
 }
 
+static int proc_has_live_vm_sibling(proc_t *target)
+{
+    proc_t *owner = target->vm_owner ? target->vm_owner : target;
+    for (int i = 0; i < N_PROC; i++) {
+        proc_t *p = &proc_list[i];
+        if (p == target)
+            continue;
+
+        int live = 0;
+        spinlock_acquire(&p->lk);
+        if (p->state != UNUSED && p->state != ZOMBIE && p->vm_owner == owner)
+            live = 1;
+        spinlock_release(&p->lk);
+        if (live)
+            return 1;
+    }
+    return 0;
+}
+
 /* 获取一个pid */
 static int alloc_pid()
 {
@@ -215,6 +234,8 @@ static void proc_return()
         p->open_file[2] = file_open("/dev/stderr", FILE_OPEN_WRITE);
         p->cwd = inode_get(ext4_is_active() ? EXT4_ROOT_INO : ROOT_INODE);
     }
+
+    proc_exit_group_if_requested();
 
     // 回到用户态
     trap_user_return();
@@ -262,7 +283,9 @@ proc_t *proc_alloc()
             p->heap_top = 0;
             p->ustack_npage = 0;
             p->mmap = NULL;
+            p->vm_owner = p;
             p->shared_vm = 0;
+            p->thread_group = 0;
             p->tf = NULL;
 
             // MLFQ 初始化
@@ -322,6 +345,8 @@ proc_t *proc_alloc()
             p->sig_restorer = 0;
             p->sig_pending = 0;
             p->sig_delivering = 0;
+            p->group_exit_pending = 0;
+            p->group_exit_code = 0;
             p->clear_child_tid = 0;
             p->reparented_to_init = 0;
             p->itimer_expire = 0;
@@ -344,7 +369,7 @@ void proc_free(proc_t *p)
 {
     // 释放用户态页表相关资源
     if (p->pgtbl) {
-        if (p->shared_vm)
+        if (p->shared_vm || proc_has_live_vm_sibling(p))
             uvm_destroy_shared_pgtbl(p->pgtbl);
         else
             uvm_destroy_pgtbl(p->pgtbl);
@@ -370,7 +395,9 @@ void proc_free(proc_t *p)
     p->heap_top = 0;
     p->ustack_npage = 0;
     p->mmap = NULL;
+    p->vm_owner = NULL;
     p->shared_vm = 0;
+    p->thread_group = 0;
     p->kstack = 0;
     memset(&p->ctx, 0, sizeof(p->ctx));
 
@@ -420,6 +447,8 @@ void proc_free(proc_t *p)
     p->sig_restorer = 0;
     p->sig_pending = 0;
     p->sig_delivering = 0;
+    p->group_exit_pending = 0;
+    p->group_exit_code = 0;
     p->clear_child_tid = 0;
     p->reparented_to_init = 0;
     p->itimer_expire = 0;
@@ -590,7 +619,9 @@ int proc_fork()
     child->heap_top = parent->heap_top;
     child->ustack_npage = parent->ustack_npage;
     child->mmap = NULL; // 子进程初始无mmap
+    child->vm_owner = child;
     child->shared_vm = 0;
+    child->thread_group = 0;
     child->state = RUNNABLE;
 
     // 调度统计：进入就绪态
@@ -620,6 +651,8 @@ int proc_fork()
     child->sig_restorer = parent->sig_restorer;
     child->sig_pending = 0;
     child->sig_delivering = 0;
+    child->group_exit_pending = 0;
+    child->group_exit_code = 0;
     child->clear_child_tid = 0;
     child->itimer_expire = 0;
     child->itimer_interval = 0;
@@ -676,6 +709,153 @@ int proc_on_tick(void)
     }
 
     return 0;
+}
+
+void proc_shared_vm_sync_mmap(mmap_region_t *old_head, mmap_region_t *new_head)
+{
+    proc_t *caller = myproc();
+    if (caller == NULL)
+        return;
+
+    proc_t *owner = caller->vm_owner ? caller->vm_owner : caller;
+    for (int i = 0; i < N_PROC; i++) {
+        proc_t *p = &proc_list[i];
+        spinlock_acquire(&p->lk);
+        if (p->state != UNUSED && p->vm_owner == owner &&
+            (p == caller || p->mmap == old_head)) {
+            p->mmap = new_head;
+        }
+        spinlock_release(&p->lk);
+    }
+}
+
+void proc_shared_vm_sync_heap_grow(uint64 old_top, uint64 new_top)
+{
+    proc_t *caller = myproc();
+    if (caller == NULL || new_top <= old_top)
+        return;
+
+    proc_t *owner = caller->vm_owner ? caller->vm_owner : caller;
+    uint64 old_pages = (old_top + PGSIZE - 1) / PGSIZE;
+    uint64 new_pages = (new_top + PGSIZE - 1) / PGSIZE;
+
+    for (int i = 0; i < N_PROC; i++) {
+        proc_t *p = &proc_list[i];
+        spinlock_acquire(&p->lk);
+        if (p->state == UNUSED || p->state == ZOMBIE || p->vm_owner != owner) {
+            spinlock_release(&p->lk);
+            continue;
+        }
+
+        if (p->heap_top < new_top)
+            p->heap_top = new_top;
+
+        if (p == caller) {
+            spinlock_release(&p->lk);
+            continue;
+        }
+
+        for (uint64 page = old_pages; page < new_pages; page++) {
+            uint64 va = page * PGSIZE;
+            pte_t *src = vm_getpte(caller->pgtbl, va, false);
+            if (src == NULL || !(*src & PTE_V))
+                continue;
+
+            pte_t *dst = vm_getpte(p->pgtbl, va, false);
+            if (dst != NULL && (*dst & PTE_V))
+                continue;
+
+            uint64 pa = (uint64)PTE_TO_PA(*src);
+            int flags = (int)PTE_FLAGS(*src);
+            vm_try_mappages(p->pgtbl, va, pa, PGSIZE, flags);
+        }
+        spinlock_release(&p->lk);
+    }
+}
+
+int proc_shared_vm_lookup_page(uint64 va, uint64 *pa_out, int *flags_out)
+{
+    proc_t *caller = myproc();
+    if (caller == NULL || pa_out == NULL || flags_out == NULL)
+        return -1;
+
+    proc_t *owner = caller->vm_owner ? caller->vm_owner : caller;
+    for (int i = 0; i < N_PROC; i++) {
+        proc_t *p = &proc_list[i];
+        spinlock_acquire(&p->lk);
+        if (p->state == UNUSED || p->state == ZOMBIE ||
+            p->vm_owner != owner || p->pgtbl == NULL) {
+            spinlock_release(&p->lk);
+            continue;
+        }
+
+        pte_t *pte = vm_getpte(p->pgtbl, va, false);
+        if (pte != NULL && (*pte & PTE_V) && !PTE_CHECK(*pte)) {
+            *pa_out = (uint64)PTE_TO_PA(*pte);
+            *flags_out = (int)PTE_FLAGS(*pte);
+            spinlock_release(&p->lk);
+            return 0;
+        }
+        spinlock_release(&p->lk);
+    }
+    return -1;
+}
+
+int proc_shared_vm_map_page(uint64 va, uint64 pa, int flags)
+{
+    proc_t *caller = myproc();
+    if (caller == NULL)
+        return -1;
+
+    int ret = 0;
+    proc_t *owner = caller->vm_owner ? caller->vm_owner : caller;
+    for (int i = 0; i < N_PROC; i++) {
+        proc_t *p = &proc_list[i];
+        spinlock_acquire(&p->lk);
+        if (p->state == UNUSED || p->state == ZOMBIE ||
+            p->vm_owner != owner || p->pgtbl == NULL) {
+            spinlock_release(&p->lk);
+            continue;
+        }
+
+        pte_t *pte = vm_getpte(p->pgtbl, va, false);
+        if (pte == NULL || !(*pte & PTE_V)) {
+            if (vm_try_mappages(p->pgtbl, va, pa, PGSIZE, flags) < 0)
+                ret = -1;
+        }
+        spinlock_release(&p->lk);
+    }
+    return ret;
+}
+
+uint64 proc_shared_vm_unmap_page(uint64 va)
+{
+    proc_t *caller = myproc();
+    if (caller == NULL)
+        return 0;
+
+    uint64 first_pa = 0;
+    proc_t *owner = caller->vm_owner ? caller->vm_owner : caller;
+    for (int i = 0; i < N_PROC; i++) {
+        proc_t *p = &proc_list[i];
+        spinlock_acquire(&p->lk);
+        if (p->state == UNUSED || p->state == ZOMBIE ||
+            p->vm_owner != owner || p->pgtbl == NULL) {
+            spinlock_release(&p->lk);
+            continue;
+        }
+
+        pte_t *pte = vm_getpte(p->pgtbl, va, false);
+        if (pte != NULL && (*pte & PTE_V) && !PTE_CHECK(*pte)) {
+            uint64 pa = (uint64)PTE_TO_PA(*pte);
+            if (first_pa == 0)
+                first_pa = pa;
+            *pte = 0;
+        }
+        spinlock_release(&p->lk);
+    }
+    sfence_vma();
+    return first_pa;
 }
 
 /*
@@ -897,6 +1077,74 @@ void proc_exit(int exit_code)
     proc_try_wakeup(p);
 
     proc_sched();
+}
+
+static int proc_signal_group_exit(proc_t *owner, proc_t *me, int exit_code)
+{
+    int live = 0;
+
+    for (int i = 0; i < N_PROC; i++) {
+        proc_t *p = &proc_list[i];
+        if (p == me)
+            continue;
+
+        int should_enqueue = 0;
+        spinlock_acquire(&p->lk);
+        if (p->state != UNUSED && p->state != ZOMBIE &&
+            p->shared_vm && p->thread_group && p->vm_owner == owner) {
+            p->group_exit_pending = 1;
+            p->group_exit_code = exit_code;
+            live++;
+            if (p->state == SLEEPING) {
+                p->state = RUNNABLE;
+                p->sleep_space = NULL;
+                p->sched_last_ready_tick = timer_get_ticks();
+                p->mlfq_age_start_tick = p->sched_last_ready_tick;
+                p->sched_ready_count++;
+                p->mlfq_in_readyq = 0;
+                should_enqueue = 1;
+            } else if (p->state == RUNNABLE) {
+                should_enqueue = 1;
+            }
+        }
+        spinlock_release(&p->lk);
+
+        if (should_enqueue)
+            mlfq_on_wakeup(p);
+    }
+
+    return live;
+}
+
+void proc_exit_group_if_requested()
+{
+    proc_t *p = myproc();
+    int pending = 0;
+    int exit_code = 0;
+
+    spinlock_acquire(&p->lk);
+    if (p->group_exit_pending) {
+        pending = 1;
+        exit_code = p->group_exit_code;
+        p->group_exit_pending = 0;
+    }
+    spinlock_release(&p->lk);
+
+    if (pending)
+        proc_exit(exit_code);
+}
+
+void proc_exit_group(int exit_code)
+{
+    proc_t *me = myproc();
+    if (!me->thread_group)
+        proc_exit(exit_code);
+
+    proc_t *owner = me->vm_owner ? me->vm_owner : me;
+    while (proc_signal_group_exit(owner, me, exit_code) > 0)
+        proc_yield();
+
+    proc_exit(exit_code);
 }
 
 /*

@@ -178,6 +178,7 @@ typedef struct proc
     uint64 heap_top;       // 用户堆顶(以字节为单位)
     uint64 ustack_npage;   // 用户栈占用的页面数量
     mmap_region_t *mmap;   // 用户态mmap区域
+    struct proc *vm_owner;  // shared VM group owner for CLONE_VM threads
     trapframe_t *tf;       // 用户态内核态切换时的运行环境暂存空间
 
     uint64 kstack;         // 内核栈的虚拟地址
@@ -192,7 +193,10 @@ typedef struct proc
     uint64 sig_restorer;          // musl 设置的 sa_restorer (调用 rt_sigreturn)
     uint64 sig_pending;           // 待投递信号位图 (bit N-1 = signal N)
     uint8  sig_delivering;        // 正在投递信号中(防嵌套)
+    uint8 group_exit_pending;      // internal exit_group request for CLONE_VM threads
+    int group_exit_code;           // exit code used by group_exit_pending
     uint8 shared_vm;              // CLONE_VM thread: page-table leaves are shared
+    uint8 thread_group;          // CLONE_THREAD member for exit_group semantics
     uint8 reparented_to_init;      // orphan adopted by proczero; safe for background reap
     uint64 clear_child_tid;        // CLONE_CHILD_CLEARTID futex address
     // ITIMER_REAL

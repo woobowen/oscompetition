@@ -31,6 +31,7 @@
 | 64 | write | |
 | 65 | readv | |
 | 66 | writev | |
+| 67 | pread64 | 按给定 offset 读取并恢复 fd offset |
 | 71 | sendfile | |
 | 72 | pselect6 | Linux fd_set copyin/copyout；socket 使用真实 readiness |
 | 73 | ppoll | |
@@ -40,9 +41,9 @@
 | 81 | sync | 桩，返回 0 |
 | 82 | fsync | 最小兼容：有效 fd 返回 0 |
 | 83 | fdatasync | 最小兼容：有效 fd 返回 0 |
-| 88 | utimensat | 最小时间戳更新/存在性检查 |
+| 88 | utimensat | 最小时间戳更新/存在性检查；兼容 `futimens(fd, NULL pathname)` |
 | 93 | exit | |
-| 94 | exit_group | 单线程下等价 exit |
+| 94 | exit_group | 单进程等价 `exit`；`CLONE_THREAD`/`CLONE_VM` 组内 sibling 通过 pending self-exit 退出 |
 | 96 | set_tid_address | 返回 pid（D3 最小实现） |
 | 98 | futex | 最小 WAIT/WAKE/WAIT_BITSET；支持粗粒度 timeout，超时返回 `-ETIMEDOUT` |
 | 99 | set_robust_list | 桩返回 0 |
@@ -67,6 +68,7 @@
 | 133 | rt_sigsuspend | 最小让出 CPU |
 | 134 | rt_sigaction | 读 musl sigaction，存 handler/restorer |
 | 135 | rt_sigprocmask | 桩，返回 0 |
+| 137 | rt_sigtimedwait | 最小 pending-signal 等待；支持 libctest SIGCHLD wrapper |
 | 139 | rt_sigreturn | 从用户栈恢复 signal frame |
 | 144 | setgid | 桩，返回 0 |
 | 146 | setuid | 桩，返回 0 |
@@ -100,8 +102,9 @@
 | 210 | shutdown | socket 半关闭，唤醒阻塞端 |
 | 211 | sendmsg | 明确返回 `-EOPNOTSUPP` |
 | 212 | recvmsg | 明确返回 `-EOPNOTSUPP` |
-| 214 | brk | |
+| 214 | brk | `CLONE_VM` heap grow 同步 live sibling 页表和 `heap_top`；shrink 仍是最小当前线程语义 |
 | 215 | munmap | `addr` 必须页对齐；`len` 按 Linux 语义向上页对齐 |
+| 216 | mremap | 最小兼容；收缩/同尺寸返回原地址，增长返回 `-ENOMEM` |
 | 220 | clone | musl fork/pthread 依赖；按 flag 区分 parent_tid、child_tid 与 clear_child_tid |
 | 221 | execve | 支持动态链接 ELF (D4) |
 | 222 | mmap | len 自动 page 对齐 |
@@ -162,7 +165,6 @@ lmbench-glibc
 
 仍保留的兼容噪声：
 
-- `rt_sigtimedwait(137)` 尚未实现，`libctest-glibc` 内部 wrapper 会打印 `unknown syscall 137` / `Function not implemented`，但组级结果已通过。
 - glibc netperf 内部仍可能打印 netserver/control 失败文本；当前测评脚本仍给出组级 `test sucess`。
 
 ## 近期状态更新（2026-06-06）

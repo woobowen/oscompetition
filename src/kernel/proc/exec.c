@@ -767,6 +767,7 @@ static int proc_exec_with_env(char *path, char **argv, char **envp)
     p->heap_top = new_heap_top;
     p->ustack_npage = 1;
     p->mmap = NULL;
+    p->vm_owner = p;
     p->shared_vm = 0;
 
     // exec 时重置信号状态
@@ -948,7 +949,9 @@ int proc_exec_target(int pid, char *path, char **argv)
     p->heap_top = new_heap_top;
     p->ustack_npage = 1;
     p->mmap = NULL;
+    p->vm_owner = p;
     p->shared_vm = 0;
+    p->thread_group = 0;
     p->clear_child_tid = 0;
     p->ub_looper_secs = unixbench_looper_secs(path, argv);
     int i;

@@ -109,7 +109,7 @@ static void run_one(char *path, char **argv)
 {
 	char str_1[] = "initcode: fork fail!\n";
 	char str_2[] = "\n======== test start  ========\n\n";
-	char str_3[] = "\n======== test sucess ========\n";
+	char str_3[] = "\n======== test end    ========\n";
 	char str_4[] = "\n======== test fail   ========\n";
 	char str_5[] = "initcode: exec fail!\n";
 

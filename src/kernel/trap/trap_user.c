@@ -48,6 +48,9 @@ void trap_user_handler()
     proc_t *p = myproc(); // 获取当前进程
     trapframe_t *tf = p->tf;
 
+    if (p->group_exit_pending)
+        proc_exit_group_if_requested();
+
     // 读取关键寄存器
     uint64 sepc = r_sepc();
     uint64 scause = r_scause();
@@ -114,6 +117,9 @@ void trap_user_handler()
             }
         }
     }
+
+    if (p->group_exit_pending)
+        proc_exit_group_if_requested();
 
     // 信号投递: 返回用户态前检查是否有待投递信号
     if (p->sig_pending != 0 && !p->sig_delivering) {

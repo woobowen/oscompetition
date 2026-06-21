@@ -351,6 +351,12 @@ static const char unixbench_sort_src_data[] =
 	"gamma\n"
 	"beta\n";
 
+static const char etc_protocols_data[] =
+	"ip 0 IP\n"
+	"icmp 1 ICMP\n"
+	"tcp 6 TCP\n"
+	"udp 17 UDP\n";
+
 static void memfs_normalize(char *dst, char *path)
 {
 	const char *src = path;
@@ -439,18 +445,26 @@ static int memfs_seed_readonly_file(char *path)
 {
 	char key[128];
 	memfs_normalize(key, path);
-	if (!streq(key, "sort.src"))
+	const char *data = NULL;
+	uint32 size = 0;
+	if (streq(key, "sort.src")) {
+		data = unixbench_sort_src_data;
+		size = sizeof(unixbench_sort_src_data) - 1;
+	} else if (streq(key, "/etc/protocols")) {
+		data = etc_protocols_data;
+		size = sizeof(etc_protocols_data) - 1;
+	} else {
 		return -1;
+	}
 
 	int idx = memfs_create(key, false);
 	if (idx < 0)
 		return -1;
 
 	memfs_node_t *node = &memfs_nodes[idx];
-	uint32 size = sizeof(unixbench_sort_src_data) - 1;
 	if (size > MEMFS_DATA_SIZE)
 		return -1;
-	memmove(node->data, unixbench_sort_src_data, size);
+	memmove(node->data, data, size);
 	node->size = size;
 	return idx;
 }

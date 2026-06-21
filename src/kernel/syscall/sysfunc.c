@@ -1,4 +1,4 @@
-﻿#include "mod.h"
+#include "mod.h"
 
 /*
     鐢ㄦ埛鍫嗙┖闂翠几缂?    uint64 new_heap_top (濡傛灉鏄?, 浠ｈ〃鏌ヨ褰撳墠鍫嗛《浣嶇疆)
@@ -23,6 +23,7 @@ uint64 sys_brk()
         uint64 ret = uvm_heap_grow(p->pgtbl, cur, len, PTE_R | PTE_W | PTE_U);
         if (ret == (uint64)-1) return (uint64)-1;
         p->heap_top = ret;
+        proc_shared_vm_sync_heap_grow(cur, ret);
 
     }else { // ungrow & stay
         uint32 len = (uint32)(cur - new_top);
@@ -186,6 +187,27 @@ uint64 sys_munmap()
     return 0;
 }
 
+// 216 mremap(old_addr, old_size, new_size, flags, new_addr): minimal resize compatibility.
+uint64 sys_mremap()
+{
+    uint64 old_addr = arg_raw(0);
+    uint64 old_size = arg_raw(1);
+    uint64 new_size = arg_raw(2);
+    uint64 flags = arg_raw(3);
+    uint64 new_addr = arg_raw(4);
+
+    if (old_addr == 0 || old_addr % PGSIZE != 0 || old_size == 0 || new_size == 0)
+        return (uint64)(-EINVAL);
+    if ((flags & ~3UL) != 0)
+        return (uint64)(-EINVAL);
+    if ((flags & 2UL) != 0 && (new_addr == 0 || new_addr % PGSIZE != 0))
+        return (uint64)(-EINVAL);
+
+    if (new_size <= old_size)
+        return old_addr;
+    return (uint64)(-ENOMEM);
+}
+
 /*
     杩涚▼澶嶅埗
     杩斿洖瀛愯繘绋嬬殑pid
@@ -240,7 +262,14 @@ uint64 sys_clone()
     child->heap_top = parent->heap_top;
     child->ustack_npage = parent->ustack_npage;
     child->mmap = parent->mmap;
+    child->vm_owner = parent->vm_owner ? parent->vm_owner : parent;
     child->shared_vm = 1;
+    child->thread_group = (flags & 0x10000) ? 1 : 0;
+    if (child->thread_group) {
+        spinlock_acquire(&parent->lk);
+        parent->thread_group = 1;
+        spinlock_release(&parent->lk);
+    }
     child->state = RUNNABLE;
     child->sched_last_ready_tick = timer_get_ticks();
     child->mlfq_age_start_tick = child->sched_last_ready_tick;
@@ -266,6 +295,8 @@ uint64 sys_clone()
     child->sig_restorer = parent->sig_restorer;
     child->sig_pending = 0;
     child->sig_delivering = 0;
+    child->group_exit_pending = 0;
+    child->group_exit_code = 0;
     child->clear_child_tid = (flags & 0x200000) ? child_tid : 0;
     child->itimer_expire = 0;
     child->itimer_interval = 0;
@@ -690,6 +721,28 @@ uint64 sys_read()
     return file_read(file, len, addr, true);
 }
 
+// 67 pread64(fd, buf, count, offset): read without changing the fd offset.
+uint64 sys_pread64()
+{
+    file_t *file;
+    if (arg_fd(0, NULL, &file) < 0)
+        return (uint64)(-EBADF);
+
+    uint64 addr = arg_raw(1);
+    uint32 len = (uint32)arg_raw(2);
+    uint64 offset = arg_raw(3);
+    if (offset > 0xffffffffUL)
+        return 0;
+    if (file->is_socket)
+        return (uint64)(-ESPIPE);
+
+    uint32 saved = file->offset;
+    file->offset = (uint32)offset;
+    uint32 ret = file_read(file, len, addr, true);
+    file->offset = saved;
+    return ret;
+}
+
 /*
     鍐欏叆鏂囦欢鍐呭
     uint32 fd
@@ -763,13 +816,13 @@ uint64 sys_writev()
     return total;
 }
 
-// 94 exit_group锛氬綋鍓嶅崟绾跨▼, 绛変环浜?exit
+// 94 exit_group(status): terminate the current process thread group.
 uint64 sys_exit_group()
 {
     int exit_code;
     arg_uint32(0, (uint32 *)&exit_code);
-    proc_exit(exit_code);
-    return 0; // 涓嶄細鎵ц鍒拌繖
+    proc_exit_group(exit_code);
+    return 0;
 }
 
 static void sbi_system_shutdown()
@@ -1290,9 +1343,17 @@ uint64 sys_faccessat()
 uint64 sys_utimensat()
 {
     char path[STR_MAXLEN + 1];
+    if (arg_raw(1) == 0) {
+        file_t *file;
+        if (arg_fd(0, NULL, &file) < 0)
+            return (uint64)(-EBADF);
+        return 0;
+    }
     arg_str(1, path, STR_MAXLEN);
     if (path[0] == 0 || procfs_path_exists(path) || memfs_path_exists(path))
         return 0;
+    if (strncmp(path, "/dev/null/", 10) == 0)
+        return (uint64)(-ENOTDIR);
     inode_t *ip = path_to_inode(path);
     if (ip == NULL)
         return (uint64)(-ENOENT);
@@ -1340,6 +1401,73 @@ uint64 sys_rt_sigsuspend()
 }
 
 uint64 sys_rt_sigprocmask() { return 0; }
+
+// 137 rt_sigtimedwait(set, info, timeout, sigsetsize): consume a pending signal from set.
+uint64 sys_rt_sigtimedwait()
+{
+    uint64 set_addr = arg_raw(0);
+    uint64 info_addr = arg_raw(1);
+    uint64 timeout_addr = arg_raw(2);
+    uint64 sigsetsize = arg_raw(3);
+    proc_t *p = myproc();
+
+    if (set_addr == 0 || sigsetsize != 8)
+        return (uint64)(-EINVAL);
+
+    uint64 want = 0;
+    uvm_copyin(p->pgtbl, (uint64)&want, set_addr, sizeof(want));
+    if (want == 0)
+        return (uint64)(-EINVAL);
+
+    uint64 deadline = 0;
+    int has_timeout = timeout_addr != 0;
+    if (has_timeout) {
+        struct {
+            int64 tv_sec;
+            int64 tv_nsec;
+        } ts;
+        uvm_copyin(p->pgtbl, (uint64)&ts, timeout_addr, sizeof(ts));
+        if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000LL)
+            return (uint64)(-EINVAL);
+        uint64 rel = (uint64)ts.tv_sec * FUTEX_TIMEBASE_HZ
+                   + ((uint64)ts.tv_nsec + 99ull) / 100ull;
+        deadline = r_time() + rel;
+    }
+
+    for (;;) {
+        uint64 pending;
+        spinlock_acquire(&p->lk);
+        pending = p->sig_pending & want;
+        if (pending != 0) {
+            int sig = 0;
+            for (int i = 1; i <= NSIG; i++) {
+                if (pending & (1UL << (i - 1))) {
+                    sig = i;
+                    break;
+                }
+            }
+            p->sig_pending &= ~(1UL << (sig - 1));
+            spinlock_release(&p->lk);
+
+            if (info_addr != 0) {
+                uint64 info[16];
+                memset(info, 0, sizeof(info));
+                int *fields = (int *)info;
+                fields[0] = sig;  // si_signo
+                fields[1] = 0;    // si_errno
+                fields[2] = 0;    // si_code
+                uvm_copyout(p->pgtbl, info_addr, (uint64)info, sizeof(info));
+            }
+            return (uint64)sig;
+        }
+        spinlock_release(&p->lk);
+
+        if (has_timeout && r_time() >= deadline)
+            return (uint64)(-EAGAIN);
+
+        proc_yield();
+    }
+}
 
 // 144 setgid / 146 setuid锛氬崟鐢ㄦ埛鐜, 瑙嗕綔鎴愬姛 no-op
 uint64 sys_setgid() { return 0; }

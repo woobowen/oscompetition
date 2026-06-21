@@ -284,6 +284,7 @@ static uint64 uvm_mmap_find(mmap_region_t *head_mmap, uint64 len, mmap_region_t 
 uint64 uvm_mmap(uint64 begin, uint32 npages, int perm)
 {
     proc_t *p = myproc();
+    mmap_region_t *old_head = p->mmap;
     uint64 len = (uint64)npages * PGSIZE;
     mmap_region_t *prev = NULL;
     mmap_region_t *curr = p->mmap;
@@ -343,6 +344,8 @@ uint64 uvm_mmap(uint64 begin, uint32 npages, int perm)
         prev->next = node->next; // 【关键修复】先从链表中摘除 node
         mmap_merge(prev, node, true); // 然后合并并释放 node
     }
+    if (p->mmap != old_head)
+        proc_shared_vm_sync_mmap(old_head, p->mmap);
     return begin;
 }
 
@@ -363,14 +366,23 @@ uint64 uvm_mmap_handle_fault(pgtbl_t pgtbl, uint64 fault_addr)
         if (pte != NULL && (*pte & PTE_V))
             return (uint64)-1;
 
-        void *pa = pmem_alloc(false);
-        if (pa == NULL)
-            return (uint64)-1;
-        memset(pa, 0, PGSIZE);
-        if (vm_try_mappages(pgtbl, va, (uint64)pa, PGSIZE, m->perm) < 0) {
-            pmem_free((uint64)pa, false);
+        uint64 pa = 0;
+        int flags = m->perm;
+        int shared = proc_shared_vm_lookup_page(va, &pa, &flags) == 0;
+        if (!shared) {
+            pa = (uint64)pmem_alloc(false);
+            if (pa == 0)
+                return (uint64)-1;
+            memset((void *)pa, 0, PGSIZE);
+        }
+        if (proc_shared_vm_map_page(va, pa, flags) < 0) {
+            if (!shared)
+                pmem_free(pa, false);
             return (uint64)-1;
         }
+        pte = vm_getpte(pgtbl, va, false);
+        if (pte == NULL || !(*pte & PTE_V))
+            return (uint64)-1;
         return va;
     }
     return (uint64)-1;
@@ -381,6 +393,7 @@ uint64 uvm_mmap_handle_fault(pgtbl_t pgtbl, uint64 fault_addr)
 void uvm_munmap(uint64 begin, uint32 npages)
 {
     proc_t *p = myproc();
+    mmap_region_t *old_head = p->mmap;
     uint64 end = begin + (uint64)npages * PGSIZE;
 
     mmap_region_t *prev = NULL;
@@ -400,9 +413,9 @@ void uvm_munmap(uint64 begin, uint32 npages)
             // 1. 解除交集区间的映射
             for (uint32 i = 0; i < o_npages; i++) {
                 uint64 va = o_begin + (uint64)i * PGSIZE;
-                pte_t *pte = vm_getpte(p->pgtbl, va, false);
-                if (pte != NULL && (*pte & PTE_V) && !PTE_CHECK(*pte))
-                    vm_unmappages(p->pgtbl, va, PGSIZE, true);
+                uint64 pa = proc_shared_vm_unmap_page(va);
+                if (pa != 0)
+                    pmem_free(pa, false);
             }
 
             // 2. 根据交集在curr中的位置，处理 curr 节点
@@ -452,6 +465,8 @@ void uvm_munmap(uint64 begin, uint32 npages)
             curr = curr->next;
         }
     }
+    if (p->mmap != old_head)
+        proc_shared_vm_sync_mmap(old_head, p->mmap);
 }
 
 /*------------------part-3: 用户空间heap和stack管理相关------------------*/
