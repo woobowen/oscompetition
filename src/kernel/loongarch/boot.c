@@ -105,6 +105,6 @@ void la_boot_main(void)
 
     /* 10  Enter scheduler — never returns */
     la_uart_puts("[init] entering scheduler\n");
-    la_uart_quiet = 1;   /* silence kernel debug, user write() still works */
+    /* la_uart_quiet = 1; */   /* DEBUG: re-enable for glibc crash dump */
     la_scheduler();
 }

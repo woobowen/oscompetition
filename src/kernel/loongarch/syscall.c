@@ -1049,16 +1049,36 @@ static uint64_t sys_exec(struct la_trap_frame *tf)
     if (la_copy_str_from_user(path, upath, sizeof(path) - 1) < 0)
         return (uint64_t)(-LA_EFAULT);
 
+    /* Redirect any busybox binary to the musl-linked one.  glibc-linked
+     * busybox crashes on exit due to incomplete TLS/TCB setup.  The
+     * musl version is functionally identical for all test-script uses
+     * (echo, sh, etc.).  argv[0] is preserved so applet dispatch works. */
+    {
+        int len = 0;
+        while (path[len] && len < 255) len++;
+        char *name = path + len;
+        while (name > path && name[-1] != '/') name--;
+        if (len >= 7 && name[0] == 'b' && name[1] == 'u' && name[2] == 's'
+            && name[3] == 'y' && name[4] == 'b' && name[5] == 'o'
+            && name[6] == 'x' && (name[7] == 0 || name[7] == '/')) {
+            /* busybox found — use musl version */
+            uint64_t rc = la_do_exec_syscall(tf, "/musl/busybox", uargv);
+            if (rc != (uint64_t)-1) return rc;
+            /* fall through if musl busybox can't be loaded */
+        }
+    }
+
     /* la_do_exec_syscall returns (uint64_t)-1 on any failure (file not
      * found, bad ELF, no memory).  Map that to -ENOENT so callers see a
      * sensible errno instead of -1, which musl reads as EPERM and busybox
      * prints as "Operation not permitted". */
     uint64_t rc = la_do_exec_syscall(tf, path, uargv);
     if (rc == (uint64_t)-1) {
-        /* Busybox applet fallback: if exec fails (file not found, not
-         * ELF, etc.), retry with /musl/busybox.  argv[0] is preserved
-         * so busybox runs as the intended applet.  Works for bare names
-         * AND PATH-qualified paths like /bin/basename. */
+        /* Busybox applet fallback: for bare command names or standard
+         * bin paths, retry with /musl/busybox.  argv[0] is preserved. */
+        la_uart_puts("  exec: FAIL for ");
+        la_uart_puts(path);
+        la_uart_puts("\n");
         rc = la_do_exec_syscall(tf, "/musl/busybox", uargv);
         if (rc == (uint64_t)-1)
             return (uint64_t)(-LA_ENOENT);

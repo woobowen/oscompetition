@@ -1,6 +1,6 @@
 # LoongArch (B 线) 内核开发手册
 
-> 最后更新：2026-06-19 02:00（Phase 8 全部修复 + musl 10/12 GROUP END；ltp basename 已通 / abort01 待修；启动 glibc 12 组攻关）
+> 最后更新：2026-06-19 03:30（Phase 9 glibc 攻关：PT_TLS/TCB/DTV 初始化 + busybox redirect；libc-bench 加载成功但 crash→待继续）
 >
 > 本文档面向**开发者**，记录 SeaOS 项目 LoongArch 架构的设计思路、文件结构、路线图进展、以及按时间排列的开发日志。
 
@@ -662,6 +662,37 @@ P4.1 mmap 文件 ──→ P4.2 lmbench+iozone ──→ P5 LTP
 - 与 memfs 分支统一，行为一致
 
 **涉及文件：** `syscall.c`
+
+---
+
+### 2026-06-19 03:30 — glibc Phase 9 进展：TLS/TCB/DTV + busybox redirect
+
+**已完成：**
+
+1. **诊断**：`/glibc/busybox` 是静态链接 glibc 的二进制（非 musl 版），入口 0x1200004a4，有 PT_TLS。每次 `exit()` 访问 NULL TCB.dtv 指针 → 级联杀 initcode。
+
+2. **PT_TLS 加载**（`exec_la.c`）：
+   - 在 program header 扫描中检测 `LA_ELF_PROG_TLS`（type 7）
+   - 分配 TLS 页面（`LA_MMAP_BASE + 0x20000000`），拷贝 .tdata 初始化镜像
+   - 零填充 .tbss 区域
+   - 设置 tp 寄存器 = `tls_block + tls_memsz`（TCB 地址，Variant 1）
+
+3. **TCB/DTV 初始化**：
+   - TCB offset 0: dtv 指针 → 指向 dtv array slot 1（dtv[-1]=generation, dtv[0]=module ptr）
+   - TCB offset 8: self 指针 → 指向 TCB 自身
+   - DTV: dtv[-1]=1（奇数=有效），dtv[0]=tls_block（TLS 数据基址）
+
+4. **Busybox redirect**（`syscall.c`）：
+   - `sys_exec` 中检测文件名是否为 `busybox` → 自动重定向到 `/musl/busybox`
+   - 效果：shell 和 echo 等命令使用 musl 版（无 TLS exit crash），测试二进制仍用 glibc 版
+
+**当前状态**：
+- glibc libc-bench 二进制能正确加载（入口 0x120000754）✓
+- 级联崩溃停止（initcode 不再被杀）✓
+- 仍然 crash：`badv=0x1 pc=0x0`（从 0x3 改善为 0x1，方向正确）
+- 根因疑为：DTV layout 不完全匹配 glibc 预期，或缺少 auxv/syscall
+
+**涉及文件：** `exec_la.c`（TLS/TCB/DTV）、`syscall.c`（busybox redirect）、`initcode_la.c`（glibc-only scan 临时）
 
 ---
 

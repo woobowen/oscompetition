@@ -362,8 +362,9 @@ int main(void)
 
     int count = 0;
 
-    count += run_test_entries("/musl");
+    /* DEBUG: glibc-only for crash diagnosis */
     count += run_test_entries("/glibc");
+    /* count += run_test_entries("/musl"); */
 
     if (count == 0)
         count += run_test_entries("/");
