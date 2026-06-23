@@ -392,3 +392,11 @@ New or updated syscall coverage for this milestone:
 Resource note: `N_OPEN_FILE_PER_PROC` is 256. This is required for lmbench `lat_ctx ... 96`, which creates 96 pipes in one parent process and therefore needs at least 195 fd including stdin/stdout/stderr. The earlier 256-fd panic was traced to user physical-page exhaustion under the old 128M `ALLOC_END` linker limit plus unchecked `pmem_alloc(false)` in `uvm_copy_pgtbl`; `ALLOC_END` now matches the 1G QEMU RAM range and fork fails cleanly if page-copy allocation still fails.
 
 Output note: `/dev/stderr` now writes bytes unchanged instead of prefixing every write with `ERROR: `. This restores normal Linux stderr semantics and lets lmbench's stderr metrics match the judge's baseline keys.
+
+## 2026-06-24 status update: wait4 errno/mask semantics
+
+| No. | Name | Current semantics |
+|---|---|---|
+| 260 | wait4 | Returns `-ECHILD` when no matching child exists; only unblocked pending signals interrupt waits; `SIGCHLD` wakes and rescans for zombies. |
+
+This closes the false `EPERM` userland decode caused by returning bare `(uint64)-1` from `wait4`, and prevents masked pending signals from spuriously becoming `EINTR`.

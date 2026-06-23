@@ -1508,10 +1508,11 @@ static int proc_wait_pending_interrupt(proc_t *parent)
     uint64 sigchld_bit = 1UL << (SIGCHLD - 1);
 
     spinlock_acquire(&parent->lk);
-    int consumed_sigchld = (parent->sig_pending & sigchld_bit) != 0;
+    uint64 pending = parent->sig_pending & ~parent->sig_mask;
+    int consumed_sigchld = (pending & sigchld_bit) != 0;
     if (consumed_sigchld)
         parent->sig_pending &= ~sigchld_bit;
-    int interrupted = parent->sig_pending != 0;
+    int interrupted = (pending & ~sigchld_bit) != 0;
     spinlock_release(&parent->lk);
     if (interrupted)
         return 1;
@@ -1574,7 +1575,7 @@ int proc_wait4(int64 wait_pid, uint64 user_addr, int wnohang)
         }
 
         if (!has_child)
-            return -1;
+            return -ECHILD;
 
         if (wnohang)
             return 0;   // WNOHANG: 没有ZOMBIE子进程，立即返回0

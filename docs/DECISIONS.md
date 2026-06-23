@@ -340,3 +340,10 @@
 - Boundary: this does not create files, symlinks, or mutate the protected image. It is a metadata compatibility bridge for known applet names only; unknown applet names still return `ENOENT` from `newfstatat`.
 - Risk: `newfstatat` is a common filesystem syscall path. Returning synthetic stat metadata too broadly could hide missing-file bugs, so the retained helper uses a fixed allowlist of applets exercised by the current BusyBox/LTP scripts.
 - Verification: `make all` passed in the fixed docker build environment. The fixed RV docker rerun reached `sys_shutdown` at line 5204. In the latest `os_serial_out_rv.txt`, `busybox-musl` and `busybox-glibc` both report `testcase busybox which ls success`, and no `basename: not found` marker remains in either LTP group.
+
+## D40: 2026-06-24 RISC-V wait4 errno and signal-mask semantics
+
+- Decision: `wait4(260)` now returns `-ECHILD` when the caller has no matching live or zombie child instead of a bare `-1`, and the wait interrupt check only treats unblocked pending signals as interrupting. `SIGCHLD` remains a wake-and-rescan event for the minimal signal model.
+- Rationale: Linux reports `ECHILD` for `wait()`/`waitpid()` with no unwaited children. Returning `(uint64)-1` is decoded by musl/glibc as errno 1 (`EPERM`), which was visible in LTP cleanup as `wait() failed: EPERM`. The old interrupt helper also ignored `sig_mask`, so a blocked pending signal could still force `waitpid(..., 0)` to return `EINTR`.
+- Boundary: this does not implement full Linux job control, `SA_RESTART`, `SA_NOCLDWAIT`, or signal queues. It only fixes the errno and mask semantics needed by the existing SeaOS wait loop while preserving the current `SIGCHLD` compatibility path.
+- Risk: process wait and signal wakeup are shared lifecycle paths. A bad change here could break initcode timeouts or child reaping, so the retained behavior must be checked with `make all` and the fixed RV docker run.
