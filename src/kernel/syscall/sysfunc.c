@@ -607,6 +607,8 @@ uint64 sys_clone()
     child->group_exit_pending = 0;
     child->group_exit_code = 0;
     child->clear_child_tid = (flags & 0x200000) ? child_tid : 0;
+    child->robust_list_head = 0;
+    child->robust_list_len = 0;
     child->itimer_expire = 0;
     child->itimer_interval = 0;
     child->ub_looper_secs = 0;
@@ -725,8 +727,9 @@ uint64 sys_gettid()
 
 /*
     set_tid_address(int *tidptr)
-    Linux 璇箟: 璁剧疆璋冪敤绾跨▼ clear_child_tid = tidptr, 杩斿洖璋冪敤鑰?TID銆?    SeaOS 鍗曠嚎绋?杩涚▼妯″瀷涓?TID == PID銆?    鏈€灏忓疄鐜?docs/DECISIONS.md D3): 鏆備笉瀛樺偍 tidptr銆佷笉鍋氶€€鍑烘椂 clear_child_tid 娓呴浂+futex 鍞ら啋,
-    浠呰繑鍥?pid 婊¤冻 musl 鍚姩鏈熴€?*/
+    Linux 语义: 设置调用线程 clear_child_tid = tidptr, 返回调用者 TID。
+    SeaOS 当前 TID == PID；退出路径会清零 clear_child_tid 并 futex wake。
+*/
 uint64 sys_set_tid_address()
 {
     myproc()->clear_child_tid = arg_raw(0);
@@ -2743,15 +2746,48 @@ uint64 sys_ioctl()
     return (uint64)(-ENOTTY);
 }
 
-// 99 set_robust_list(head, len): musl 绾跨▼鍒濆鍖栭渶瑕併€傛々杩斿洖 0銆?
+#define ROBUST_LIST_HEAD_SIZE_LOCAL 24
+
+// 99 set_robust_list(head, len): register the calling thread's robust futex list.
 uint64 sys_set_robust_list()
 {
+    uint64 head = arg_raw(0);
+    uint64 len = arg_raw(1);
+    if (len != ROBUST_LIST_HEAD_SIZE_LOCAL)
+        return (uint64)(-EINVAL);
+
+    proc_t *p = myproc();
+    p->robust_list_head = head;
+    p->robust_list_len = len;
     return 0;
 }
 
-// 100 get_robust_list(pid, head_ptr, len_ptr): 妗╄繑鍥?0銆?
+// 100 get_robust_list(pid, head_ptr, len_ptr): return a thread's robust futex list registration.
 uint64 sys_get_robust_list()
 {
+    int pid = (int)arg_raw(0);
+    uint64 head_ptr = arg_raw(1);
+    uint64 len_ptr = arg_raw(2);
+    if (head_ptr == 0 || len_ptr == 0)
+        return (uint64)(-EFAULT);
+
+    proc_t *target = NULL;
+    if (pid == 0 || pid == myproc()->pid) {
+        target = myproc();
+    } else {
+        target = proc_get_by_pid(pid);
+        if (target == NULL)
+            return (uint64)(-ESRCH);
+    }
+
+    uint64 head = target->robust_list_head;
+    uint64 len = target->robust_list_len;
+    if (target != myproc())
+        spinlock_release(&target->lk);
+
+    proc_t *p = myproc();
+    uvm_copyout(p->pgtbl, head_ptr, (uint64)&head, sizeof(head));
+    uvm_copyout(p->pgtbl, len_ptr, (uint64)&len, sizeof(len));
     return 0;
 }
 

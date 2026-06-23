@@ -14,6 +14,12 @@ extern uint64 timer_get_ticks();
 #define MKV_R_HIGHER 2
 #define PROC_PGTBL_RECLAIM_ON_OOM 512
 
+#define ROBUST_LIST_HEAD_SIZE 24
+#define ROBUST_LIST_LIMIT 2048
+#define FUTEX_OWNER_DIED 0x40000000u
+#define FUTEX_WAITERS 0x80000000u
+#define FUTEX_TID_MASK 0x3fffffffu
+
 static int mkv_burst_class(uint64 run_ticks)
 {
     // 分档阈值：
@@ -174,6 +180,112 @@ static int sleepchan_has_waiter(void *chan)
     int has = sleepchan_overflow > 0;
     spinlock_release(&sleepchan_lk);
     return has;
+}
+
+static int proc_user_read(pgtbl_t pgtbl, uint64 src, void *dst, uint32 len)
+{
+    uint32 copied = 0;
+    while (copied < len) {
+        pte_t *pte = vm_getpte(pgtbl, src, false);
+        if (pte == NULL || !(*pte & PTE_V))
+            return -1;
+
+        uint64 offset = src % PGSIZE;
+        uint64 copy_len = PGSIZE - offset;
+        if (copy_len > len - copied)
+            copy_len = len - copied;
+
+        memmove((uint8 *)dst + copied, (void *)(PTE_TO_PA(*pte) + offset), copy_len);
+        src += copy_len;
+        copied += (uint32)copy_len;
+    }
+    return 0;
+}
+
+static int proc_user_write(pgtbl_t pgtbl, uint64 dst, const void *src, uint32 len)
+{
+    uint32 copied = 0;
+    while (copied < len) {
+        pte_t *pte = vm_getpte(pgtbl, dst, false);
+        if (pte == NULL || !(*pte & PTE_V) || !(*pte & PTE_W))
+            return -1;
+
+        uint64 offset = dst % PGSIZE;
+        uint64 copy_len = PGSIZE - offset;
+        if (copy_len > len - copied)
+            copy_len = len - copied;
+
+        memmove((void *)(PTE_TO_PA(*pte) + offset), (const uint8 *)src + copied, copy_len);
+        dst += copy_len;
+        copied += (uint32)copy_len;
+    }
+    return 0;
+}
+
+static int proc_user_read_u64(pgtbl_t pgtbl, uint64 addr, uint64 *out)
+{
+    return proc_user_read(pgtbl, addr, out, sizeof(*out));
+}
+
+static int proc_user_read_u32(pgtbl_t pgtbl, uint64 addr, uint32 *out)
+{
+    return proc_user_read(pgtbl, addr, out, sizeof(*out));
+}
+
+static int proc_user_write_u32(pgtbl_t pgtbl, uint64 addr, uint32 val)
+{
+    return proc_user_write(pgtbl, addr, &val, sizeof(val));
+}
+
+static void proc_robust_mark_futex(proc_t *p, uint64 list_entry, int64 futex_offset)
+{
+    if (p == NULL || p->pgtbl == NULL || list_entry == 0)
+        return;
+
+    uint64 futex_addr = list_entry + (uint64)futex_offset;
+    uint32 old = 0;
+    if (proc_user_read_u32(p->pgtbl, futex_addr, &old) < 0)
+        return;
+    if ((old & FUTEX_TID_MASK) != (uint32)p->pid)
+        return;
+
+    uint32 updated = (old & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+    if (proc_user_write_u32(p->pgtbl, futex_addr, updated) == 0)
+        proc_wakeup_force((void *)futex_addr);
+}
+
+static void proc_exit_robust_list_values(proc_t *p, uint64 head, uint64 len)
+{
+    if (p == NULL || p->pgtbl == NULL || head == 0)
+        return;
+    if (len != ROBUST_LIST_HEAD_SIZE)
+        return;
+
+    uint64 next = 0;
+    uint64 offset_raw = 0;
+    uint64 pending = 0;
+    if (proc_user_read_u64(p->pgtbl, head, &next) < 0 ||
+        proc_user_read_u64(p->pgtbl, head + 8, &offset_raw) < 0 ||
+        proc_user_read_u64(p->pgtbl, head + 16, &pending) < 0)
+        return;
+
+    int64 futex_offset = (int64)offset_raw;
+    for (uint32 seen = 0; next != 0 && next != head && seen < ROBUST_LIST_LIMIT; seen++) {
+        uint64 entry = next;
+        if (proc_user_read_u64(p->pgtbl, entry, &next) < 0)
+            break;
+        proc_robust_mark_futex(p, entry, futex_offset);
+    }
+
+    if (pending != 0 && pending != head)
+        proc_robust_mark_futex(p, pending, futex_offset);
+}
+
+static void proc_exit_robust_list(proc_t *p)
+{
+    if (p == NULL)
+        return;
+    proc_exit_robust_list_values(p, p->robust_list_head, p->robust_list_len);
 }
 
 static void proc_free_mmap_list(proc_t *p)
@@ -368,6 +480,8 @@ proc_t *proc_alloc()
             p->group_exit_pending = 0;
             p->group_exit_code = 0;
             p->clear_child_tid = 0;
+            p->robust_list_head = 0;
+            p->robust_list_len = 0;
             p->reparented_to_init = 0;
             p->itimer_expire = 0;
             p->itimer_interval = 0;
@@ -478,6 +592,8 @@ void proc_free(proc_t *p)
     p->group_exit_pending = 0;
     p->group_exit_code = 0;
     p->clear_child_tid = 0;
+    p->robust_list_head = 0;
+    p->robust_list_len = 0;
     p->reparented_to_init = 0;
     p->itimer_expire = 0;
     p->itimer_interval = 0;
@@ -688,6 +804,8 @@ int proc_fork_with_stack(uint64 child_stack)
     child->group_exit_pending = 0;
     child->group_exit_code = 0;
     child->clear_child_tid = 0;
+    child->robust_list_head = 0;
+    child->robust_list_len = 0;
     child->itimer_expire = 0;
     child->itimer_interval = 0;
     child->ub_looper_secs = 0;
@@ -1088,14 +1206,22 @@ static void proc_kill_descendants(proc_t *parent)
             file_t *files[N_OPEN_FILE_PER_PROC];
             inode_t *cwd;
             uint64 clear_child_tid;
+            uint64 robust_list_head;
+            uint64 robust_list_len;
 
             proc_kill_descendants(p);
 
             memset(files, 0, sizeof(files));
             cwd = NULL;
             clear_child_tid = 0;
+            robust_list_head = 0;
+            robust_list_len = 0;
             spinlock_acquire(&p->lk);
             if (p->state != UNUSED && p->state != ZOMBIE) {
+                robust_list_head = p->robust_list_head;
+                robust_list_len = p->robust_list_len;
+                p->robust_list_head = 0;
+                p->robust_list_len = 0;
                 for (int fd = 0; fd < N_OPEN_FILE_PER_PROC; fd++) {
                     files[fd] = p->open_file[fd];
                     p->open_file[fd] = NULL;
@@ -1113,6 +1239,8 @@ static void proc_kill_descendants(proc_t *parent)
                 p->state = ZOMBIE;
             }
             spinlock_release(&p->lk);
+
+            proc_exit_robust_list_values(p, robust_list_head, robust_list_len);
 
             if (clear_child_tid != 0) {
                 uint32 zero = 0;
@@ -1226,6 +1354,9 @@ void proc_check_sleep_deadlines(uint64 now)
 void proc_exit(int exit_code)
 {
     proc_t *p = myproc();
+    proc_exit_robust_list(p);
+    p->robust_list_head = 0;
+    p->robust_list_len = 0;
     if (p->clear_child_tid != 0) {
         uint32 zero = 0;
         uvm_copyout(p->pgtbl, p->clear_child_tid, (uint64)&zero, sizeof(zero));

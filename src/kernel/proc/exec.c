@@ -777,6 +777,8 @@ static int proc_exec_with_env(char *path, char **argv, char **envp)
     p->sig_pending = 0;
     p->sig_delivering = 0;
     p->clear_child_tid = 0;
+    p->robust_list_head = 0;
+    p->robust_list_len = 0;
     p->itimer_expire = 0;
     p->itimer_interval = 0;
     p->ub_looper_secs = unixbench_looper_secs(path, argv);
@@ -954,6 +956,8 @@ int proc_exec_target(int pid, char *path, char **argv)
     p->shared_vm = 0;
     p->thread_group = 0;
     p->clear_child_tid = 0;
+    p->robust_list_head = 0;
+    p->robust_list_len = 0;
     p->ub_looper_secs = unixbench_looper_secs(path, argv);
     int i;
     for(i = 0; i < sizeof(p->name) - 1 && path[i] != '\0'; i++){

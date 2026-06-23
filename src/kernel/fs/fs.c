@@ -799,6 +799,13 @@ static void memfs_maybe_reclaim_unlinked(int mem_idx)
 		memfs_reclaim_node(mem_idx);
 }
 
+static void memfs_init_tmp_dirs(void)
+{
+	memfs_create("/tmp", true);
+	memfs_create("/var", true);
+	memfs_create("/var/tmp", true);
+}
+
 /* 初始化file_table */
 void file_init()
 {
@@ -825,6 +832,8 @@ void file_init()
 	file_table[i].socket = NULL;
 	}
 	spinlock_release(&lk_file_table);
+
+	memfs_init_tmp_dirs();
 }
 
 /* ===================== 管道实现 (pipe) ===================== */

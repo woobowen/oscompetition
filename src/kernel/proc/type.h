@@ -210,6 +210,8 @@ typedef struct proc
     uint8 thread_group;          // CLONE_THREAD member for exit_group semantics
     uint8 reparented_to_init;      // orphan adopted by proczero; safe for background reap
     uint64 clear_child_tid;        // CLONE_CHILD_CLEARTID futex address
+    uint64 robust_list_head;       // Linux robust futex list head for this thread
+    uint64 robust_list_len;        // sizeof(struct robust_list_head) accepted by set_robust_list
     // ITIMER_REAL
     uint64 itimer_expire;         // 到期时的 CLINT 时间 (0=未激活)
     uint64 itimer_interval;       // 重复间隔 (CLINT ticks, 0=单次)

@@ -51,8 +51,8 @@
 | 94 | exit_group | 单进程等价 `exit`；`CLONE_THREAD`/`CLONE_VM` 组内 sibling 通过 pending self-exit 退出 |
 | 96 | set_tid_address | 返回 pid（D3 最小实现） |
 | 98 | futex | 最小 WAIT/WAKE/WAIT_BITSET；支持粗粒度 timeout，超时返回 `-ETIMEDOUT` |
-| 99 | set_robust_list | 桩返回 0 |
-| 100 | get_robust_list | 桩返回 0 |
+| 99 | set_robust_list | 记录每线程 robust futex list head/len，退出时用于 owner-death 标记 |
+| 100 | get_robust_list | 返回当前或指定 pid 的 robust futex list head/len |
 | 101 | nanosleep(兼容) | |
 | 102 | getitimer | 桩，零填充返回 |
 | 103 | setitimer | ITIMER_REAL → proc_t.itimer_expire/interval |
@@ -132,13 +132,21 @@
 | 283 | membarrier | 单核最小兼容；支持 query 和 no-op barrier |
 | 500/501/502 | schedstat/spawn/shutdown | SeaOS 私有 |
 
+## 2026-06-24 状态更新：RISC-V robust futex owner-death
+
+本轮将 `set_robust_list(99)` / `get_robust_list(100)` 从空成功桩推进为最小 Linux/RISC-V 兼容语义。每个 `proc_t` 记录 robust list 的 head 和长度；正常退出、线程退出和强制清理 descendants 时，会按 RISC-V LP64 `struct robust_list_head` 布局读取用户链表，给退出 TID 持有的 futex word 写入 `FUTEX_OWNER_DIED`，保留 `FUTEX_WAITERS` 位，并唤醒等待者。
+
+语义边界：当前只接受 24 字节 robust-list head，链表遍历上限为 2048 项；遇到未映射或不可写用户地址时停止/跳过该项，避免退出路径 panic。该实现不包含 PI futex，也不是完整 Linux thread-group robust-futex 模型。
+
+验证：`make all` 在固定 docker 构建环境通过，随后固定 RV docker 复跑到 `sys_shutdown` 并枚举 24 组。最新 `os_serial_out_rv.txt` 中 `libctest-glibc` 的 `pthread_robust_detach` 静态/动态子项均只出现 START/END，不再出现旧日志中的 `ETIMEDOUT` vs `EOWNERDEAD` 失败。`libctest-glibc` 整组仍因其他真实失败保持失败状态，详见 `rv-current.md`。
+
 ## 2026-06-24 状态更新：RV initcode 完整枚举 24 组
 
 本轮按固定 docker 命令复跑，`os_serial_out_rv.txt` 已到 `sys_shutdown`，并确认 RV initcode 枚举到 `/musl` 12 组和 `/glibc` 12 组，共 24 组。`src/user/initcode.c` 的目录扫描不再把短 `getdentries64` 读当作 EOF，而是持续读取直到 `SYS_get_dentries <= 0`。
 
 本轮主表同步到当前 `src/kernel/syscall/syscall.c` 分发表：共 126 个入口，其中 123 个 Linux/RISC-V ABI 或兼容入口，3 个 SeaOS 私有入口。
 
-当前 RV 评测状态以 `rv-current.md` 为准：15 组在本轮日志中未见聚焦失败标记，9 组仍有真实失败或 timeout。失败组包括 `libcbench-glibc`、`libctest-glibc`、`netperf-glibc`、`unixbench-musl`、`lmbench-musl`、`ltp-musl`、`unixbench-glibc`、`lmbench-glibc`、`ltp-glibc`。
+当前 RV 评测状态以 `rv-current.md` 为准。最新严格扫描为 13 组 clean、11 组失败；busybox 子项 `fail` 行按真实失败记录，不再仅凭 `GROUP END` 判定成功。失败组包括 `busybox-musl`、`libctest-glibc`、`busybox-glibc`、`cyclictest-glibc`、`netperf-glibc`、`unixbench-musl`、`lmbench-musl`、`ltp-musl`、`unixbench-glibc`、`lmbench-glibc`、`ltp-glibc`。
 
 本轮新增或补强的 syscall/语义：
 
