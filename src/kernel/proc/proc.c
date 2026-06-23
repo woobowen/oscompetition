@@ -299,6 +299,28 @@ static void proc_free_mmap_list(proc_t *p)
     p->mmap = NULL;
 }
 
+static mmap_region_t *proc_clone_mmap_list(mmap_region_t *src)
+{
+    mmap_region_t *head = NULL;
+    mmap_region_t *tail = NULL;
+
+    while (src != NULL) {
+        mmap_region_t *node = mmap_region_alloc();
+        node->begin = src->begin;
+        node->npages = src->npages;
+        node->perm = src->perm;
+        node->next = NULL;
+
+        if (tail == NULL)
+            head = node;
+        else
+            tail->next = node;
+        tail = node;
+        src = src->next;
+    }
+    return head;
+}
+
 static int proc_has_live_vm_sibling(proc_t *target)
 {
     proc_t *owner = target->vm_owner ? target->vm_owner : target;
@@ -764,7 +786,7 @@ int proc_fork_with_stack(uint64 child_stack)
     }
     child->heap_top = parent->heap_top;
     child->ustack_npage = parent->ustack_npage;
-    child->mmap = NULL; // 子进程初始无mmap
+    child->mmap = proc_clone_mmap_list(parent->mmap);
     child->vm_owner = child;
     child->shared_vm = 0;
     child->thread_group = 0;
