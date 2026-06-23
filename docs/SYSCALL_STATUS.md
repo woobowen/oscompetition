@@ -41,7 +41,7 @@
 | 72 | pselect6 | Linux fd_set copyin/copyout；socket 使用真实 readiness |
 | 73 | ppoll | |
 | 78 | readlinkat | `/proc/self/exe` 返回当前程序路径 |
-| 79 | newfstatat | 按路径 stat |
+| 79 | newfstatat | 按路径 stat；已对已知 BusyBox applet 名提供 bounded stat 兼容 |
 | 80 | fstat | 输出 Linux `struct stat` |
 | 81 | sync | 桩，返回 0 |
 | 82 | fsync | 最小兼容：有效 fd 返回 0 |
@@ -132,6 +132,14 @@
 | 283 | membarrier | 单核最小兼容；支持 query 和 no-op barrier |
 | 500/501/502 | schedstat/spawn/shutdown | SeaOS 私有 |
 
+## 2026-06-24 状态更新：RISC-V BusyBox applet stat 兼容
+
+本轮补强 `newfstatat(79)`：当用户态对已知 BusyBox applet 路径做 stat 探测、但只读镜像里没有单独 applet inode 时，内核会返回真实 BusyBox 二进制的 Linux `struct stat` 元数据。该语义与既有 `faccessat(48)` applet 存在性兼容和 `execve(221)` applet fallback 对齐，避免 shell/`which` 在 exec 前的 stat 检查把可由 BusyBox 分发的命令误判为不存在。
+
+语义边界：只对固定 allowlist 中的 BusyBox applet 名生效；不创建文件、不创建 symlink、不修改测试镜像。未知命令仍从 `newfstatat` 返回 `-ENOENT`，避免把所有缺失路径都伪装成 BusyBox。
+
+验证：`make all` 在固定 docker 构建环境通过，随后固定 RV docker 复跑到 `sys_shutdown` 并枚举 24 组。最新严格扫描为 16 组 clean、8 组失败；`busybox-musl` 和 `busybox-glibc` 中 `which ls` 均为 success，`ltp-musl`/`ltp-glibc` 不再出现 `basename: not found`，但仍因真实 LTP 内部失败保持失败状态，详见 `rv-current.md`。
+
 ## 2026-06-24 状态更新：RISC-V robust futex owner-death
 
 本轮将 `set_robust_list(99)` / `get_robust_list(100)` 从空成功桩推进为最小 Linux/RISC-V 兼容语义。每个 `proc_t` 记录 robust list 的 head 和长度；正常退出、线程退出和强制清理 descendants 时，会按 RISC-V LP64 `struct robust_list_head` 布局读取用户链表，给退出 TID 持有的 futex word 写入 `FUTEX_OWNER_DIED`，保留 `FUTEX_WAITERS` 位，并唤醒等待者。
@@ -146,7 +154,7 @@
 
 本轮主表同步到当前 `src/kernel/syscall/syscall.c` 分发表：共 126 个入口，其中 123 个 Linux/RISC-V ABI 或兼容入口，3 个 SeaOS 私有入口。
 
-当前 RV 评测状态以 `rv-current.md` 为准。最新严格扫描为 13 组 clean、11 组失败；busybox 子项 `fail` 行按真实失败记录，不再仅凭 `GROUP END` 判定成功。失败组包括 `busybox-musl`、`libctest-glibc`、`busybox-glibc`、`cyclictest-glibc`、`netperf-glibc`、`unixbench-musl`、`lmbench-musl`、`ltp-musl`、`unixbench-glibc`、`lmbench-glibc`、`ltp-glibc`。
+当前 RV 评测状态以 `rv-current.md` 为准。最新严格扫描为 16 组 clean、8 组失败；busybox 子项 `fail` 行和 LTP `FAIL LTP CASE` 行按真实失败记录，不再仅凭 `GROUP END` 判定成功。失败组包括 `libctest-glibc`、`netperf-glibc`、`unixbench-musl`、`lmbench-musl`、`ltp-musl`、`unixbench-glibc`、`lmbench-glibc`、`ltp-glibc`。
 
 本轮新增或补强的 syscall/语义：
 

@@ -1851,6 +1851,58 @@ static bool is_busybox_applet_candidate(char *path)
     return true;
 }
 
+static bool is_known_busybox_applet_name(const char *name)
+{
+    static const char *applets[] = {
+        "[", "ash", "basename", "cal", "cat", "clear", "cp", "cut",
+        "date", "df", "dirname", "dmesg", "du", "echo", "expr",
+        "false", "find", "free", "grep", "head", "hexdump",
+        "hwclock", "kill", "ls", "md5sum", "mkdir", "more", "mv",
+        "od", "printf", "ps", "pwd", "rm", "rmdir", "sh", "sleep",
+        "sort", "stat", "strings", "tail", "touch", "true", "uname",
+        "uniq", "uptime", "wc", "which",
+    };
+
+    if (name == NULL || name[0] == '\0')
+        return false;
+    for (uint32 i = 0; i < sizeof(applets) / sizeof(applets[0]); i++) {
+        if (strlen(name) == strlen(applets[i]) &&
+            strncmp(name, applets[i], (uint32)strlen(applets[i])) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool is_busybox_applet_stat_candidate(char *path)
+{
+    if (!is_busybox_applet_candidate(path))
+        return false;
+
+    const char *name = path;
+    for (int i = 0; path[i] != '\0'; i++) {
+        if (path[i] == '/')
+            name = &path[i + 1];
+    }
+    return is_known_busybox_applet_name(name);
+}
+
+static file_t *open_busybox_for_applet_stat(char *path)
+{
+    static char *const musl_first[] = {"/musl/busybox", "busybox", "/glibc/busybox"};
+    static char *const glibc_first[] = {"/glibc/busybox", "/musl/busybox", "busybox"};
+    char *const *candidates = musl_first;
+
+    if (strncmp(path, "/glibc/", 7) == 0)
+        candidates = glibc_first;
+
+    for (uint32 i = 0; i < 3; i++) {
+        file_t *file = file_open(candidates[i], FILE_OPEN_READ);
+        if (file != NULL)
+            return file;
+    }
+    return NULL;
+}
+
 uint64 sys_faccessat()
 {
     char path[STR_MAXLEN + 1];
@@ -2135,6 +2187,8 @@ uint64 sys_newfstatat()
     }
     // 鍚﹀垯鎸夎矾寰勬墦寮€鍚?stat(dirfd 鏆傛寜 cwd/缁濆璺緞澶勭悊, 涓庣幇鏈?openat 涓€鑷?
     file_t *file = file_open(path, FILE_OPEN_READ);
+    if (!file && is_busybox_applet_stat_candidate(path))
+        file = open_busybox_for_applet_stat(path);
     if (!file) return (uint64)(-ENOENT);
     uint64 r = file_get_stat_linux(file, statbuf);
     file_close(file);
