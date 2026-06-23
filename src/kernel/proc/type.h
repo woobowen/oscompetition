@@ -103,6 +103,10 @@ enum proc_state
 // 单个进程最多打开N_OPEN_FILE_PER_PROC个文件
 #define N_OPEN_FILE_PER_PROC 256
 
+// Linux resource limit slots used by getrlimit/setrlimit/prlimit64.
+#define N_RLIMIT 16
+#define RLIMIT_NOFILE_INDEX 7
+
 // Signal
 #define NSIG        64
 #define SIGHUP      1
@@ -114,6 +118,7 @@ enum proc_state
 #define SIGALRM     14
 #define SIGTERM     15
 #define SIGCHLD     17
+#define SA_SIGINFO   4
 #define SA_RESTORER 0x04000000
 
 #define PROC_NAME_LEN 16
@@ -129,6 +134,8 @@ typedef struct proc
     struct proc *parent;   // 父进程
     int exit_code;         // 进程退出状态(父进程关心)
     void *sleep_space;     // 进程睡眠位置(等待的资源)
+    uint64 sleep_deadline;  // CLINT time deadline for timed sleeps, 0=none
+    uint8 sleep_timedout;   // set when a timed sleep is woken by deadline
 
     // MLFQ 调度字段
     int mlfq_level;        // 当前队列层级(0最高)
@@ -187,11 +194,15 @@ typedef struct proc
     inode_t *cwd;          // 工作目录
     file_t *open_file[N_OPEN_FILE_PER_PROC]; // 打开文件表
     uint8 fd_cloexec[N_OPEN_FILE_PER_PROC];
+    uint64 rlimit_cur[N_RLIMIT];
+    uint64 rlimit_max[N_RLIMIT];
 
     // Signal
     uint64 sig_handler[NSIG + 1]; // 信号处理器地址 (1..64), 0=SIG_DFL, 1=SIG_IGN
+    uint64 sig_flags[NSIG + 1];   // rt_sigaction sa_flags, e.g. SA_SIGINFO
     uint64 sig_restorer;          // musl 设置的 sa_restorer (调用 rt_sigreturn)
     uint64 sig_pending;           // 待投递信号位图 (bit N-1 = signal N)
+    uint64 sig_mask;              // 当前线程信号屏蔽字 (bit N-1 = signal N)
     uint8  sig_delivering;        // 正在投递信号中(防嵌套)
     uint8 group_exit_pending;      // internal exit_group request for CLONE_VM threads
     int group_exit_code;           // exit code used by group_exit_pending

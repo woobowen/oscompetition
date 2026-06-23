@@ -107,6 +107,7 @@ typedef struct sleepchan_hint {
 static sleepchan_hint_t sleepchan_hints[SLEEPCHAN_HINT_SLOTS];
 static uint32 sleepchan_overflow;
 static spinlock_t sleepchan_lk;
+static spinlock_t shared_vm_lk;
 
 static uint64 sleepchan_hash(void *chan)
 {
@@ -196,13 +197,26 @@ static int proc_has_live_vm_sibling(proc_t *target)
 
         int live = 0;
         spinlock_acquire(&p->lk);
-        if (p->state != UNUSED && p->state != ZOMBIE && p->vm_owner == owner)
+        if (p->state != UNUSED && p->vm_owner == owner)
             live = 1;
         spinlock_release(&p->lk);
         if (live)
             return 1;
     }
     return 0;
+}
+
+#define RLIMIT_STACK_INDEX 3
+
+static void proc_init_rlimits(proc_t *p)
+{
+    for (int i = 0; i < N_RLIMIT; i++) {
+        p->rlimit_cur[i] = (uint64)-1;
+        p->rlimit_max[i] = (uint64)-1;
+    }
+    p->rlimit_cur[RLIMIT_STACK_INDEX] = 1 * 1024 * 1024;
+    p->rlimit_cur[RLIMIT_NOFILE_INDEX] = N_OPEN_FILE_PER_PROC;
+    p->rlimit_max[RLIMIT_NOFILE_INDEX] = N_OPEN_FILE_PER_PROC;
 }
 
 /* 获取一个pid */
@@ -250,6 +264,7 @@ void proc_init()
     memset(sleepchan_hints, 0, sizeof(sleepchan_hints));
     sleepchan_overflow = 0;
     spinlock_init(&sleepchan_lk, "sleepchan");
+    spinlock_init(&shared_vm_lk, "shared_vm");
 
     // 初始化MLFQ调度器
     mlfq_init();
@@ -278,6 +293,8 @@ proc_t *proc_alloc()
             p->pid = alloc_pid();
             p->exit_code = 0;
             p->sleep_space = NULL;
+            p->sleep_deadline = 0;
+            p->sleep_timedout = 0;
             p->parent = myproc();
             p->pgtbl = NULL;
             p->heap_top = 0;
@@ -340,10 +357,13 @@ proc_t *proc_alloc()
                 p->open_file[fd] = NULL;
                 p->fd_cloexec[fd] = 0;
             }
+            proc_init_rlimits(p);
 
             memset(p->sig_handler, 0, sizeof(p->sig_handler));
+            memset(p->sig_flags, 0, sizeof(p->sig_flags));
             p->sig_restorer = 0;
             p->sig_pending = 0;
+            p->sig_mask = 0;
             p->sig_delivering = 0;
             p->group_exit_pending = 0;
             p->group_exit_code = 0;
@@ -367,21 +387,25 @@ proc_t *proc_alloc()
 */
 void proc_free(proc_t *p)
 {
+    int has_live_vm_sibling = proc_has_live_vm_sibling(p);
+
     // 释放用户态页表相关资源
     if (p->pgtbl) {
-        if (p->shared_vm || proc_has_live_vm_sibling(p))
+        if (has_live_vm_sibling)
             uvm_destroy_shared_pgtbl(p->pgtbl);
         else
             uvm_destroy_pgtbl(p->pgtbl);
         p->pgtbl = NULL;
     }
-    if (!p->shared_vm && p->mmap)
+    if (!has_live_vm_sibling && p->mmap)
         proc_free_mmap_list(p);
 
     // open_file 和 cwd 已由 proc_exit 关闭，这里只做防御性清理
     for (int i = 0; i < N_OPEN_FILE_PER_PROC; i++)
         p->open_file[i] = NULL;
     memset(p->fd_cloexec, 0, sizeof(p->fd_cloexec));
+    memset(p->rlimit_cur, 0, sizeof(p->rlimit_cur));
+    memset(p->rlimit_max, 0, sizeof(p->rlimit_max));
     p->cwd = NULL;
 
     // 清空结构体并置为 UNUSED
@@ -391,6 +415,8 @@ void proc_free(proc_t *p)
     p->tf = NULL;
     p->exit_code = 0;
     p->sleep_space = NULL;
+    p->sleep_deadline = 0;
+    p->sleep_timedout = 0;
     p->pgtbl = NULL;
     p->heap_top = 0;
     p->ustack_npage = 0;
@@ -444,8 +470,10 @@ void proc_free(proc_t *p)
 
     // Signal 清理
     memset(p->sig_handler, 0, sizeof(p->sig_handler));
+    memset(p->sig_flags, 0, sizeof(p->sig_flags));
     p->sig_restorer = 0;
     p->sig_pending = 0;
+    p->sig_mask = 0;
     p->sig_delivering = 0;
     p->group_exit_pending = 0;
     p->group_exit_code = 0;
@@ -590,7 +618,7 @@ void proc_make_first()
     父进程产生子进程
     UNUSED -> RUNNABLE
 */
-int proc_fork()
+int proc_fork_with_stack(uint64 child_stack)
 {
     proc_t *parent = myproc();
     proc_t *child = proc_alloc();
@@ -604,6 +632,8 @@ int proc_fork()
     if (!tf) { spinlock_release(&child->lk); return -1; }
     *tf = *parent->tf;
     tf->a0=0;
+    if (child_stack != 0)
+        tf->sp = child_stack;
 
     // 填充子进程结构体
     child->tf = tf;
@@ -645,11 +675,15 @@ int proc_fork()
         }
         child->fd_cloexec[i] = parent->fd_cloexec[i];
     }
+    memcpy(child->rlimit_cur, parent->rlimit_cur, sizeof(parent->rlimit_cur));
+    memcpy(child->rlimit_max, parent->rlimit_max, sizeof(parent->rlimit_max));
 
     // 继承信号处理器
     memcpy(child->sig_handler, parent->sig_handler, sizeof(parent->sig_handler));
+    memcpy(child->sig_flags, parent->sig_flags, sizeof(parent->sig_flags));
     child->sig_restorer = parent->sig_restorer;
     child->sig_pending = 0;
+    child->sig_mask = parent->sig_mask;
     child->sig_delivering = 0;
     child->group_exit_pending = 0;
     child->group_exit_code = 0;
@@ -676,6 +710,11 @@ int proc_fork()
     // printf("proc_fork: after mlfq_on_new child=%d\n", pid);
 
     return pid;
+}
+
+int proc_fork()
+{
+    return proc_fork_with_stack(0);
 }
 
 /*
@@ -773,6 +812,44 @@ void proc_shared_vm_sync_heap_grow(uint64 old_top, uint64 new_top)
     }
 }
 
+uint64 proc_shared_vm_sync_heap_shrink(uint64 old_top, uint64 requested_top)
+{
+    proc_t *caller = myproc();
+    if (caller == NULL)
+        return (uint64)-1;
+
+    const uint64 min_heap = 2 * PGSIZE;
+    if (old_top <= min_heap)
+        return (uint64)-1;
+
+    uint64 new_top = requested_top < min_heap ? min_heap : requested_top;
+    if (new_top >= old_top)
+        return old_top;
+
+    uint64 old_pages = (old_top + PGSIZE - 1) / PGSIZE;
+    uint64 new_pages = (new_top + PGSIZE - 1) / PGSIZE;
+
+    for (uint64 page = new_pages; page < old_pages; page++) {
+        uint64 va = page * PGSIZE;
+        uint64 pa = proc_shared_vm_unmap_page(va);
+        if (pa != 0)
+            pmem_free(pa, false);
+    }
+
+    proc_t *owner = caller->vm_owner ? caller->vm_owner : caller;
+    for (int i = 0; i < N_PROC; i++) {
+        proc_t *p = &proc_list[i];
+        spinlock_acquire(&p->lk);
+        if (p->state != UNUSED && p->state != ZOMBIE &&
+            p->vm_owner == owner && p->heap_top > new_top) {
+            p->heap_top = new_top;
+        }
+        spinlock_release(&p->lk);
+    }
+
+    return new_top;
+}
+
 int proc_shared_vm_lookup_page(uint64 va, uint64 *pa_out, int *flags_out)
 {
     proc_t *caller = myproc();
@@ -828,6 +905,80 @@ int proc_shared_vm_map_page(uint64 va, uint64 pa, int flags)
     return ret;
 }
 
+int proc_shared_vm_fault_page(uint64 va, int flags)
+{
+    proc_t *caller = myproc();
+    if (caller == NULL)
+        return -1;
+
+    proc_t *owner = caller->vm_owner ? caller->vm_owner : caller;
+    uint64 pa = 0;
+    int map_flags = flags;
+    int allocated = 0;
+    int ret = 0;
+
+    spinlock_acquire(&shared_vm_lk);
+
+    for (int i = 0; i < N_PROC; i++) {
+        proc_t *p = &proc_list[i];
+        spinlock_acquire(&p->lk);
+        if (p->state != UNUSED && p->state != ZOMBIE &&
+            p->vm_owner == owner && p->pgtbl != NULL) {
+            pte_t *pte = vm_getpte(p->pgtbl, va, false);
+            if (pte != NULL && (*pte & PTE_V) && !PTE_CHECK(*pte)) {
+                pa = (uint64)PTE_TO_PA(*pte);
+                map_flags = (int)PTE_FLAGS(*pte);
+                spinlock_release(&p->lk);
+                break;
+            }
+        }
+        spinlock_release(&p->lk);
+    }
+
+    if (pa == 0) {
+        pa = (uint64)pmem_alloc(false);
+        if (pa == 0) {
+            spinlock_release(&shared_vm_lk);
+            return -1;
+        }
+        memset((void *)pa, 0, PGSIZE);
+        allocated = 1;
+    }
+
+    for (int i = 0; i < N_PROC; i++) {
+        proc_t *p = &proc_list[i];
+        spinlock_acquire(&p->lk);
+        if (p->state != UNUSED && p->state != ZOMBIE &&
+            p->vm_owner == owner && p->pgtbl != NULL) {
+            pte_t *pte = vm_getpte(p->pgtbl, va, false);
+            if (pte == NULL || !(*pte & PTE_V)) {
+                if (vm_try_mappages(p->pgtbl, va, pa, PGSIZE, map_flags) < 0)
+                    ret = -1;
+            }
+        }
+        spinlock_release(&p->lk);
+    }
+
+    if (ret < 0 && allocated) {
+        for (int i = 0; i < N_PROC; i++) {
+            proc_t *p = &proc_list[i];
+            spinlock_acquire(&p->lk);
+            if (p->state != UNUSED && p->vm_owner == owner && p->pgtbl != NULL) {
+                pte_t *pte = vm_getpte(p->pgtbl, va, false);
+                if (pte != NULL && (*pte & PTE_V) &&
+                    (uint64)PTE_TO_PA(*pte) == pa)
+                    *pte = 0;
+            }
+            spinlock_release(&p->lk);
+        }
+    }
+
+    spinlock_release(&shared_vm_lk);
+
+    if (ret < 0 && allocated)
+        pmem_free(pa, false);
+    return ret;
+}
 uint64 proc_shared_vm_unmap_page(uint64 va)
 {
     proc_t *caller = myproc();
@@ -990,7 +1141,8 @@ static void proc_try_wakeup(proc_t *p)
     // 唤醒等待“自己”的父进程
     bool woke = false;
     spinlock_acquire(&parent->lk);
-    bool sigchld = parent->sig_handler[SIGCHLD] > 1;
+    bool thread_exit = p->shared_vm && p->thread_group;
+    bool sigchld = !thread_exit && parent->sig_handler[SIGCHLD] > 1;
     if (sigchld)
         parent->sig_pending |= (1UL << (SIGCHLD - 1));
     if (parent->state == SLEEPING && (parent->sleep_space == parent || sigchld)) {
@@ -1037,6 +1189,32 @@ void proc_check_itimers(uint64 now)
         spinlock_release(&p->lk);
 
         if (woke)
+            mlfq_on_wakeup(p);
+    }
+}
+
+void proc_check_sleep_deadlines(uint64 now)
+{
+    for (int i = 0; i < N_PROC; i++) {
+        proc_t *p = &proc_list[i];
+        int should_enqueue = 0;
+
+        spinlock_acquire(&p->lk);
+        if (p->state == SLEEPING && p->sleep_deadline != 0 &&
+            now >= p->sleep_deadline) {
+            p->sleep_timedout = 1;
+            p->state = RUNNABLE;
+            p->sleep_space = NULL;
+            p->sleep_deadline = 0;
+            p->sched_last_ready_tick = timer_get_ticks();
+            p->mlfq_age_start_tick = p->sched_last_ready_tick;
+            p->sched_ready_count++;
+            p->mlfq_in_readyq = 0;
+            should_enqueue = 1;
+        }
+        spinlock_release(&p->lk);
+
+        if (should_enqueue)
             mlfq_on_wakeup(p);
     }
 }
@@ -1090,8 +1268,9 @@ static int proc_signal_group_exit(proc_t *owner, proc_t *me, int exit_code)
 
         int should_enqueue = 0;
         spinlock_acquire(&p->lk);
-        if (p->state != UNUSED && p->state != ZOMBIE &&
-            p->shared_vm && p->thread_group && p->vm_owner == owner) {
+        int same_group = p->thread_group &&
+            (p == owner || (p->shared_vm && p->vm_owner == owner));
+        if (p->state != UNUSED && p->state != ZOMBIE && same_group) {
             p->group_exit_pending = 1;
             p->group_exit_code = exit_code;
             live++;
@@ -1147,6 +1326,54 @@ void proc_exit_group(int exit_code)
     proc_exit(exit_code);
 }
 
+void proc_signal_action_sync(int signum, uint64 handler, uint64 flags, uint64 restorer)
+{
+    proc_t *caller = myproc();
+    if (caller == NULL || signum < 1 || signum > NSIG)
+        return;
+
+    proc_t *owner = caller->vm_owner ? caller->vm_owner : caller;
+    for (int i = 0; i < N_PROC; i++) {
+        proc_t *p = &proc_list[i];
+        spinlock_acquire(&p->lk);
+        int same_group = p == caller;
+        if (caller->thread_group) {
+            same_group = p->thread_group &&
+                (p == owner || (p->shared_vm && p->vm_owner == owner));
+        }
+        if (p->state != UNUSED && same_group) {
+            p->sig_handler[signum] = handler;
+            p->sig_flags[signum] = flags;
+            p->sig_restorer = restorer;
+        }
+        spinlock_release(&p->lk);
+    }
+}
+
+static int proc_wait_pending_interrupt(proc_t *parent)
+{
+    uint64 sigchld_bit = 1UL << (SIGCHLD - 1);
+
+    spinlock_acquire(&parent->lk);
+    int consumed_sigchld = (parent->sig_pending & sigchld_bit) != 0;
+    if (consumed_sigchld)
+        parent->sig_pending &= ~sigchld_bit;
+    int interrupted = parent->sig_pending != 0;
+    spinlock_release(&parent->lk);
+    if (interrupted)
+        return 1;
+    return consumed_sigchld ? -1 : 0;
+}
+
+static void proc_wait_clear_sigchld(proc_t *parent)
+{
+    uint64 sigchld_bit = 1UL << (SIGCHLD - 1);
+
+    spinlock_acquire(&parent->lk);
+    parent->sig_pending &= ~sigchld_bit;
+    spinlock_release(&parent->lk);
+}
+
 /*
     wait4(wait_pid, user_addr, wnohang)
     wait_pid: -1=任意子进程, >0=等特定pid
@@ -1176,11 +1403,15 @@ int proc_wait4(int64 wait_pid, uint64 user_addr, int wnohang)
                 has_child = 1;
                 if (p->state == ZOMBIE) {
                     if (user_addr) {
-                        // Linux wait4 *status 编码: exit_code << 8
-                        int wstatus = (p->exit_code & 0xff) << 8;
+                        int wstatus;
+                        if (p->exit_code < 0)
+                            wstatus = (-p->exit_code) & 0x7f;
+                        else
+                            wstatus = (p->exit_code & 0xff) << 8;
                         uvm_copyout(parent->pgtbl, user_addr, (uint64)&wstatus, sizeof(int));
                     }
                     int pid = p->pid;
+                    proc_wait_clear_sigchld(parent);
                     proc_free(p);
                     spinlock_release(&p->lk);
                     return pid;
@@ -1195,20 +1426,18 @@ int proc_wait4(int64 wait_pid, uint64 user_addr, int wnohang)
         if (wnohang)
             return 0;   // WNOHANG: 没有ZOMBIE子进程，立即返回0
 
-        spinlock_acquire(&parent->lk);
-        if (parent->sig_pending != 0) {
-            spinlock_release(&parent->lk);
+        int pending = proc_wait_pending_interrupt(parent);
+        if (pending > 0)
             return -EINTR;
-        }
-        spinlock_release(&parent->lk);
+        if (pending < 0)
+            continue;
 
         spinlock_acquire(&parent->lk);
         proc_sleep(parent, &parent->lk);
-        if (parent->sig_pending != 0) {
-            spinlock_release(&parent->lk);
-            return -EINTR;
-        }
         spinlock_release(&parent->lk);
+        pending = proc_wait_pending_interrupt(parent);
+        if (pending > 0)
+            return -EINTR;
     }
 }
 
@@ -1216,11 +1445,11 @@ int proc_wait4(int64 wait_pid, uint64 user_addr, int wnohang)
     进程等待sleep_space对应的资源, 进入睡眠状态
     RUNNING -> SLEEPING
 */
-void proc_sleep(void *sleep_space, spinlock_t *lock)
+static int proc_sleep_common(void *sleep_space, spinlock_t *lock, uint64 deadline)
 {
     proc_t *p = myproc();
     if (p == NULL || lock == NULL)
-        return;
+        return 0;
 
     // 应对外设中断处理程序调用proc_sleep的情况
     if (lock != &p->lk) {
@@ -1233,6 +1462,8 @@ void proc_sleep(void *sleep_space, spinlock_t *lock)
 
     // 开始睡眠
     p->sleep_space = sleep_space;
+    p->sleep_deadline = deadline;
+    p->sleep_timedout = 0;
     p->state = SLEEPING;
     // 防御：进程处于 SLEEPING 时不应在就绪队列中。
     p->mlfq_in_readyq = 0;
@@ -1247,6 +1478,9 @@ void proc_sleep(void *sleep_space, spinlock_t *lock)
 
     // 被唤醒
     // printf("proc %d is wakeup!\n", p->pid);
+    int timedout = p->sleep_timedout;
+    p->sleep_deadline = 0;
+    p->sleep_timedout = 0;
     sleepchan_dec(sleep_space);
 
     // 恢复原样
@@ -1254,6 +1488,17 @@ void proc_sleep(void *sleep_space, spinlock_t *lock)
         spinlock_release(&p->lk);
         spinlock_acquire(lock);
     }
+    return timedout;
+}
+
+void proc_sleep(void *sleep_space, spinlock_t *lock)
+{
+    (void)proc_sleep_common(sleep_space, lock, 0);
+}
+
+int proc_sleep_until(void *sleep_space, spinlock_t *lock, uint64 deadline)
+{
+    return proc_sleep_common(sleep_space, lock, deadline);
 }
 
 /*

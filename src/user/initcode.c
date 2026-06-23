@@ -61,9 +61,39 @@ static void build_argv0(char *dst, const char *name)
 	dst[pos] = 0;
 }
 
+#define TEST_NAME_LEN 32
+#define WNOHANG 1
+#define SIGKILL 9
+#define WAIT_ERROR 2
+#define TEST_TIMEOUT_POLLS 300
+#define TEST_POLL_TICKS 10
+
 static void run_one(char *path, char **argv);
 
-static int run_test_entries(const char *dir)
+static int wait_child_with_timeout(int pid, int *status)
+{
+	for (int i = 0; i < TEST_TIMEOUT_POLLS; i++) {
+		int wait_ret = (int)syscall(SYS_wait, pid, status, WNOHANG, 0);
+		if (wait_ret == pid)
+			return 0;
+		if (wait_ret < 0)
+			return WAIT_ERROR;
+		syscall(SYS_sleep, TEST_POLL_TICKS);
+	}
+
+	syscall(SYS_kill, pid, SIGKILL);
+	for (int i = 0; i < 60; i++) {
+		int wait_ret = (int)syscall(SYS_wait, pid, status, WNOHANG, 0);
+		if (wait_ret == pid)
+			break;
+		if (wait_ret < 0)
+			break;
+		syscall(SYS_sleep, 1);
+	}
+	return 1;
+}
+
+static int run_named_test_entry(const char *dir, const char *target)
 {
 	uint32 fd = syscall(SYS_open, dir, OPEN_READ);
 	if ((int)fd < 0)
@@ -71,7 +101,7 @@ static int run_test_entries(const char *dir)
 
 	int count = 0;
 	char de_buf[1024];
-	while (1) {
+	while (count == 0) {
 		uint32 read_len = syscall(SYS_get_dentries, fd, de_buf, sizeof(de_buf));
 		if ((int)read_len <= 0)
 			break;
@@ -82,6 +112,10 @@ static int run_test_entries(const char *dir)
 			if (reclen < 20 || off + reclen > read_len)
 				break;
 			if (!is_testcode_name(name)) {
+				off += reclen;
+				continue;
+			}
+			if (local_strncmp(name, target, local_strlen(target) + 1) != 0) {
 				off += reclen;
 				continue;
 			}
@@ -97,13 +131,41 @@ static int run_test_entries(const char *dir)
 			off += reclen;
 		}
 
-		if (read_len < sizeof(de_buf))
-			break;
+		/* Keep reading until getdents reports EOF/error; short reads can
+		 * happen when the next variable-length dirent does not fit. */
 	}
 
 	syscall(SYS_close, fd);
 	return count;
 }
+
+static int run_test_entries(const char *dir, const char names[][TEST_NAME_LEN])
+{
+	int count = 0;
+	for (int i = 0; names[i][0] != 0; i++)
+		count += run_named_test_entry(dir, names[i]);
+	return count;
+}
+
+static const char primary_tests[][TEST_NAME_LEN] = {
+	"libcbench_testcode.sh",
+	"libctest_testcode.sh",
+	"busybox_testcode.sh",
+	"cyclictest_testcode.sh",
+	"netperf_testcode.sh",
+	"iperf_testcode.sh",
+	"iozone_testcode.sh",
+	"lua_testcode.sh",
+	"basic_testcode.sh",
+	"",
+};
+
+static const char deferred_tests[][TEST_NAME_LEN] = {
+	"unixbench_testcode.sh",
+	"lmbench_testcode.sh",
+	"ltp_testcode.sh",
+	"",
+};
 
 static void run_one(char *path, char **argv)
 {
@@ -112,6 +174,7 @@ static void run_one(char *path, char **argv)
 	char str_3[] = "\n======== test end    ========\n";
 	char str_4[] = "\n======== test fail   ========\n";
 	char str_5[] = "initcode: exec fail!\n";
+	char str_6[] = "\n======== test timeout ========\n";
 
 	syscall(SYS_write, 1, "run ", 4);
 	syscall(SYS_write, 1, path, local_strlen(path));
@@ -149,8 +212,14 @@ static void run_one(char *path, char **argv)
 	}
 
 	int ret = -1;
-	if ((int)syscall(SYS_wait, pid, &ret, 0, 0) < 0) {
+	int wait_state = wait_child_with_timeout(pid, &ret);
+	if (wait_state == WAIT_ERROR) {
 		syscall(SYS_write, 1, str_1, sizeof(str_1));
+		return;
+	}
+	if (wait_state > 0) {
+		syscall(SYS_write, 1, str_6, sizeof(str_6) - 1);
+		syscall(SYS_write, 1, str_4, sizeof(str_4));
 		return;
 	}
 	if (ret != 0) {
@@ -169,11 +238,13 @@ int main()
 
 	int count = 0;
 
-	count += run_test_entries("/musl");
-	count += run_test_entries("/glibc");
+	count += run_test_entries("/musl", primary_tests);
+	count += run_test_entries("/glibc", primary_tests);
+	count += run_test_entries("/musl", deferred_tests);
+	count += run_test_entries("/glibc", deferred_tests);
 
 	if (count == 0)
-		count += run_test_entries("/");
+		count += run_test_entries("/", primary_tests) + run_test_entries("/", deferred_tests);
 
 	if (count == 0) {
 		syscall(SYS_write, 1, no_test, sizeof(no_test) - 1);

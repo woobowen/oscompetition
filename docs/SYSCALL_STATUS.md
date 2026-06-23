@@ -4,11 +4,13 @@
 > 返回值约定：成功返回结果（uint64）；失败返回 (uint64)(-EXXX)，见 docs/DECISIONS.md D1/D2。
 > 分发表上限 SYS_MAX_NUM=502（src/kernel/syscall/type.h）。
 
-## 已实现（共 111 个分发表入口，含 3 个 SeaOS 私有入口）
+## 已实现（共 126 个分发表入口，含 3 个 SeaOS 私有入口）
 | 号 | 名 | 备注 |
 |---|---|---|
 | 4 | fork | SeaOS |
 | 17 | getcwd | Linux/RISC-V ABI；写出当前工作目录 |
+| 39 | umount2 | 最小兼容卸载入口；当前镜像路径返回成功边界 |
+| 40 | mount | 最小兼容挂载入口；基础测试挂载路径返回成功边界 |
 | 23 | dup | |
 | 24 | dup3 | 支持 `O_CLOEXEC` 标志 |
 | 25 | fcntl | 支持 `F_DUPFD`、`F_DUPFD_CLOEXEC`、`F_GETFD`、`F_SETFD` |
@@ -21,6 +23,8 @@
 | 44 | fstatfs | 最小 Linux `struct statfs` |
 | 46 | ftruncate | 最小兼容：有效 fd 返回 0 |
 | 48 | faccessat | 路径存在性/可读可执行检查 |
+| 53 | fchmodat | 权限修改最小兼容；有效路径返回成功边界 |
+| 54 | fchownat | 属主修改最小兼容；有效路径返回成功边界 |
 | 49 | chdir | |
 | 56 | open(at) | |
 | 57 | close | |
@@ -32,6 +36,7 @@
 | 65 | readv | |
 | 66 | writev | |
 | 67 | pread64 | 按给定 offset 读取并恢复 fd offset |
+| 68 | pwrite64 | 按给定 offset 写入并恢复 fd offset |
 | 71 | sendfile | |
 | 72 | pselect6 | Linux fd_set copyin/copyout；socket 使用真实 readiness |
 | 73 | ppoll | |
@@ -72,6 +77,8 @@
 | 139 | rt_sigreturn | 从用户栈恢复 signal frame |
 | 144 | setgid | 桩，返回 0 |
 | 146 | setuid | 桩，返回 0 |
+| 153 | times | 返回进程时间结构，供基础测试读取 |
+| 154 | setpgid | 最小进程组兼容入口 |
 | 157 | setsid | 返回调用进程 pid 作为最小 session id |
 | 160 | uname | |
 | 163 | getrlimit | 支持 `RLIMIT_NOFILE` |
@@ -87,6 +94,10 @@
 | 177 | getegid | 返回 0 |
 | 178 | gettid | 单线程 = pid |
 | 179 | sysinfo | 零填充 112B，uptime 填入 |
+| 194 | shmget | SysV SHM 最小段分配，供 glibc/ltp 探测 |
+| 195 | shmctl | SysV SHM `IPC_STAT`/`IPC_RMID` 最小兼容 |
+| 196 | shmat | SysV SHM 映射到用户地址空间 |
+| 197 | shmdt | SysV SHM detach，清理 attach 记录 |
 | 198 | socket | AF_INET loopback，支持 STREAM/DGRAM |
 | 199 | socketpair | AF_UNIX/SOCK_STREAM 最小 pipe-like 兼容 |
 | 200 | bind | loopback/any IPv4，端口 0 自动分配 |
@@ -118,7 +129,28 @@
 | 261 | prlimit64 | 支持当前进程 `RLIMIT_NOFILE` |
 | 276 | renameat2 | 无 flags 时转 `renameat`，其他 flags 返回 `-EINVAL` |
 | 278 | getrandom | 非阻塞伪随机字节，支持 Linux flags 子集 |
+| 283 | membarrier | 单核最小兼容；支持 query 和 no-op barrier |
 | 500/501/502 | schedstat/spawn/shutdown | SeaOS 私有 |
+
+## 2026-06-24 状态更新：RV initcode 完整枚举 24 组
+
+本轮按固定 docker 命令复跑，`os_serial_out_rv.txt` 已到 `sys_shutdown`，并确认 RV initcode 枚举到 `/musl` 12 组和 `/glibc` 12 组，共 24 组。`src/user/initcode.c` 的目录扫描不再把短 `getdentries64` 读当作 EOF，而是持续读取直到 `SYS_get_dentries <= 0`。
+
+本轮主表同步到当前 `src/kernel/syscall/syscall.c` 分发表：共 126 个入口，其中 123 个 Linux/RISC-V ABI 或兼容入口，3 个 SeaOS 私有入口。
+
+当前 RV 评测状态以 `rv-current.md` 为准：15 组在本轮日志中未见聚焦失败标记，9 组仍有真实失败或 timeout。失败组包括 `libcbench-glibc`、`libctest-glibc`、`netperf-glibc`、`unixbench-musl`、`lmbench-musl`、`ltp-musl`、`unixbench-glibc`、`lmbench-glibc`、`ltp-glibc`。
+
+本轮新增或补强的 syscall/语义：
+
+| 号 | 名 | 当前语义/修正 |
+|---|---|---|
+| 39/40 | umount2/mount | 基础测试所需最小挂载/卸载兼容入口。 |
+| 53/54 | fchmodat/fchownat | 最小权限/属主修改兼容，避免路径探测落到 unknown syscall。 |
+| 68 | pwrite64 | 按给定 offset 写入并恢复 fd offset。 |
+| 153/154 | times/setpgid | 基础进程时间和进程组兼容入口。 |
+| 194-197 | SysV SHM | `shmget/shmctl/shmat/shmdt` 最小段管理与映射。 |
+| 283 | membarrier | 单核最小兼容，支持 query/no-op barrier。 |
+| 多个文件 syscall | errno 边界 | syscall 出错返回从裸 `(uint64)-1` 收敛为 `-EXXX`，减少误报 `Operation not permitted`；剩余 `EBADF/EMFILE` pipe 失败仍按真实缺口记录。 |
 
 ## 2026-06-18 状态更新：glibc 压力组推进到 `lmbench-glibc`
 

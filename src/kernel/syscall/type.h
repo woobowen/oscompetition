@@ -20,6 +20,7 @@
 #define SYS_write 64             // Linux/RISC-V write
 #define SYS_readv 65             // Linux/RISC-V readv
 #define SYS_pread64 67           // Linux/RISC-V pread64
+#define SYS_pwrite64 68          // Linux/RISC-V pwrite64
 #define SYS_lseek 62             // Linux/RISC-V lseek
 #define SYS_dup 23               // Linux/RISC-V dup
 #define SYS_fstat 80             // Linux/RISC-V fstat
@@ -30,12 +31,16 @@
 #define SYS_mkdir 34             // Linux/RISC-V mkdirat
 #define SYS_chdir 49             // Linux/RISC-V chdir
 #define SYS_getcwd 17            // Linux/RISC-V getcwd
+#define SYS_mount 40             // Linux/RISC-V mount
+#define SYS_umount2 39           // Linux/RISC-V umount2
 #define SYS_link 37              // Linux/RISC-V linkat
 #define SYS_renameat 38          // Linux/RISC-V renameat
 #define SYS_statfs 43            // Linux/RISC-V statfs
 #define SYS_fstatfs 44           // Linux/RISC-V fstatfs
 #define SYS_ftruncate 46         // Linux/RISC-V ftruncate
 #define SYS_faccessat 48         // Linux/RISC-V faccessat
+#define SYS_fchmodat 53          // Linux/RISC-V fchmodat
+#define SYS_fchownat 54          // Linux/RISC-V fchownat
 #define SYS_unlink 35            // Linux/RISC-V unlinkat
 #define SYS_newfstatat 79        // Linux/RISC-V newfstatat (按路径 stat)
 #define SYS_utimensat 88         // Linux/RISC-V utimensat
@@ -45,7 +50,9 @@
 #define SYS_rt_sigreturn 139     // Linux/RISC-V rt_sigreturn
 #define SYS_setgid 144           // 暂桩返回 0
 #define SYS_setuid 146           // 暂桩返回 0
+#define SYS_setpgid 154          // Linux/RISC-V setpgid
 #define SYS_setsid 157           // Linux/RISC-V setsid
+#define SYS_times 153            // Linux/RISC-V times
 #define SYS_getuid 174           // 返回 0 (root)
 #define SYS_getgid 176           // 返回 0
 #define SYS_writev 66            // Linux/RISC-V writev
@@ -80,6 +87,10 @@
 #define SYS_tkill 130            // Linux/RISC-V tkill
 #define SYS_tgkill 131           // Linux/RISC-V tgkill
 #define SYS_sysinfo 179          // Linux/RISC-V sysinfo
+#define SYS_shmget 194           // Linux/RISC-V shmget
+#define SYS_shmctl 195           // Linux/RISC-V shmctl
+#define SYS_shmat 196            // Linux/RISC-V shmat
+#define SYS_shmdt 197            // Linux/RISC-V shmdt
 #define SYS_madvise 233          // Linux/RISC-V madvise
 #define SYS_readlinkat 78        // Linux/RISC-V readlinkat
 #define SYS_sched_yield 124      // Linux/RISC-V sched_yield
@@ -114,6 +125,7 @@
 #define SYS_get_mempolicy 236    // Linux/RISC-V get_mempolicy
 #define SYS_prlimit64 261        // Linux/RISC-V prlimit64
 #define SYS_getrandom 278        // Linux/RISC-V getrandom
+#define SYS_membarrier 283       // Linux/RISC-V membarrier
 
 #define SYS_schedstat 500        // SeaOS 私有: 拉取调度统计快照
 #define SYS_spawn     501        // SeaOS 私有: fork+exec+wait 串行执行程序

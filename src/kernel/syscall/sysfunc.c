@@ -12,7 +12,7 @@ uint64 sys_brk()
     arg_uint64(0, &new_top);
 
     proc_t *p = myproc();
-    if (!p) return (uint64)-1;
+    if (!p) return 0;
 
     uint64 cur = p->heap_top;
 
@@ -21,14 +21,13 @@ uint64 sys_brk()
     }else if (new_top > cur) { // grow
         uint32 len = (uint32)(new_top - cur);
         uint64 ret = uvm_heap_grow(p->pgtbl, cur, len, PTE_R | PTE_W | PTE_U);
-        if (ret == (uint64)-1) return (uint64)-1;
+        if (ret == (uint64)-1) return cur;
         p->heap_top = ret;
         proc_shared_vm_sync_heap_grow(cur, ret);
 
     }else { // ungrow & stay
-        uint32 len = (uint32)(cur - new_top);
-        uint64 ret = uvm_heap_ungrow(p->pgtbl, cur, len);
-        if (ret == (uint64)-1) return (uint64)-1;
+        uint64 ret = proc_shared_vm_sync_heap_shrink(cur, new_top);
+        if (ret == (uint64)-1) return cur;
         p->heap_top = ret;
 
     }
@@ -55,12 +54,12 @@ static int mmap_prefill_file(file_t *file, uint64 start, uint64 len, uint64 file
         if (pte == NULL || !(*pte & PTE_V)) {
             if (uvm_mmap_handle_fault(p->pgtbl, va) == (uint64)-1) {
                 inode_unlock(ip);
-                return -1;
+                return -ENOMEM;
             }
             pte = vm_getpte(p->pgtbl, va, false);
             if (pte == NULL || !(*pte & PTE_V)) {
                 inode_unlock(ip);
-                return -1;
+                return -ENOMEM;
             }
         }
 
@@ -84,7 +83,7 @@ static int mmap_prefill_file(file_t *file, uint64 start, uint64 len, uint64 file
         if (inode_read_data(ip, (uint32)pos, want,
                             (void *)(pa + (copy_start - va)), false) != want) {
             inode_unlock(ip);
-            return -1;
+            return -EIO;
         }
     }
 
@@ -208,6 +207,307 @@ uint64 sys_mremap()
     return (uint64)(-ENOMEM);
 }
 
+#define SYSV_SHM_MAX_SEG 32
+#define SYSV_SHM_MAX_ATTACH 128
+#define SYSV_SHM_MAX_PAGES 64
+#define SYSV_IPC_PRIVATE 0
+#define SYSV_IPC_CREAT 01000
+#define SYSV_IPC_EXCL 02000
+#define SYSV_IPC_RMID 0
+#define SYSV_IPC_STAT 2
+#define SYSV_SHM_RDONLY 010000
+#define SYSV_SHM_RND 020000
+
+typedef struct sysv_shm_seg {
+    int used;
+    int id;
+    int key;
+    uint64 size;
+    uint32 npages;
+    uint64 pages[SYSV_SHM_MAX_PAGES];
+    int attach_count;
+    int marked_remove;
+} sysv_shm_seg_t;
+
+typedef struct sysv_shm_attach {
+    int used;
+    int pid;
+    int shmid;
+    uint64 addr;
+    uint32 npages;
+} sysv_shm_attach_t;
+
+static spinlock_t sysv_shm_lk = {0, "sysv_shm", -1};
+static sysv_shm_seg_t sysv_shm_seg[SYSV_SHM_MAX_SEG];
+static sysv_shm_attach_t sysv_shm_attach[SYSV_SHM_MAX_ATTACH];
+static int sysv_shm_next_id = 1;
+
+static sysv_shm_seg_t *sysv_shm_find_id_locked(int shmid)
+{
+    for (int i = 0; i < SYSV_SHM_MAX_SEG; i++) {
+        if (sysv_shm_seg[i].used && sysv_shm_seg[i].id == shmid &&
+            !sysv_shm_seg[i].marked_remove)
+            return &sysv_shm_seg[i];
+    }
+    return NULL;
+}
+
+static sysv_shm_seg_t *sysv_shm_find_id_any_locked(int shmid)
+{
+    for (int i = 0; i < SYSV_SHM_MAX_SEG; i++) {
+        if (sysv_shm_seg[i].used && sysv_shm_seg[i].id == shmid)
+            return &sysv_shm_seg[i];
+    }
+    return NULL;
+}
+
+static sysv_shm_seg_t *sysv_shm_find_key_locked(int key)
+{
+    for (int i = 0; i < SYSV_SHM_MAX_SEG; i++) {
+        if (sysv_shm_seg[i].used && sysv_shm_seg[i].key == key &&
+            !sysv_shm_seg[i].marked_remove)
+            return &sysv_shm_seg[i];
+    }
+    return NULL;
+}
+
+static void sysv_shm_free_seg_locked(sysv_shm_seg_t *seg)
+{
+    if (seg == NULL)
+        return;
+    for (uint32 i = 0; i < seg->npages; i++) {
+        if (seg->pages[i] != 0)
+            pmem_free(seg->pages[i], false);
+    }
+    memset(seg, 0, sizeof(*seg));
+}
+
+static int sysv_shm_record_attach_locked(int pid, int shmid, uint64 addr, uint32 npages)
+{
+    for (int i = 0; i < SYSV_SHM_MAX_ATTACH; i++) {
+        if (!sysv_shm_attach[i].used) {
+            sysv_shm_attach[i].used = 1;
+            sysv_shm_attach[i].pid = pid;
+            sysv_shm_attach[i].shmid = shmid;
+            sysv_shm_attach[i].addr = addr;
+            sysv_shm_attach[i].npages = npages;
+            return 0;
+        }
+    }
+    return -ENOSPC;
+}
+
+static sysv_shm_attach_t *sysv_shm_find_attach_locked(int pid, uint64 addr)
+{
+    for (int i = 0; i < SYSV_SHM_MAX_ATTACH; i++) {
+        if (sysv_shm_attach[i].used && sysv_shm_attach[i].pid == pid &&
+            sysv_shm_attach[i].addr == addr)
+            return &sysv_shm_attach[i];
+    }
+    return NULL;
+}
+
+// 194 shmget(key, size, shmflg): create/find a small SysV shared segment.
+uint64 sys_shmget()
+{
+    int key = (int)arg_raw(0);
+    uint64 size = arg_raw(1);
+    int shmflg = (int)arg_raw(2);
+
+    spinlock_acquire(&sysv_shm_lk);
+
+    if (key != SYSV_IPC_PRIVATE) {
+        sysv_shm_seg_t *old = sysv_shm_find_key_locked(key);
+        if (old != NULL) {
+            if ((shmflg & SYSV_IPC_CREAT) && (shmflg & SYSV_IPC_EXCL)) {
+                spinlock_release(&sysv_shm_lk);
+                return (uint64)(-EEXIST);
+            }
+            if (size != 0 && size > old->size) {
+                spinlock_release(&sysv_shm_lk);
+                return (uint64)(-EINVAL);
+            }
+            int id = old->id;
+            spinlock_release(&sysv_shm_lk);
+            return (uint64)id;
+        }
+        if ((shmflg & SYSV_IPC_CREAT) == 0) {
+            spinlock_release(&sysv_shm_lk);
+            return (uint64)(-ENOENT);
+        }
+    }
+
+    if (size == 0) {
+        spinlock_release(&sysv_shm_lk);
+        return (uint64)(-EINVAL);
+    }
+
+    uint64 aligned = (size + PGSIZE - 1) & ~(PGSIZE - 1);
+    if (aligned < size || aligned / PGSIZE > SYSV_SHM_MAX_PAGES) {
+        spinlock_release(&sysv_shm_lk);
+        return (uint64)(-ENOMEM);
+    }
+    uint32 npages = (uint32)(aligned / PGSIZE);
+
+    sysv_shm_seg_t *seg = NULL;
+    for (int i = 0; i < SYSV_SHM_MAX_SEG; i++) {
+        if (!sysv_shm_seg[i].used) {
+            seg = &sysv_shm_seg[i];
+            break;
+        }
+    }
+    if (seg == NULL) {
+        spinlock_release(&sysv_shm_lk);
+        return (uint64)(-ENOMEM);
+    }
+
+    memset(seg, 0, sizeof(*seg));
+    seg->used = 1;
+    seg->id = sysv_shm_next_id++;
+    if (sysv_shm_next_id <= 0)
+        sysv_shm_next_id = 1;
+    seg->key = key;
+    seg->size = size;
+    seg->npages = npages;
+    for (uint32 i = 0; i < npages; i++) {
+        seg->pages[i] = (uint64)pmem_alloc(false);
+        if (seg->pages[i] == 0) {
+            sysv_shm_free_seg_locked(seg);
+            spinlock_release(&sysv_shm_lk);
+            return (uint64)(-ENOMEM);
+        }
+        memset((void *)seg->pages[i], 0, PGSIZE);
+    }
+
+    int id = seg->id;
+    spinlock_release(&sysv_shm_lk);
+    return (uint64)id;
+}
+
+// 196 shmat(shmid, shmaddr, shmflg): map a segment into the caller.
+uint64 sys_shmat()
+{
+    int shmid = (int)arg_raw(0);
+    uint64 shmaddr = arg_raw(1);
+    int shmflg = (int)arg_raw(2);
+    proc_t *p = myproc();
+    if (p == NULL)
+        return (uint64)(-EINVAL);
+
+    if (shmaddr != 0) {
+        if (shmflg & SYSV_SHM_RND)
+            shmaddr &= ~(PGSIZE - 1);
+        else if (shmaddr % PGSIZE != 0)
+            return (uint64)(-EINVAL);
+    }
+
+    spinlock_acquire(&sysv_shm_lk);
+    sysv_shm_seg_t *seg = sysv_shm_find_id_locked(shmid);
+    if (seg == NULL) {
+        spinlock_release(&sysv_shm_lk);
+        return (uint64)(-EINVAL);
+    }
+
+    int perm = PTE_R | PTE_U | PTE_SHM;
+    if ((shmflg & SYSV_SHM_RDONLY) == 0)
+        perm |= PTE_W;
+
+    uint64 addr = uvm_mmap(shmaddr, seg->npages, perm);
+    if (addr == (uint64)-1) {
+        spinlock_release(&sysv_shm_lk);
+        return (uint64)(-ENOMEM);
+    }
+
+    for (uint32 i = 0; i < seg->npages; i++) {
+        if (vm_try_mappages(p->pgtbl, addr + (uint64)i * PGSIZE,
+                            seg->pages[i], PGSIZE, perm) < 0) {
+            uvm_munmap(addr, seg->npages);
+            spinlock_release(&sysv_shm_lk);
+            return (uint64)(-ENOMEM);
+        }
+    }
+
+    if (sysv_shm_record_attach_locked(p->pid, shmid, addr, seg->npages) < 0) {
+        uvm_munmap(addr, seg->npages);
+        spinlock_release(&sysv_shm_lk);
+        return (uint64)(-ENOMEM);
+    }
+    seg->attach_count++;
+
+    spinlock_release(&sysv_shm_lk);
+    return addr;
+}
+
+// 197 shmdt(shmaddr): detach a mapping created by shmat.
+uint64 sys_shmdt()
+{
+    uint64 shmaddr = arg_raw(0);
+    proc_t *p = myproc();
+    if (p == NULL || shmaddr % PGSIZE != 0)
+        return (uint64)(-EINVAL);
+
+    spinlock_acquire(&sysv_shm_lk);
+    sysv_shm_attach_t *att = sysv_shm_find_attach_locked(p->pid, shmaddr);
+    if (att == NULL) {
+        spinlock_release(&sysv_shm_lk);
+        return (uint64)(-EINVAL);
+    }
+
+    int shmid = att->shmid;
+    uint32 npages = att->npages;
+    memset(att, 0, sizeof(*att));
+
+    sysv_shm_seg_t *seg = sysv_shm_find_id_any_locked(shmid);
+    if (seg != NULL && seg->attach_count > 0)
+        seg->attach_count--;
+
+    uvm_munmap(shmaddr, npages);
+    if (seg != NULL && seg->marked_remove && seg->attach_count == 0)
+        sysv_shm_free_seg_locked(seg);
+
+    spinlock_release(&sysv_shm_lk);
+    return 0;
+}
+
+// 195 shmctl(shmid, cmd, buf): support IPC_RMID and a zeroed IPC_STAT.
+uint64 sys_shmctl()
+{
+    int shmid = (int)arg_raw(0);
+    int cmd = (int)arg_raw(1);
+    uint64 buf = arg_raw(2);
+
+    spinlock_acquire(&sysv_shm_lk);
+    sysv_shm_seg_t *seg = sysv_shm_find_id_locked(shmid);
+    if (seg == NULL) {
+        spinlock_release(&sysv_shm_lk);
+        return (uint64)(-EINVAL);
+    }
+
+    if (cmd == SYSV_IPC_RMID) {
+        if (seg->attach_count == 0)
+            sysv_shm_free_seg_locked(seg);
+        else
+            seg->marked_remove = 1;
+        spinlock_release(&sysv_shm_lk);
+        return 0;
+    }
+
+    if (cmd == SYSV_IPC_STAT) {
+        uint64 size = seg->size;
+        spinlock_release(&sysv_shm_lk);
+        if (buf != 0) {
+            uint64 out[16];
+            memset(out, 0, sizeof(out));
+            out[4] = size;
+            uvm_copyout(myproc()->pgtbl, buf, (uint64)out, sizeof(out));
+        }
+        return 0;
+    }
+
+    spinlock_release(&sysv_shm_lk);
+    return (uint64)(-EINVAL);
+}
+
 /*
     杩涚▼澶嶅埗
     杩斿洖瀛愯繘绋嬬殑pid
@@ -225,12 +525,10 @@ uint64 sys_clone()
     uint64 parent_tid = arg_raw(2);
     uint64 tls = arg_raw(3);
     uint64 child_tid = arg_raw(4);
-
-    if ((flags & 0x100) == 0 && stack == 0)
-        return proc_fork();
-
-    if ((flags & 0x100) == 0)
-        return (uint64)(-ENOSYS);
+    if ((flags & 0x100) == 0) {
+        int pid = proc_fork_with_stack(stack);
+        return pid < 0 ? (uint64)(-EAGAIN) : (uint64)pid;
+    }
 
     proc_t *parent = myproc();
     proc_t *child = proc_alloc();
@@ -286,14 +584,25 @@ uint64 sys_clone()
         return (uint64)(-ENOMEM);
     }
 
-    for (int i = 0; i < N_OPEN_FILE_PER_PROC; i++) {
-        child->open_file[i] = parent->open_file[i] ? file_dup(parent->open_file[i]) : NULL;
-        child->fd_cloexec[i] = parent->fd_cloexec[i];
+    if (child->thread_group) {
+        for (int i = 0; i < N_OPEN_FILE_PER_PROC; i++) {
+            child->open_file[i] = NULL;
+            child->fd_cloexec[i] = 0;
+        }
+    } else {
+        for (int i = 0; i < N_OPEN_FILE_PER_PROC; i++) {
+            child->open_file[i] = parent->open_file[i] ? file_dup(parent->open_file[i]) : NULL;
+            child->fd_cloexec[i] = parent->fd_cloexec[i];
+        }
     }
+    memcpy(child->rlimit_cur, parent->rlimit_cur, sizeof(parent->rlimit_cur));
+    memcpy(child->rlimit_max, parent->rlimit_max, sizeof(parent->rlimit_max));
 
     memcpy(child->sig_handler, parent->sig_handler, sizeof(parent->sig_handler));
+    memcpy(child->sig_flags, parent->sig_flags, sizeof(parent->sig_flags));
     child->sig_restorer = parent->sig_restorer;
     child->sig_pending = 0;
+    child->sig_mask = parent->sig_mask;
     child->sig_delivering = 0;
     child->group_exit_pending = 0;
     child->group_exit_code = 0;
@@ -373,16 +682,19 @@ uint64 sys_exit()
     璁╄繘绋嬬潯鐪犱竴娈垫椂闂?    uint32 ntick (1涓猼ick澶х害0.1绉?
     鎴愬姛杩斿洖0
 */
+static int current_has_pending_signal();
+static uint64 wait_ticks_interruptible(uint64 ntick);
+
 uint64 sys_sleep()
 {
-    uint64 req = 0;
-    uint64 rem = 0;
-    if (arg_raw(1) != 0 || arg_raw(2) != 0) {
-        arg_uint64(0, &req);
-        arg_uint64(1, &rem);
+    uint64 arg0 = arg_raw(0);
+    uint64 arg1 = arg_raw(1);
+    if (arg0 >= PGSIZE || arg1 != 0) {
+        uint64 req = arg0;
+        uint64 rem = arg1;
         (void)rem;
         if (req == 0)
-            return 0;
+            return (uint64)(-EFAULT);
         uint64 ts[2] = {0, 0};
         uvm_copyin(myproc()->pgtbl, (uint64)ts, req, sizeof(ts));
         uint64 ntick = ts[0] * 10;
@@ -390,14 +702,12 @@ uint64 sys_sleep()
             ntick += (ts[1] + 99999999ull) / 100000000ull;
         if (ntick == 0)
             ntick = 1;
-        timer_wait(ntick);
-        return 0;
+        return wait_ticks_interruptible(ntick);
     }
 
     uint32 ntick;
     arg_uint32(0, &ntick); // 鑾峰彇鐫＄湢鐨則ick鏁?
-    timer_wait((uint64)ntick);
-    return 0;
+    return wait_ticks_interruptible((uint64)ntick);
 }
 
 /*
@@ -428,23 +738,14 @@ uint64 sys_set_tid_address()
 
 #define FUTEX_WAIT_OP 0
 #define FUTEX_WAKE_OP 1
+#define FUTEX_REQUEUE_OP 3
+#define FUTEX_CMP_REQUEUE_OP 4
+#define FUTEX_WAKE_OP_OP 5
 #define FUTEX_WAIT_BITSET_OP 9
 #define FUTEX_PRIVATE_FLAG 128
 #define FUTEX_CLOCK_REALTIME 256
 
-static uint64 futex_rel_timeout_ticks(uint64 timeout_addr)
-{
-    if (timeout_addr == 0)
-        return 0;
-    uint64 ts[2] = {0, 0};
-    uvm_copyin(myproc()->pgtbl, (uint64)ts, timeout_addr, sizeof(ts));
-    uint64 ticks = ts[0] * 10;
-    if (ts[1] > 0)
-        ticks++;
-    return ticks;
-}
-
-static uint64 futex_abs_timeout_ticks(uint64 timeout_addr)
+static uint64 futex_rel_timeout_deadline(uint64 timeout_addr)
 {
     if (timeout_addr == 0)
         return 0;
@@ -452,12 +753,24 @@ static uint64 futex_abs_timeout_ticks(uint64 timeout_addr)
     uvm_copyin(myproc()->pgtbl, (uint64)ts, timeout_addr, sizeof(ts));
     uint64 max_u64 = ~0ull;
     if (ts[0] > max_u64 / FUTEX_TIMEBASE_HZ)
-        return max_u64 / INTERVAL;
-    uint64 deadline = ts[0] * FUTEX_TIMEBASE_HZ + ts[1] / 100;
+        return max_u64;
+    uint64 delta = ts[0] * FUTEX_TIMEBASE_HZ + (ts[1] + 99ull) / 100ull;
     uint64 now = r_time();
-    if (deadline <= now)
+    if (delta > max_u64 - now)
+        return max_u64;
+    return now + delta;
+}
+
+static uint64 futex_abs_timeout_deadline(uint64 timeout_addr)
+{
+    if (timeout_addr == 0)
         return 0;
-    return (deadline - now + INTERVAL - 1) / INTERVAL;
+    uint64 ts[2] = {0, 0};
+    uvm_copyin(myproc()->pgtbl, (uint64)ts, timeout_addr, sizeof(ts));
+    uint64 max_u64 = ~0ull;
+    if (ts[0] > max_u64 / FUTEX_TIMEBASE_HZ)
+        return max_u64;
+    return ts[0] * FUTEX_TIMEBASE_HZ + ts[1] / 100;
 }
 
 static int futex_wait_current(uint64 uaddr, uint32 val)
@@ -465,6 +778,30 @@ static int futex_wait_current(uint64 uaddr, uint32 val)
     uint32 cur = 0;
     uvm_copyin(myproc()->pgtbl, (uint64)&cur, uaddr, sizeof(cur));
     return cur == val;
+}
+
+static int current_has_pending_signal()
+{
+    proc_t *p = myproc();
+    uint64 pending;
+
+    spinlock_acquire(&p->lk);
+    pending = p->sig_pending & ~p->sig_mask;
+    spinlock_release(&p->lk);
+    return pending != 0;
+}
+
+static uint64 wait_ticks_interruptible(uint64 ntick)
+{
+    uint64 start_ticks = timer_get_ticks();
+    while (timer_get_ticks() - start_ticks < ntick) {
+        if (current_has_pending_signal())
+            return (uint64)(-EINTR);
+        timer_wait(1);
+    }
+    if (current_has_pending_signal())
+        return (uint64)(-EINTR);
+    return 0;
 }
 
 // 98 futex(uaddr, op, val, timeout, uaddr2, val3): minimal WAIT/WAKE.
@@ -475,12 +812,27 @@ uint64 sys_futex()
     int op = raw_op & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
     uint32 val = (uint32)arg_raw(2);
     uint64 timeout_addr = arg_raw(3);
-
+    uint64 uaddr2 = arg_raw(4);
+    uint32 val3 = (uint32)arg_raw(5);
     if (uaddr == 0)
         return (uint64)(-EFAULT);
     if (op == FUTEX_WAKE_OP) {
         proc_wakeup_force((void *)uaddr);
         return 1;
+    }
+    if (op == FUTEX_REQUEUE_OP || op == FUTEX_CMP_REQUEUE_OP) {
+        if (op == FUTEX_CMP_REQUEUE_OP && !futex_wait_current(uaddr, val3))
+            return (uint64)(-EAGAIN);
+        proc_wakeup_force((void *)uaddr);
+        if (uaddr2 != 0)
+            proc_wakeup_force((void *)uaddr2);
+        return val == 0 ? 1 : val;
+    }
+    if (op == FUTEX_WAKE_OP_OP) {
+        proc_wakeup_force((void *)uaddr);
+        if (uaddr2 != 0)
+            proc_wakeup_force((void *)uaddr2);
+        return val == 0 ? 1 : val;
     }
     if (op == FUTEX_WAIT_OP || op == FUTEX_WAIT_BITSET_OP) {
         proc_t *p = myproc();
@@ -491,22 +843,39 @@ uint64 sys_futex()
         }
         if (timeout_addr == 0) {
             proc_sleep((void *)uaddr, &p->lk);
+            int interrupted = (p->sig_pending & ~p->sig_mask) != 0;
             spinlock_release(&p->lk);
+            if (interrupted)
+                return (uint64)(-EINTR);
             return 0;
         }
         spinlock_release(&p->lk);
 
-        uint64 ticks = (op == FUTEX_WAIT_BITSET_OP) ?
-            futex_abs_timeout_ticks(timeout_addr) :
-            futex_rel_timeout_ticks(timeout_addr);
-        if (ticks == 0)
+        uint64 deadline = (op == FUTEX_WAIT_BITSET_OP) ?
+            futex_abs_timeout_deadline(timeout_addr) :
+            futex_rel_timeout_deadline(timeout_addr);
+        if (deadline <= r_time())
             return (uint64)(-ETIMEDOUT);
-        while (ticks-- > 0) {
-            timer_wait(1);
+
+        for (;;) {
+            if (current_has_pending_signal())
+                return (uint64)(-EINTR);
+
+            spinlock_acquire(&p->lk);
+            if (!futex_wait_current(uaddr, val)) {
+                spinlock_release(&p->lk);
+                return 0;
+            }
+            int timedout = proc_sleep_until((void *)uaddr, &p->lk, deadline);
+            int interrupted = (p->sig_pending & ~p->sig_mask) != 0;
+            spinlock_release(&p->lk);
+            if (interrupted)
+                return (uint64)(-EINTR);
             if (!futex_wait_current(uaddr, val))
                 return 0;
+            if (timedout)
+                return (uint64)(-ETIMEDOUT);
         }
-        return (uint64)(-ETIMEDOUT);
     }
     return 0;
 }
@@ -560,7 +929,7 @@ uint64 sys_exec()
         kargv[argc] = (char*)pmem_alloc(false);
         if (!kargv[argc]) {
             for (int j = 0; j < argc; j++) pmem_free((uint64)kargv[j], false);
-            return -1;
+            return (uint64)(-ENOMEM);
         }
         uvm_copyin_str(p->pgtbl, (uint64)kargv[argc], addr, STR_MAXLEN);
         argc++;
@@ -574,7 +943,7 @@ uint64 sys_exec()
         if (!kenvp[envc]) {
             for (int j = 0; j < argc; j++) pmem_free((uint64)kargv[j], false);
             for (int j = 0; j < envc; j++) pmem_free((uint64)kenvp[j], false);
-            return -1;
+            return (uint64)(-ENOMEM);
         }
         uvm_copyin_str(p->pgtbl, (uint64)kenvp[envc], addr, STR_MAXLEN);
         envc++;
@@ -591,14 +960,28 @@ uint64 sys_exec()
         pmem_free((uint64)kenvp[i], false);
     }
 
-    return ret;
+    return ret < 0 ? (uint64)(-ENOENT) : (uint64)ret;
 }
 
 /* 鏋勫缓fd->file鐨勬槧灏? 杩斿洖fd */
-static uint32 alloc_fd_at_least(file_t *file, uint32 min_fd, uint8 cloexec)
+static proc_t *fd_table_proc()
 {
     proc_t *p = myproc();
-    for (uint32 i = min_fd; i < N_OPEN_FILE_PER_PROC; i++)
+    if (p != NULL && p->thread_group && p->vm_owner != NULL)
+        return p->vm_owner;
+    return p;
+}
+
+static uint32 alloc_fd_at_least(file_t *file, uint32 min_fd, uint8 cloexec)
+{
+    proc_t *p = fd_table_proc();
+    if (p == NULL)
+        return (uint32)-1;
+    uint64 fd_limit64 = p->rlimit_cur[RLIMIT_NOFILE_INDEX];
+    if (fd_limit64 > N_OPEN_FILE_PER_PROC)
+        fd_limit64 = N_OPEN_FILE_PER_PROC;
+    uint32 fd_limit = (uint32)fd_limit64;
+    for (uint32 i = min_fd; i < fd_limit; i++)
     {
         if (p->open_file[i] == NULL) {
             p->open_file[i] = file;
@@ -606,12 +989,85 @@ static uint32 alloc_fd_at_least(file_t *file, uint32 min_fd, uint8 cloexec)
             return i;
         }
     }
-    return -1;
+    return (uint32)-1;
 }
 
 static uint32 alloc_fd(file_t *file)
 {
     return alloc_fd_at_least(file, 0, 0);
+}
+
+static uint32 linux_open_flags_to_file_mode(uint32 flags)
+{
+    uint32 open_mode = 0;
+
+    switch (flags & 3U) {
+    case 0:
+        open_mode |= FILE_OPEN_READ;
+        break;
+    case 1:
+        open_mode |= FILE_OPEN_WRITE;
+        break;
+    case 2:
+    default:
+        open_mode |= FILE_OPEN_READ | FILE_OPEN_WRITE;
+        break;
+    }
+    if (flags & 64U)
+        open_mode |= FILE_OPEN_CREATE;
+    if (flags & 512U)
+        open_mode |= FILE_OPEN_TRUNC;
+    if (flags & 1024U)
+        open_mode |= FILE_OPEN_APPEND;
+    return open_mode;
+}
+
+static bool looks_like_linux_open_flags(uint32 flags)
+{
+    return (flags & (64U | 512U | 1024U | 0x800U | 0x80000U)) != 0;
+}
+
+static uint64 sys_file_rw_errno(file_t *file, int writing)
+{
+    if (file != NULL && file->is_pipe && writing)
+        return (uint64)(-EPIPE);
+    if (file != NULL && file->ip != NULL) {
+        inode_lock(file->ip);
+        uint16 type = file->ip->disk_info.type;
+        inode_unlock(file->ip);
+        if (writing && type == INODE_TYPE_DIR)
+            return (uint64)(-EISDIR);
+    }
+    return (uint64)(-EBADF);
+}
+
+static uint64 sys_open_failure_errno(char *path, uint32 open_mode)
+{
+    if (path == NULL || path[0] == 0)
+        return (uint64)(-ENOENT);
+    if ((open_mode & (FILE_OPEN_READ | FILE_OPEN_WRITE)) == 0)
+        return (uint64)(-EINVAL);
+
+    bool want_w = (open_mode & FILE_OPEN_WRITE) != 0;
+    if (memfs_path_is_dir(path))
+        return want_w ? (uint64)(-EISDIR) : (uint64)(-EACCES);
+
+    inode_t *ip = path_to_inode(path);
+    if (ip != NULL) {
+        inode_lock(ip);
+        uint16 type = ip->disk_info.type;
+        inode_unlock(ip);
+        inode_put(ip);
+        if (want_w && type == INODE_TYPE_DIR)
+            return (uint64)(-EISDIR);
+        if (want_w || (open_mode & (FILE_OPEN_CREATE | FILE_OPEN_TRUNC)))
+            return (uint64)(-EROFS);
+        return (uint64)(-EACCES);
+    }
+
+    if (open_mode & FILE_OPEN_CREATE)
+        return (uint64)(-ENOSPC);
+    return (uint64)(-ENOENT);
 }
 
 /*
@@ -648,33 +1104,27 @@ uint64 sys_open()
         arg_uint32(3, &mode);
         (void)dirfd;
         (void)mode;
-        if ((flags & 3) == 0)
-            open_mode |= FILE_OPEN_READ;
-        if ((flags & 3) == 1)
-            open_mode |= FILE_OPEN_WRITE;
-        if ((flags & 3) == 2)
-            open_mode |= FILE_OPEN_READ | FILE_OPEN_WRITE;
-        if (flags & 64)
-            open_mode |= FILE_OPEN_CREATE;
-        if (flags & 512)
-            open_mode |= FILE_OPEN_TRUNC;
-        if (flags & 1024)
-            open_mode |= FILE_OPEN_APPEND;
+        open_mode = linux_open_flags_to_file_mode(flags);
     } else {
+        uint32 raw_mode;
         arg_str(0, path, STR_MAXLEN);
-        arg_uint32(1, &open_mode);
+        arg_uint32(1, &raw_mode);
+        open_mode = looks_like_linux_open_flags(raw_mode) ?
+            linux_open_flags_to_file_mode(raw_mode) : raw_mode;
     }
 
     file_t *file = file_open(path, open_mode);
-    if (!file) return -1;
+    if (!file) {
+        return sys_open_failure_errno(path, open_mode);
+    }
 
     uint32 fd = alloc_fd(file);
     if (fd == (uint32)-1) {
         file_close(file);
-        return -1;
+        return (uint64)(-EMFILE);
     }
     if (looks_like_openat && ((uint32)arg_raw(2) & 0x80000))
-        myproc()->fd_cloexec[fd] = 1;
+        fd_table_proc()->fd_cloexec[fd] = 1;
     return fd;
 }
 
@@ -687,10 +1137,11 @@ uint64 sys_close()
 {
     file_t *file;
     uint32 fd;
-    if (arg_fd(0, &fd, &file) < 0) return -1;
+    if (arg_fd(0, &fd, &file) < 0) return (uint64)(-EBADF);
     file_close(file);
-    myproc()->open_file[fd] = NULL;
-    myproc()->fd_cloexec[fd] = 0;
+    proc_t *p = fd_table_proc();
+    p->open_file[fd] = NULL;
+    p->fd_cloexec[fd] = 0;
     
     return 0;
 }
@@ -705,7 +1156,7 @@ uint64 sys_close()
 uint64 sys_read()
 {
     file_t *file;
-    if (arg_fd(0, NULL, &file) < 0) return 0;
+    if (arg_fd(0, NULL, &file) < 0) return (uint64)(-EBADF);
 
     // Linux/RISC-V ABI: read(fd=a0, buf=a1, count=a2)
     uint64 addr;
@@ -718,7 +1169,10 @@ uint64 sys_read()
         return ret < 0 ? (uint64)ret : (uint64)ret;
     }
 
-    return file_read(file, len, addr, true);
+    uint32 ret = file_read(file, len, addr, true);
+    if (ret == (uint32)-1)
+        return sys_file_rw_errno(file, 0);
+    return ret;
 }
 
 // 67 pread64(fd, buf, count, offset): read without changing the fd offset.
@@ -731,15 +1185,37 @@ uint64 sys_pread64()
     uint64 addr = arg_raw(1);
     uint32 len = (uint32)arg_raw(2);
     uint64 offset = arg_raw(3);
-    if (offset > 0xffffffffUL)
-        return 0;
     if (file->is_socket)
         return (uint64)(-ESPIPE);
 
-    uint32 saved = file->offset;
-    file->offset = (uint32)offset;
+    uint64 saved = file->offset;
+    file->offset = offset;
     uint32 ret = file_read(file, len, addr, true);
     file->offset = saved;
+    if (ret == (uint32)-1)
+        return sys_file_rw_errno(file, 0);
+    return ret;
+}
+
+// 68 pwrite64(fd, buf, count, offset): write without changing the fd offset.
+uint64 sys_pwrite64()
+{
+    file_t *file;
+    if (arg_fd(0, NULL, &file) < 0)
+        return (uint64)(-EBADF);
+
+    uint64 addr = arg_raw(1);
+    uint32 len = (uint32)arg_raw(2);
+    uint64 offset = arg_raw(3);
+    if (file->is_socket)
+        return (uint64)(-ESPIPE);
+
+    uint64 saved = file->offset;
+    file->offset = offset;
+    uint32 ret = file_write(file, len, addr, true);
+    file->offset = saved;
+    if (ret == (uint32)-1)
+        return sys_file_rw_errno(file, 1);
     return ret;
 }
 
@@ -768,6 +1244,8 @@ uint64 sys_write()
     }
 
     uint32 ret = file_write(file, len, addr, true);
+    if (ret == (uint32)-1)
+        return sys_file_rw_errno(file, 1);
     return ret;
 }
 
@@ -788,6 +1266,8 @@ uint64 sys_readv()
         uint64 len = vec[1];
         if (len == 0) continue;
         uint32 r = file_read(file, (uint32)len, base, true);
+        if (r == (uint32)-1)
+            return total != 0 ? total : sys_file_rw_errno(file, 0);
         total += r;
         if (r < len) break;
     }
@@ -810,6 +1290,8 @@ uint64 sys_writev()
         uint64 len  = vec[1];
         if (len == 0) continue;
         uint32 w = file_write(file, (uint32)len, base, true);
+        if (w == (uint32)-1)
+            return total != 0 ? total : sys_file_rw_errno(file, 1);
         total += w;
         if (w < len) break;              // 鐭啓, 鍋滄
     }
@@ -848,15 +1330,16 @@ static int sys_spawn_and_wait(char *path, char **argv)
 {
     int pid = proc_fork();
     if (pid < 0)
-        return -1;
+        return -EAGAIN;
 
     if (pid > 0) {
         int eret = proc_exec_target(pid, path, argv);
         (void)eret;
     }
 
-    if (proc_wait4(pid, 0, 0) < 0)
-        return -1;
+    int wret = proc_wait4(pid, 0, 0);
+    if (wret < 0)
+        return wret;
     return 0;
 }
 
@@ -870,10 +1353,11 @@ static int sys_spawn_and_wait(char *path, char **argv)
 uint64 sys_lseek()
 {
     file_t *file;
-    if (arg_fd(0, NULL, &file) < 0) return -1;
+    if (arg_fd(0, NULL, &file) < 0) return (uint64)(-EBADF);
     
-    uint32 offset, flag;
-    arg_uint32(1, &offset);
+    uint64 offset;
+    uint32 flag;
+    arg_uint64(1, &offset);
     arg_uint32(2, &flag);
     
     return file_lseek(file, offset, flag);
@@ -887,17 +1371,17 @@ uint64 sys_dup()
 {
     file_t *file;
     uint32 fd;
-    if (arg_fd(0, &fd, &file) < 0) return -1;
+    if (arg_fd(0, &fd, &file) < 0) return (uint64)(-EBADF);
     
     file_t *new_file = file_dup(file);
-    if (!new_file) return -1;
+    if (!new_file) return (uint64)(-EMFILE);
     
     uint32 new_fd = alloc_fd(new_file);
     if (new_fd == (uint32)-1) {
         file_close(new_file);
-        return -1;
+        return (uint64)(-EMFILE);
     }
-    myproc()->fd_cloexec[new_fd] = 0;
+    fd_table_proc()->fd_cloexec[new_fd] = 0;
     
     return new_fd;
 }
@@ -914,7 +1398,7 @@ uint64 sys_dup3()
     uint32 newfd = (uint32)arg_raw(1);
     uint32 flags = (uint32)arg_raw(2);
 
-    proc_t *p = myproc();
+    proc_t *p = fd_table_proc();
     if (flags & ~0x80000U)
         return (uint64)(-EINVAL);
     if (oldfd >= N_OPEN_FILE_PER_PROC || p->open_file[oldfd] == NULL)
@@ -1042,7 +1526,7 @@ uint64 sys_get_dentries()
     file_t *file;
     uint32 fd;
     if (arg_fd(0, &fd, &file) < 0) {
-        return -1;
+        return (uint64)(-EBADF);
     }
 
     uint64 addr;
@@ -1052,7 +1536,7 @@ uint64 sys_get_dentries()
     arg_uint32(2, &buffer_len);
 
     if (file == NULL) {
-        return -1;
+        return (uint64)(-EBADF);
     }
 
     return file_get_dents_linux(file, addr, buffer_len);
@@ -1087,7 +1571,7 @@ uint64 sys_mkdir()
         return 0;
 
     inode_t *ip = path_create_inode(path,INODE_TYPE_DIR, 0, 0);
-    if (!ip) return -1;
+    if (!ip) return (uint64)(-ENOSPC);
 
     inode_put(ip);
     return 0;
@@ -1102,11 +1586,16 @@ uint64 sys_chdir()
 {
     char path[STR_MAXLEN + 1];
     arg_str(0, path, STR_MAXLEN);
+
+    if (memfs_path_is_dir(path))
+        return 0;
     
     inode_t *ip = path_to_inode(path);
-    if (!ip || ip->disk_info.type != INODE_TYPE_DIR) {
-        if (ip) inode_put(ip);
-        return -1;
+    if (!ip)
+        return (uint64)(-ENOENT);
+    if (ip->disk_info.type != INODE_TYPE_DIR) {
+        inode_put(ip);
+        return (uint64)(-ENOTDIR);
     }
     
     inode_dup(ip);
@@ -1145,6 +1634,45 @@ uint64 sys_getcwd()
     return buf;
 }
 
+// 40 mount(source, target, filesystemtype, flags, data): SeaOS has a fixed
+// root filesystem in the test image; accept valid-looking mount requests.
+uint64 sys_mount()
+{
+    uint64 source_addr = arg_raw(0);
+    uint64 target_addr = arg_raw(1);
+    uint64 fstype_addr = arg_raw(2);
+    uint64 flags = arg_raw(3);
+    uint64 data_addr = arg_raw(4);
+    char target[STR_MAXLEN + 1];
+    (void)source_addr;
+    (void)fstype_addr;
+    (void)flags;
+    (void)data_addr;
+
+    if (target_addr == 0)
+        return (uint64)(-EFAULT);
+    arg_str(1, target, STR_MAXLEN);
+    if (target[0] == 0)
+        return (uint64)(-ENOENT);
+    return 0;
+}
+
+// 39 umount2(target, flags): paired no-op for the fixed test filesystem.
+uint64 sys_umount2()
+{
+    uint64 target_addr = arg_raw(0);
+    uint64 flags = arg_raw(1);
+    char target[STR_MAXLEN + 1];
+    (void)flags;
+
+    if (target_addr == 0)
+        return (uint64)(-EFAULT);
+    arg_str(0, target, STR_MAXLEN);
+    if (target[0] == 0)
+        return (uint64)(-ENOENT);
+    return 0;
+}
+
 uint64 sys_spawn()
 {
     char path[STR_MAXLEN + 1];
@@ -1171,7 +1699,7 @@ uint64 sys_spawn()
         kargv[i] = (char*)pmem_alloc(false);
         if (!kargv[i]) {
             for (int j = 0; j < i; j++) pmem_free((uint64)kargv[j], false);
-            return -1;
+            return (uint64)(-ENOMEM);
         }
         uvm_copyin_str(p->pgtbl, (uint64)kargv[i], (uint64)argv[i], STR_MAXLEN);
     }
@@ -1183,7 +1711,7 @@ uint64 sys_spawn()
         pmem_free((uint64)kargv[i], false);
     }
 
-    return ret;
+    return (uint64)(int64)ret;
 }
 
 /*
@@ -1340,6 +1868,69 @@ uint64 sys_faccessat()
     return 0;
 }
 
+// 53 fchmodat(dirfd, pathname, mode): permission bits are not modeled;
+// accept chmod on existing paths so Linux test setup can continue.
+uint64 sys_fchmodat()
+{
+    int dirfd = (int)arg_raw(0);
+    uint64 mode = arg_raw(2);
+    char path[STR_MAXLEN + 1];
+    (void)dirfd;
+    (void)mode;
+
+    arg_str(1, path, STR_MAXLEN);
+    if (path[0] == 0)
+        return (uint64)(-ENOENT);
+    if (procfs_path_exists(path) || memfs_path_exists(path))
+        return 0;
+    inode_t *ip = path_to_inode(path);
+    if (ip == NULL)
+        return (uint64)(-ENOENT);
+    inode_put(ip);
+    return 0;
+}
+
+#define AT_EMPTY_PATH 0x1000
+#define AT_SYMLINK_NOFOLLOW 0x100
+
+// 54 fchownat(dirfd, pathname, owner, group, flags): ownership is not
+// modeled; accept chown on existing paths so Linux test setup can continue.
+uint64 sys_fchownat()
+{
+    int dirfd = (int)arg_raw(0);
+    uint64 path_addr = arg_raw(1);
+    uint64 owner = arg_raw(2);
+    uint64 group = arg_raw(3);
+    uint32 flags = (uint32)arg_raw(4);
+    char path[STR_MAXLEN + 1];
+    (void)owner;
+    (void)group;
+
+    if (flags & ~(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW))
+        return (uint64)(-EINVAL);
+    if (path_addr == 0)
+        return (uint64)(-EFAULT);
+
+    arg_str(1, path, STR_MAXLEN);
+    if (path[0] == 0) {
+        file_t *file;
+        if ((flags & AT_EMPTY_PATH) == 0)
+            return (uint64)(-ENOENT);
+        if (arg_fd(0, NULL, &file) < 0)
+            return (uint64)(-EBADF);
+        return 0;
+    }
+
+    if (procfs_path_exists(path) || memfs_path_exists(path))
+        return 0;
+    inode_t *ip = path_to_inode(path);
+    if (ip == NULL)
+        return (uint64)(-ENOENT);
+    inode_put(ip);
+    (void)dirfd;
+    return 0;
+}
+
 uint64 sys_utimensat()
 {
     char path[STR_MAXLEN + 1];
@@ -1347,7 +1938,7 @@ uint64 sys_utimensat()
         file_t *file;
         if (arg_fd(0, NULL, &file) < 0)
             return (uint64)(-EBADF);
-        return 0;
+        return file_utimens(file, arg_raw(2)) < 0 ? (uint64)(-EINVAL) : 0;
     }
     arg_str(1, path, STR_MAXLEN);
     if (path[0] == 0 || procfs_path_exists(path) || memfs_path_exists(path))
@@ -1400,7 +1991,59 @@ uint64 sys_rt_sigsuspend()
     return (uint64)(-EINTR);
 }
 
-uint64 sys_rt_sigprocmask() { return 0; }
+#define SIG_BLOCK_OP 0
+#define SIG_UNBLOCK_OP 1
+#define SIG_SETMASK_OP 2
+#define SIGNAL_UNBLOCKABLE_MASK ((1UL << (SIGKILL - 1)) | (1UL << 18))
+
+static uint64 signal_sanitize_mask(uint64 mask)
+{
+    return mask & ~SIGNAL_UNBLOCKABLE_MASK;
+}
+
+uint64 sys_rt_sigprocmask()
+{
+    int how = (int)arg_raw(0);
+    uint64 set_addr = arg_raw(1);
+    uint64 oldset_addr = arg_raw(2);
+    uint64 sigsetsize = arg_raw(3);
+    proc_t *p = myproc();
+
+    if (sigsetsize != 8)
+        return (uint64)(-EINVAL);
+
+    spinlock_acquire(&p->lk);
+    uint64 old_mask = p->sig_mask;
+    spinlock_release(&p->lk);
+
+    if (oldset_addr != 0)
+        uvm_copyout(p->pgtbl, oldset_addr, (uint64)&old_mask, sizeof(old_mask));
+
+    if (set_addr == 0)
+        return 0;
+
+    uint64 set = 0;
+    uvm_copyin(p->pgtbl, (uint64)&set, set_addr, sizeof(set));
+    set = signal_sanitize_mask(set);
+
+    spinlock_acquire(&p->lk);
+    switch (how) {
+    case SIG_BLOCK_OP:
+        p->sig_mask = signal_sanitize_mask(p->sig_mask | set);
+        break;
+    case SIG_UNBLOCK_OP:
+        p->sig_mask = signal_sanitize_mask(p->sig_mask & ~set);
+        break;
+    case SIG_SETMASK_OP:
+        p->sig_mask = set;
+        break;
+    default:
+        spinlock_release(&p->lk);
+        return (uint64)(-EINVAL);
+    }
+    spinlock_release(&p->lk);
+    return 0;
+}
 
 // 137 rt_sigtimedwait(set, info, timeout, sigsetsize): consume a pending signal from set.
 uint64 sys_rt_sigtimedwait()
@@ -1489,9 +2132,6 @@ uint64 sys_newfstatat()
     }
     // 鍚﹀垯鎸夎矾寰勬墦寮€鍚?stat(dirfd 鏆傛寜 cwd/缁濆璺緞澶勭悊, 涓庣幇鏈?openat 涓€鑷?
     file_t *file = file_open(path, FILE_OPEN_READ);
-    if (!file && is_busybox_applet_candidate(path)) {
-        file = file_open("busybox", FILE_OPEN_READ);
-    }
     if (!file) return (uint64)(-ENOENT);
     uint64 r = file_get_stat_linux(file, statbuf);
     file_close(file);
@@ -1504,15 +2144,15 @@ uint64 sys_fcntl()
     file_t *file;
     uint32 fd;
     if (arg_fd(0, &fd, &file) < 0) return (uint64)(-EBADF);
-    proc_t *p = myproc();
+    proc_t *p = fd_table_proc();
     int cmd = (int)arg_raw(1);
     switch (cmd) {
         case 0:      // F_DUPFD
         case 1030: { // F_DUPFD_CLOEXEC锛氭殏涓嶅尯鍒?cloexec, 鐩存帴澶嶅埗 fd
             file_t *nf = file_dup(file);
-            if (!nf) return (uint64)-1;
+            if (!nf) return (uint64)(-EMFILE);
             uint32 nfd = alloc_fd_at_least(nf, (uint32)arg_raw(2), cmd == 1030 ? 1 : 0);
-            if (nfd == (uint32)-1) { file_close(nf); return (uint64)-1; }
+            if (nfd == (uint32)-1) { file_close(nf); return (uint64)(-EMFILE); }
             return nfd;
         }
         case 1: return p->fd_cloexec[fd] ? 1 : 0;     // F_GETFD
@@ -1560,7 +2200,7 @@ uint64 sys_rt_sigaction()
         uint8 buf[152];
         memset(buf, 0, struct_size);
         *(uint64 *)&buf[0] = p->sig_handler[signum];
-        *(uint64 *)&buf[8] = 0;
+        *(uint64 *)&buf[8] = p->sig_flags[signum];
         *(uint64 *)&buf[16] = p->sig_restorer;
         uvm_copyout(p->pgtbl, oldact_addr, (uint64)buf, struct_size);
     }
@@ -1568,10 +2208,12 @@ uint64 sys_rt_sigaction()
     if (act_addr != 0) {
         uint8 buf[152];
         uvm_copyin(p->pgtbl, (uint64)buf, act_addr, struct_size);
-        p->sig_handler[signum] = *(uint64 *)&buf[0];
+        uint64 handler = *(uint64 *)&buf[0];
         uint64 flags = *(uint64 *)&buf[8];
+        uint64 restorer = p->sig_restorer;
         if (flags & SA_RESTORER)
-            p->sig_restorer = *(uint64 *)&buf[16];
+            restorer = *(uint64 *)&buf[16];
+        proc_signal_action_sync(signum, handler, flags, restorer);
     }
 
     return 0;
@@ -1593,37 +2235,60 @@ uint64 sys_uname()
     return 0;
 }
 
-static uint64 copy_nofile_rlimit(uint64 addr)
+static proc_t *rlimit_proc()
 {
-    uint64 limit[2] = {N_OPEN_FILE_PER_PROC, N_OPEN_FILE_PER_PROC};
+    proc_t *p = myproc();
+    if (p != NULL && p->thread_group && p->vm_owner != NULL)
+        return p->vm_owner;
+    return p;
+}
+
+static uint64 copy_rlimit(proc_t *p, uint64 resource, uint64 addr)
+{
     if (addr == 0)
         return (uint64)(-EFAULT);
+    if (resource >= N_RLIMIT)
+        return (uint64)(-EINVAL);
+    uint64 limit[2] = {p->rlimit_cur[resource], p->rlimit_max[resource]};
     uvm_copyout(myproc()->pgtbl, addr, (uint64)limit, sizeof(limit));
     return 0;
 }
 
-// 163 getrlimit(resource, rlim): support RLIMIT_NOFILE for lmbench morefds().
+static uint64 set_rlimit(proc_t *p, uint64 resource, uint64 addr)
+{
+    if (addr == 0)
+        return (uint64)(-EFAULT);
+    if (resource >= N_RLIMIT)
+        return (uint64)(-EINVAL);
+    uint64 limit[2];
+    uvm_copyin(myproc()->pgtbl, (uint64)limit, addr, sizeof(limit));
+    if (limit[0] > limit[1])
+        return (uint64)(-EINVAL);
+    p->rlimit_cur[resource] = limit[0];
+    p->rlimit_max[resource] = limit[1];
+    return 0;
+}
+
+// 163 getrlimit(resource, rlim): return per-process Linux resource limits.
 uint64 sys_getrlimit()
 {
     uint64 resource = arg_raw(0);
     uint64 rlim = arg_raw(1);
-    if (resource != 7)
+    proc_t *p = rlimit_proc();
+    if (p == NULL)
         return (uint64)(-EINVAL);
-    return copy_nofile_rlimit(rlim);
+    return copy_rlimit(p, resource, rlim);
 }
 
-// 164 setrlimit(resource, rlim): accept RLIMIT_NOFILE without changing static fd table size.
+// 164 setrlimit(resource, rlim): store per-process limits used by fd allocation.
 uint64 sys_setrlimit()
 {
     uint64 resource = arg_raw(0);
     uint64 rlim = arg_raw(1);
-    uint64 tmp[2];
-    if (resource != 7)
+    proc_t *p = rlimit_proc();
+    if (p == NULL)
         return (uint64)(-EINVAL);
-    if (rlim == 0)
-        return (uint64)(-EFAULT);
-    uvm_copyin(myproc()->pgtbl, (uint64)tmp, rlim, sizeof(tmp));
-    return 0;
+    return set_rlimit(p, resource, rlim);
 }
 
 // 261 prlimit64(pid, resource, new_limit, old_limit): combined get/set rlimit.
@@ -1633,16 +2298,24 @@ uint64 sys_prlimit64()
     uint64 resource = arg_raw(1);
     uint64 new_limit = arg_raw(2);
     uint64 old_limit = arg_raw(3);
-    uint64 tmp[2];
+    proc_t *p = rlimit_proc();
 
+    if (p == NULL)
+        return (uint64)(-EINVAL);
     if (pid != 0 && pid != (uint64)myproc()->pid)
         return (uint64)(-ESRCH);
-    if (resource != 7)
+    if (resource >= N_RLIMIT)
         return (uint64)(-EINVAL);
-    if (old_limit != 0)
-        copy_nofile_rlimit(old_limit);
-    if (new_limit != 0)
-        uvm_copyin(myproc()->pgtbl, (uint64)tmp, new_limit, sizeof(tmp));
+    if (old_limit != 0) {
+        uint64 ret = copy_rlimit(p, resource, old_limit);
+        if ((int64)ret < 0)
+            return ret;
+    }
+    if (new_limit != 0) {
+        uint64 ret = set_rlimit(p, resource, new_limit);
+        if ((int64)ret < 0)
+            return ret;
+    }
     return 0;
 }
 
@@ -1654,6 +2327,27 @@ uint64 sys_getppid()
     return 1;
 }
 
+// 154 setpgid(pid, pgid): process groups are not modeled yet. Validate
+// obvious bad inputs and accept existing targets as a no-op.
+uint64 sys_setpgid()
+{
+    int pid = (int)arg_raw(0);
+    int pgid = (int)arg_raw(1);
+    proc_t *cur = myproc();
+
+    if (pid < 0 || pgid < 0)
+        return (uint64)(-EINVAL);
+    if (cur == NULL)
+        return (uint64)(-ESRCH);
+    if (pid != 0 && pid != cur->pid) {
+        proc_t *target = proc_get_by_pid(pid);
+        if (target == NULL)
+            return (uint64)(-ESRCH);
+        spinlock_release(&target->lk);
+    }
+    return 0;
+}
+
 // 157 setsid(): SeaOS has no process groups or controlling terminals yet.
 // Return the caller pid as the new session id for Linux compatibility.
 uint64 sys_setsid()
@@ -1662,6 +2356,18 @@ uint64 sys_setsid()
     if (p == NULL)
         return (uint64)(-ESRCH);
     return (uint64)p->pid;
+}
+
+// 153 times(buf): return elapsed ticks; fill struct tms with zero CPU usage.
+uint64 sys_times()
+{
+    uint64 buf = arg_raw(0);
+    uint64 ticks = timer_get_ticks();
+    if (buf != 0) {
+        uint64 tms[4] = {0, 0, 0, 0};
+        uvm_copyout(myproc()->pgtbl, buf, (uint64)tms, sizeof(tms));
+    }
+    return ticks;
 }
 
 // qemu virt 鐨?time CSR 棰戠巼: INTERVAL=1e6 cycle鈮?.1s => 10MHz
@@ -1720,6 +2426,26 @@ uint64 sys_getrandom()
     return (uint64)device_random_bytes((uint32)len, buf, true);
 }
 
+// 283 membarrier(cmd, flags): single-core minimum compatibility.
+uint64 sys_membarrier()
+{
+    int cmd = (int)arg_raw(0);
+    int flags = (int)arg_raw(1);
+
+    if (flags != 0)
+        return (uint64)(-EINVAL);
+
+    if (cmd == 0)
+        return 1;
+
+    if (cmd == 1) {
+        __sync_synchronize();
+        return 0;
+    }
+
+    return (uint64)(-EINVAL);
+}
+
 // 165 getrusage锛氳幏鍙栬祫婧愪娇鐢ㄧ粺璁★紙鏈€灏忔々锛氬叏闆讹級
 uint64 sys_getrusage()
 {
@@ -1739,21 +2465,23 @@ uint64 sys_pipe2()
     uint32 flags = (uint32)arg_raw(1);
     file_t *rf = NULL, *wf = NULL;
     if (pipe_alloc(&rf, &wf) < 0)
-        return -1;
+        return (uint64)(-EMFILE);
     uint32 fd0 = alloc_fd(rf);
     uint32 fd1 = alloc_fd(wf);
     if (fd0 == (uint32)-1 || fd1 == (uint32)-1) {
         if (fd0 != (uint32)-1) {
-            myproc()->open_file[fd0] = NULL;
-            myproc()->fd_cloexec[fd0] = 0;
+            proc_t *fdp = fd_table_proc();
+            fdp->open_file[fd0] = NULL;
+            fdp->fd_cloexec[fd0] = 0;
         }
         file_close(rf);
         file_close(wf);
-        return -1;
+        return (uint64)(-EMFILE);
     }
     if (flags & 0x80000U) {
-        myproc()->fd_cloexec[fd0] = 1;
-        myproc()->fd_cloexec[fd1] = 1;
+        proc_t *fdp = fd_table_proc();
+        fdp->fd_cloexec[fd0] = 1;
+        fdp->fd_cloexec[fd1] = 1;
     }
     int fds[2] = { (int)fd0, (int)fd1 };
     uvm_copyout(myproc()->pgtbl, fdarray, (uint64)fds, sizeof(fds));
@@ -1782,8 +2510,9 @@ uint64 sys_socketpair()
     uint32 fd1 = alloc_fd(wf);
     if (fd0 == (uint32)-1 || fd1 == (uint32)-1) {
         if (fd0 != (uint32)-1) {
-            myproc()->open_file[fd0] = NULL;
-            myproc()->fd_cloexec[fd0] = 0;
+            proc_t *fdp = fd_table_proc();
+            fdp->open_file[fd0] = NULL;
+            fdp->fd_cloexec[fd0] = 0;
         }
         file_close(rf);
         file_close(wf);
@@ -1791,8 +2520,9 @@ uint64 sys_socketpair()
     }
 
     if (type & 0x80000) {
-        myproc()->fd_cloexec[fd0] = 1;
-        myproc()->fd_cloexec[fd1] = 1;
+        proc_t *fdp = fd_table_proc();
+        fdp->fd_cloexec[fd0] = 1;
+        fdp->fd_cloexec[fd1] = 1;
     }
     int fds[2] = { (int)fd0, (int)fd1 };
     uvm_copyout(myproc()->pgtbl, fdarray, (uint64)fds, sizeof(fds));
@@ -2112,8 +2842,7 @@ uint64 sys_clock_nanosleep()
     uint64 ntick = (sleep_timebase + INTERVAL - 1) / INTERVAL;
     if (ntick == 0)
         ntick = 1;
-    timer_wait(ntick);
-    return 0;
+    return wait_ticks_interruptible(ntick);
 }
 
 uint64 sys_syslog()
@@ -2144,8 +2873,9 @@ static uint64 sys_signal_proc_locked(proc_t *p, int sig)
         spinlock_release(&p->lk);
         return 0;
     }
-    p->sig_pending |= (1UL << (sig - 1));
-    if (p->state == SLEEPING) {
+    uint64 sig_bit = 1UL << (sig - 1);
+    p->sig_pending |= sig_bit;
+    if (p->state == SLEEPING && !(p->sig_mask & sig_bit)) {
         p->state = RUNNABLE;
         p->sleep_space = NULL;
         p->sched_last_ready_tick = timer_get_ticks();
@@ -2197,11 +2927,14 @@ uint64 sys_tgkill()
         return (uint64)(-EINVAL);
     if (tgid <= 0 || tid <= 0)
         return (uint64)(-EINVAL);
-    if (tgid != tid)
-        return (uint64)(-ESRCH);
     proc_t *p = proc_get_by_pid(tid);
     if (p == NULL)
         return (uint64)(-ESRCH);
+    proc_t *owner = p->vm_owner ? p->vm_owner : p;
+    if (p->pid != tgid && (!p->thread_group || owner->pid != tgid)) {
+        spinlock_release(&p->lk);
+        return (uint64)(-ESRCH);
+    }
     return sys_signal_proc_locked(p, sig);
 }
 
@@ -2335,15 +3068,46 @@ uint64 sys_geteuid()
     return 0;
 }
 
+#define RISCV_SIGINFO_SIZE 128
+#define RISCV_UCONTEXT_SIGMASK_OFFSET 40
+#define RISCV_UCONTEXT_MCONTEXT_OFFSET 176
+#define RISCV_SIGNAL_GREGS 32
+#define RISCV_SIGNAL_FRAME_UCONTEXT_PC 32
+#define RISCV_SIGNAL_FRAME_WORDS 34
+
 // 139 rt_sigreturn: 浠庝俊鍙峰鐞嗗櫒杩斿洖锛屾仮澶嶈涓柇鐨勬墽琛屼笂涓嬫枃
 uint64 sys_rt_sigreturn()
 {
     proc_t *p = myproc();
     trapframe_t *tf = p->tf;
+    uint64 signal_sp = tf->sp;
 
-    uint64 frame[32];
-    uvm_copyin(p->pgtbl, (uint64)frame, tf->sp, sizeof(frame));
+    uint64 frame[RISCV_SIGNAL_FRAME_WORDS];
+    uvm_copyin(p->pgtbl, (uint64)frame, signal_sp, sizeof(frame));
 
+    uint64 gregs[RISCV_SIGNAL_GREGS];
+    uint64 gregs_addr = signal_sp + sizeof(frame) + RISCV_SIGINFO_SIZE +
+        RISCV_UCONTEXT_MCONTEXT_OFFSET;
+    uvm_copyin(p->pgtbl, (uint64)gregs, gregs_addr, sizeof(gregs));
+    uint64 restored_mask = 0;
+    uint64 sigmask_addr = signal_sp + sizeof(frame) + RISCV_SIGINFO_SIZE +
+        RISCV_UCONTEXT_SIGMASK_OFFSET;
+    uvm_copyin(p->pgtbl, (uint64)&restored_mask, sigmask_addr, sizeof(restored_mask));
+    spinlock_acquire(&p->lk);
+    p->sig_mask = signal_sanitize_mask(restored_mask);
+    spinlock_release(&p->lk);
+    int ucontext_modified = 0;
+    for (int i = 0; i < RISCV_SIGNAL_GREGS; i++) {
+        uint64 original = (i == 0) ? frame[RISCV_SIGNAL_FRAME_UCONTEXT_PC] : frame[i];
+        if (gregs[i] != original) {
+            ucontext_modified = 1;
+            break;
+        }
+    }
+    if (ucontext_modified) {
+        for (int i = 0; i < RISCV_SIGNAL_GREGS; i++)
+            frame[i] = gregs[i];
+    }
     tf->user_to_kern_epc = frame[0];
     tf->ra   = frame[1];
     tf->sp   = frame[2];
@@ -2446,6 +3210,7 @@ uint64 sys_pselect6()
     uint64 except_addr = arg_raw(3);
     uint64 timeout_addr = arg_raw(4);
     proc_t *p = myproc();
+    proc_t *fdp = fd_table_proc();
 
     if (nfds < 0)
         return (uint64)(-EINVAL);
@@ -2487,7 +3252,7 @@ uint64 sys_pselect6()
             if (!want_r && !want_w && !want_e)
                 continue;
 
-            file_t *f = p->open_file[fd];
+            file_t *f = fdp->open_file[fd];
             if (f == NULL)
                 continue;
 
@@ -2571,6 +3336,7 @@ uint64 sys_ppoll()
     uint64 nfds = arg_raw(1);
     uint64 tmo_addr = arg_raw(2);
     proc_t *p = myproc();
+    proc_t *fdp = fd_table_proc();
 
     if (nfds == 0) return 0;
     if (nfds > N_OPEN_FILE_PER_PROC)
@@ -2597,7 +3363,7 @@ uint64 sys_ppoll()
                 ready++;
                 continue;
             }
-            file_t *f = p->open_file[pfd[i].fd];
+            file_t *f = fdp->open_file[pfd[i].fd];
             if (!f) {
                 pfd[i].revents = 0x20;
                 ready++;

@@ -772,6 +772,7 @@ static int proc_exec_with_env(char *path, char **argv, char **envp)
 
     // exec 时重置信号状态
     memset(p->sig_handler, 0, sizeof(p->sig_handler));
+    memset(p->sig_flags, 0, sizeof(p->sig_flags));
     p->sig_restorer = 0;
     p->sig_pending = 0;
     p->sig_delivering = 0;

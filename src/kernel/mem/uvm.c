@@ -366,20 +366,8 @@ uint64 uvm_mmap_handle_fault(pgtbl_t pgtbl, uint64 fault_addr)
         if (pte != NULL && (*pte & PTE_V))
             return (uint64)-1;
 
-        uint64 pa = 0;
-        int flags = m->perm;
-        int shared = proc_shared_vm_lookup_page(va, &pa, &flags) == 0;
-        if (!shared) {
-            pa = (uint64)pmem_alloc(false);
-            if (pa == 0)
-                return (uint64)-1;
-            memset((void *)pa, 0, PGSIZE);
-        }
-        if (proc_shared_vm_map_page(va, pa, flags) < 0) {
-            if (!shared)
-                pmem_free(pa, false);
+        if (proc_shared_vm_fault_page(va, m->perm) < 0)
             return (uint64)-1;
-        }
         pte = vm_getpte(pgtbl, va, false);
         if (pte == NULL || !(*pte & PTE_V))
             return (uint64)-1;
@@ -413,8 +401,10 @@ void uvm_munmap(uint64 begin, uint32 npages)
             // 1. 解除交集区间的映射
             for (uint32 i = 0; i < o_npages; i++) {
                 uint64 va = o_begin + (uint64)i * PGSIZE;
+                pte_t *pte = vm_getpte(p->pgtbl, va, false);
+                int is_shm = (pte != NULL && (*pte & PTE_V) && (*pte & PTE_SHM));
                 uint64 pa = proc_shared_vm_unmap_page(va);
-                if (pa != 0)
+                if (pa != 0 && !is_shm)
                     pmem_free(pa, false);
             }
 
@@ -604,7 +594,7 @@ static void destroy_pgtbl(pgtbl_t pgtbl, uint32 level)
 
         // 如果这是叶子（具有 R/W/X 权限）（普通页面或大页），释放对应的物理页
         if (level == 1 || (flags & (PTE_R | PTE_W | PTE_X))) {
-            if (pa != (uint64)trampoline) { // TRAMPOLINE页面是全局共享的，不能释放
+            if (pa != (uint64)trampoline && !(flags & PTE_SHM)) { // TRAMPOLINE页面是全局共享的，不能释放
                 pmem_free(pa, false);
             }
         } else {
@@ -677,13 +667,18 @@ static int copy_range(pgtbl_t old, pgtbl_t new, uint64 begin, uint64 end)
         pa = (uint64)PTE_TO_PA(*pte);
         flags = (int)PTE_FLAGS(*pte);
 
-        page = (uint64)pmem_alloc(false);
-        if (page == 0)
-            return -1;
-        memmove((char *)page, (const char *)pa, PGSIZE);
-        if (vm_try_mappages(new, va, page, PGSIZE, flags) < 0) {
-            pmem_free(page, false);
-            return -1;
+        if (flags & PTE_SHM) {
+            if (vm_try_mappages(new, va, pa, PGSIZE, flags) < 0)
+                return -1;
+        } else {
+            page = (uint64)pmem_alloc(false);
+            if (page == 0)
+                return -1;
+            memmove((char *)page, (const char *)pa, PGSIZE);
+            if (vm_try_mappages(new, va, page, PGSIZE, flags) < 0) {
+                pmem_free(page, false);
+                return -1;
+            }
         }
     }
     return 0;
@@ -731,13 +726,18 @@ static int copy_range_sparse_walk(pgtbl_t old, pgtbl_t new, uint64 begin, uint64
             for (; va < va_end; va += PGSIZE) {
                 if (va == SIGTRAMPOLINE)
                     continue;
-                uint64 page = (uint64)pmem_alloc(false);
-                if (page == 0)
-                    return -1;
-                memmove((char *)page, (const char *)(pa + (va - entry_begin)), PGSIZE);
-                if (vm_try_mappages(new, va, page, PGSIZE, flags) < 0) {
-                    pmem_free(page, false);
-                    return -1;
+                if (flags & PTE_SHM) {
+                    if (vm_try_mappages(new, va, pa + (va - entry_begin), PGSIZE, flags) < 0)
+                        return -1;
+                } else {
+                    uint64 page = (uint64)pmem_alloc(false);
+                    if (page == 0)
+                        return -1;
+                    memmove((char *)page, (const char *)(pa + (va - entry_begin)), PGSIZE);
+                    if (vm_try_mappages(new, va, page, PGSIZE, flags) < 0) {
+                        pmem_free(page, false);
+                        return -1;
+                    }
                 }
             }
             continue;

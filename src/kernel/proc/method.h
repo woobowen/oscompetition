@@ -9,20 +9,26 @@ void proc_free(proc_t *p);                          // 进程释放
 pgtbl_t proc_pgtbl_init(uint64 trapframe);          // 页表初始化
 void proc_make_first();                             // 创建第一个用户进程
 int proc_fork();                                    // 复制子进程
+int proc_fork_with_stack(uint64 child_stack);       // 复制子进程并可指定子栈
 int proc_wait4(int64 wait_pid, uint64 user_addr, int wnohang); // 等待子进程退出
 void proc_exit(int exit_state);                     // 进程退出
 void proc_exit_group(int exit_state);               // exit all CLONE_VM siblings in this VM group
 void proc_exit_group_if_requested();              // current thread handles pending group exit
+void proc_signal_action_sync(int signum, uint64 handler, uint64 flags, uint64 restorer);
 void proc_yield();                                  // 进程放弃CPU
 void proc_sleep(void *sleep_space, spinlock_t *lk); // 进程睡眠
+int proc_sleep_until(void *sleep_space, spinlock_t *lk, uint64 deadline); // timed sleep until CLINT deadline
 void proc_wakeup(void *sleep_space);                // 进程唤醒
 void proc_wakeup_force(void *sleep_space);          // futex/clear_child_tid paths must not miss pre-hint wakeups
 void proc_shared_vm_sync_mmap(mmap_region_t *old_head, mmap_region_t *new_head);
 void proc_shared_vm_sync_heap_grow(uint64 old_top, uint64 new_top);
+uint64 proc_shared_vm_sync_heap_shrink(uint64 old_top, uint64 requested_top);
 int proc_shared_vm_lookup_page(uint64 va, uint64 *pa_out, int *flags_out);
 int proc_shared_vm_map_page(uint64 va, uint64 pa, int flags);
+int proc_shared_vm_fault_page(uint64 va, int flags);
 uint64 proc_shared_vm_unmap_page(uint64 va);
 void proc_check_itimers(uint64 now);                // ITIMER_REAL wall-clock expiry
+void proc_check_sleep_deadlines(uint64 now);        // wake timed sleeps on deadline
 void proc_sched();                                  // 进程切换到调度器
 void proc_scheduler();                              // 调度器选择合适的进程执行
 

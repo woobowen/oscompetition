@@ -167,8 +167,10 @@ void timer_interrupt_handler()
     if (p && p->state == RUNNING)
         p->sched_cpu_ticks++;
 
-    if (mycpu()->noff == 0)
+    if (mycpu()->noff == 0) {
         proc_check_itimers(r_time());
+        proc_check_sleep_deadlines(r_time());
+    }
 
     // 调度下一次 SBI 定时器中断并清除待决位
     timer_init_sbi();

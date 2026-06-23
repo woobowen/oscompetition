@@ -1,4 +1,4 @@
-# SeaOS RISC-V Current State (2026-06-22)
+# SeaOS RISC-V Current State (2026-06-24)
 
 ## Baseline Command
 
@@ -17,63 +17,81 @@ Before each rerun, remove only the root-level temporary files `sdcard-rv.img`, `
 
 Generated log: `os_serial_out_rv.txt`
 
-The latest regenerated RISC-V run used the fixed docker command from 2026-06-21 23:31:00 to 2026-06-22 01:33:26 Asia/Shanghai. The docker container exited with status 0, completed under the 2.5 hour cap, and the serial log reaches `sys_shutdown` at line 2865.
+The latest regenerated RISC-V run was started with the fixed docker command on 2026-06-24 Asia/Shanghai. The serial log reached `sys_shutdown: powering off via SBI SRST` at line 4533 after all 24 groups were enumerated. The docker container was manually stopped only after the serial log had reached `sys_shutdown` and stopped growing.
 
 ## Important Interpretation Rule
 
 `======== test end    ========` is an initcode/test-wrapper marker. It only proves that the wrapper reached its own cleanup point. It is not proof that the testsuite really passed.
 
-Real status must come from the actual `testsuits-for-oskernel/` program and script output. Internal markers such as `FAIL`, `[SEGV]`, `end: fail`, `Function not implemented`, `Interrupted system call`, `panic`, `fork fail`, `no more mmap`, `unknown syscall`, or group-level `test fail` remain real defects even if the wrapper later prints its end marker.
+Real status must come from the actual `testsuits-for-oskernel/` program and script output. Internal markers such as `FAIL`, `[SEGV]`, `end: fail`, `Function not implemented`, `Interrupted system call`, `panic`, pipe/open errors, or group-level `test fail` remain real defects even if a wrapper later prints its end marker.
 
 ## Current RV Evidence
 
-| Test group | Wrapper marker in latest log | Real testsuite status notes |
-|---|---|---|
-| `unixbench-musl` | `GROUP END` line 100, wrapper end line 102 | No focused failure marker in the latest run. |
-| `busybox-musl` | `GROUP END` line 347, wrapper end line 349 | No focused failure marker in the latest run. |
-| `cyclictest-musl` | `GROUP END` line 397, wrapper end line 399 | Includes `kill hackbench: success`. |
-| `netperf-musl` | `GROUP END` line 455, wrapper end line 457 | `UDP_STREAM`, `TCP_STREAM`, `UDP_RR`, `TCP_RR`, and `TCP_CRR` print `end: success`. |
-| `lmbench-musl` | `GROUP END` line 503, wrapper end line 505 | No focused failure marker in the latest run. |
-| `iperf-musl` | `GROUP END` line 629, wrapper end line 631 | No focused failure marker in the latest run. |
-| `unixbench-glibc` | `GROUP END` line 664, wrapper end line 666 | No focused failure marker in the latest run. |
-| `libcbench-glibc` | `GROUP END` line 751, wrapper end line 753 | Improved but not clean. The earlier `free(): invalid pointer` lines are gone. The first remaining internal failure is `[SEGV]` line 723 (`pc=0x236a6`, `stval=0xf0`, `ra=0x112d8`) after `b_pthread_createjoin_serial1`, before `b_pthread_create_serial1`. |
-| `libctest-glibc` | `GROUP END` line 2494, wrapper end line 2496 | Not clean. Many `FAIL` lines remain. Current first true failure is `FAIL clocale_mbfuncs [status 1]` at line 1079. `Interrupted system call` remains at lines 1173, 1232, and 1581. Many status-127 failures remain later in static tests. |
-| `busybox-glibc` | `GROUP END` line 2741, wrapper end line 2743 | No focused failure marker in the latest run. |
-| `cyclictest-glibc` | `GROUP END` line 2791, wrapper end line 2793 | Includes `kill hackbench: success`; group wrapper completes under hackbench pressure. |
-| `netperf-glibc` | `GROUP END` line 2824, wrapper end line 2826 | Not clean. `UDP_STREAM`, `TCP_STREAM`, `UDP_RR`, `TCP_RR`, and `TCP_CRR` still print `end: fail` at lines 2803, 2808, 2813, 2818, and 2823. Four subtests also report `[SEGV] pc=0x3ffb1392e0` at lines 2805, 2810, 2815, and 2820. |
-| `lmbench-glibc` | `GROUP END` line 2862, wrapper end line 2864 | No focused failure marker in the latest run. |
+RV initcode now keeps reading `SYS_get_dentries` until it returns `<= 0`, so short reads no longer stop directory enumeration early. To keep long or hanging groups from blocking later coverage, the current RV initcode runs shorter primary groups first and defers `unixbench`, `lmbench`, and `ltp` until after the primary `/musl` and `/glibc` groups.
 
-Focused checks in the final log:
+| Test group | Latest RV log marker | Real testsuite status notes |
+|---|---|---|
+| `libcbench-musl` | `GROUP END` line 154 | Clean in this log: no focused `FAIL`, `[SEGV]`, `end: fail`, timeout, panic, or unknown syscall marker in the group. |
+| `libctest-musl` | `GROUP END` line 813 | Clean in this log: no focused failure marker in the group. |
+| `busybox-musl` | `GROUP END` line 1060 | Clean in this log: no focused failure marker in the group. |
+| `cyclictest-musl` | `GROUP END` line 1108 | Clean in this log: no focused failure marker in the group. |
+| `netperf-musl` | `GROUP END` line 1170 | Clean in this log: no focused failure marker in the group. |
+| `iperf-musl` | `GROUP END` line 1296 | Clean in this log: no focused failure marker in the group. |
+| `iozone-musl` | `GROUP END` line 1701 | Clean in this log. The previous `iozone.DUMMY.*: Operation not permitted` blocker is not present. |
+| `lua-musl` | `GROUP END` line 1718 | Clean in this log: no focused failure marker in the group. |
+| `basic-musl` | `GROUP END` line 1907 | Clean in this log: no focused failure marker in the group. |
+| `libcbench-glibc` | `GROUP END` line 1992 | Fails internally: `[SEGV]` at lines 1981 and 1982. Do not count the wrapper/group end as success. |
+| `libctest-glibc` | `GROUP END` line 3410 | Fails internally: many `FAIL`, `[SEGV]`, `timed out`, and `signal Aborted` markers, including `daemon_failure`, `lseek_large`, pthread, regex, stdio, locale, and wide-char cases. |
+| `busybox-glibc` | `GROUP END` line 3656 | Clean in this log: no focused failure marker in the group. |
+| `cyclictest-glibc` | `GROUP END` line 3704 | Clean in this log: no focused failure marker in the group. |
+| `netperf-glibc` | `GROUP END` line 3741 | Fails internally: UDP/TCP stream and RR/CRR subtests report `end: fail`; several netperf processes hit `[SEGV]`. |
+| `iperf-glibc` | `GROUP END` line 3868 | Clean in this log: no focused failure marker in the group. |
+| `iozone-glibc` | `GROUP END` line 4273 | Clean in this log: no focused failure marker in the group. |
+| `lua-glibc` | `GROUP END` line 4290 | Clean in this log: no focused failure marker in the group. |
+| `basic-glibc` | `GROUP END` line 4478 | Clean in this log: no focused failure marker in the group. |
+| `unixbench-musl` | `GROUP START` line 4485, wrapper `test fail` line 4488 | Fails before tests run: `/musl/unixbench_testcode.sh: line 5: can't create pipe: Bad file descriptor`. |
+| `lmbench-musl` | `GROUP START` line 4493, timeout line 4496, `test fail` line 4498 | Fails by initcode timeout after `latency measurements`; this is a real incomplete group, not success. |
+| `ltp-musl` | `GROUP START` line 4503, wrapper `test fail` line 4506 | Fails before tests run: `/musl/ltp_testcode.sh: line 13: can't create pipe: No file descriptors available`. |
+| `unixbench-glibc` | `GROUP START` line 4511, wrapper `test fail` line 4514 | Fails before tests run: `/glibc/unixbench_testcode.sh: line 5: can't create pipe: Bad file descriptor`. |
+| `lmbench-glibc` | `GROUP START` line 4519, timeout line 4522, `test fail` line 4524 | Fails by initcode timeout after `latency measurements`; this is a real incomplete group, not success. |
+| `ltp-glibc` | `GROUP START` line 4529, wrapper `test fail` line 4532 | Fails before tests run: `/glibc/ltp_testcode.sh: line 13: can't create pipe: Too many open files`. |
+
+Focused checks in the latest RISC-V log:
 
 ```text
+all_24_groups_seen=True
 sys_shutdown=True
 panic=False
-pmem_alloc=False
-fork_fail=False
-no_more_mmap=False
 unknown_syscall=False
-group_test_fail=False
-free_invalid_pointer=False
-segv=True
+function_not_implemented=False
+interrupted_system_call=False
+operation_not_permitted=False
+segv=True                      # glibc libcbench/libctest/netperf
+explicit_group_or_wrapper_fail=True
 ```
 
 ## This Iteration
 
-- Retained D34: `brk(214)` grow synchronizes newly mapped heap leaves and `heap_top` to live same-`vm_owner` siblings.
-- Added D35: mmap lazy faults now reuse/synchronize the same PA for the same VA across live `CLONE_VM` siblings; `munmap` clears live sibling PTEs and frees the PA once; `proc_free()` avoids freeing shared leaves while same-owner siblings are still live.
-- This removes the earliest `libcbench-glibc` malloc-thread symptom (`free(): invalid pointer`) that previously appeared immediately after `b_malloc_big2`.
-- It does not hide or fix the later `libcbench-glibc` pthread-area `[SEGV] pc=0x236a6 stval=0xf0`; that remains the next libcbench target.
+- `src/user/initcode.c` no longer treats a short `SYS_get_dentries` read as EOF. It keeps reading until `get_dentries` returns `<= 0`.
+- RV now enumerates the full `/musl` 12 groups plus `/glibc` 12 groups, for 24 total groups.
+- Newly exposed groups from the old RV short-read boundary include `libcbench-musl`, `libctest-musl`, `iozone-musl`, `lua-musl`, `basic-musl`, and the later `/glibc` groups `iperf-glibc`, `iozone-glibc`, `lua-glibc`, `basic-glibc`, `unixbench-glibc`, `lmbench-glibc`, and `ltp-glibc`.
+- The previous `iozone.DUMMY.*: Operation not permitted` symptom is gone in this run.
+- The user-visible naked `-1` errno leak has been reduced: pipe/open failures now report concrete errno such as `EBADF`, `EMFILE`, or `ENFILE`-style messages instead of misleading `Operation not permitted`. Remaining pipe failures are still real bugs and should be fixed next.
+- Initcode per-test timeout lets RV continue after long `lmbench` paths. The timeout marker is deliberately recorded as failure, not success.
 
 ## Remaining Real Gaps
 
-1. `libcbench-glibc`: first remaining real failure is `[SEGV]` at line 723, `pc=0x236a6`, `stval=0xf0`, after `b_pthread_createjoin_serial1`.
-2. `libctest-glibc`: many true `FAIL` lines remain, starting with `clocale_mbfuncs`; `Interrupted system call` remains in wrapper wait paths.
-3. `netperf-glibc`: all five real subtests still end in `fail`, with four repeated user `[SEGV]` reports in the response path.
+1. `libcbench-glibc`: first failing group in the current execution order; contains `[SEGV]` in pthread/memory-stress paths.
+2. `libctest-glibc`: many real libc-test failures remain; focus after the earlier glibc SEGVs are understood.
+3. `netperf-glibc`: all netperf subtests report `end: fail`, with repeated `[SEGV]` in the glibc netperf process.
+4. `unixbench-musl` and `unixbench-glibc`: shell script fails creating a pipe with `Bad file descriptor`.
+5. `lmbench-musl` and `lmbench-glibc`: still exceed the current per-test timeout at `latency measurements`.
+6. `ltp-musl` and `ltp-glibc`: shell script fails creating a pipe because file descriptors are exhausted or unavailable.
 
 Do not treat wrapper `test end` as testsuite success.
 
 ## Public-Path Risk Notes
 
-This iteration investigated `libcbench-glibc` line 723 and tried a stricter `PROT_NONE`/`mprotect` propagation patch. The strict `PROT_NONE` trial hung in `libcbench-glibc` under the 2.5 hour cap; the narrower `mprotect` propagation trial did not improve the libcbench `[SEGV]` and introduced a `cyclictest-glibc` `kill hackbench: fail` regression, so both code changes were rolled back. The retained source state is the prior D35 baseline; only docs/status/log files were updated in this round.
+This iteration modifies RV initcode plus shared kernel syscall, FS, process, memory, and trap paths. Public-path files touched include `src/kernel/syscall/type.h`, `src/kernel/syscall/syscall.c`, and `src/kernel/mem/type.h`; these are shared-risk paths under `AGENTS.md` and must be regression-checked with `make all` and the fixed RV docker command.
 
-The forbidden grader images `data/sdcard-rv.img.gz` and `data/sdcard-la.img.gz` were not modified.
+The forbidden grader images `data/sdcard-rv.img.gz` and `data/sdcard-la.img.gz` were not modified. Root-level temporary image files created by the docker run were removed before the fixed RV rerun.
