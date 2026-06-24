@@ -113,6 +113,7 @@ typedef pte_t* pgtbl_t;
 #define PTE_G (1 << 5) // global
 #define PTE_A (1 << 6) // accessed
 #define PTE_D (1 << 7) // dirty
+#define PTE_SHM (1 << 8) // software: SysV shared-memory leaf
 
 // 检查一个PTE是否属于pgtbl
 #define PTE_CHECK(pte) (((pte) & (PTE_R | PTE_W | PTE_X)) == 0)
@@ -157,8 +158,8 @@ typedef struct mmap_region_node
 // 映射区域的终点 (给ustack留16MB内存空间)
 #define MMAP_END (TRAPFRAME - 16 * 256 * PGSIZE)
 
-// 映射区域的起点 (单个进程的mmap_reagion最大占据64MB内存空间)
-#define MMAP_BEGIN (MMAP_END - 64 * 256 * PGSIZE)
+// 映射区域的起点: 1GB窗口，容纳glibc默认8MB pthread栈并发创建
+#define MMAP_BEGIN (MMAP_END - 1024 * 256 * PGSIZE)
 
 // User-space signal-return trampoline page, kept below mmap and above heap.
 #define SIGTRAMPOLINE (MMAP_BEGIN - PGSIZE)

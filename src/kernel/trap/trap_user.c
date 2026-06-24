@@ -2,6 +2,11 @@
 #include <stdint.h>
 #include "../mem/mod.h"  
 #define UCODE_VA PGSIZE
+#define RISCV_UCONTEXT_SIGMASK_OFFSET 40
+#define RISCV_UCONTEXT_MCONTEXT_OFFSET 176
+#define RISCV_SIGNAL_GREGS 32
+#define RISCV_SIGNAL_FRAME_UCONTEXT_PC 32
+#define RISCV_SIGNAL_FRAME_WORDS 34
 
 // in trampoline.S
 extern char trampoline[];  // 内核和用户切换的代码
@@ -38,6 +43,11 @@ static int map_user_sigtrampoline(proc_t *p)
     return 0;
 }
 
+static void fatal_signal_exit(int sig)
+{
+    proc_exit_group(-sig);
+}
+
 // 在user_vector()里面调用
 // 用户态trap处理的核心逻辑
 void trap_user_handler()
@@ -47,6 +57,9 @@ void trap_user_handler()
 
     proc_t *p = myproc(); // 获取当前进程
     trapframe_t *tf = p->tf;
+
+    if (p->group_exit_pending)
+        proc_exit_group_if_requested();
 
     // 读取关键寄存器
     uint64 sepc = r_sepc();
@@ -102,7 +115,7 @@ void trap_user_handler()
                     }
                     printf("[SEGV] pid=%d t=%d pc=%p stval=%p gp=%p tp=%p sp=%p ra=%p\n",
                            p->pid, trap_id, sepc, (void*)fault_addr, (void*)tf->gp, (void*)tf->tp, (void*)tf->sp, (void*)tf->ra);
-                    proc_exit(-11);
+                    fatal_signal_exit(SIGSEGV);
                 }
                 break;
             }
@@ -110,15 +123,19 @@ void trap_user_handler()
             {
                 printf("[SEGV] pid=%d t=%d pc=%p stval=%p gp=%p tp=%p sp=%p\n",
                        p->pid, trap_id, sepc, r_stval(), (void*)tf->gp, (void*)tf->tp, (void*)tf->sp);
-                proc_exit(-11);
+                fatal_signal_exit(SIGSEGV);
             }
         }
     }
 
+    if (p->group_exit_pending)
+        proc_exit_group_if_requested();
+
     // 信号投递: 返回用户态前检查是否有待投递信号
-    if (p->sig_pending != 0 && !p->sig_delivering) {
+    if ((p->sig_pending & ~p->sig_mask) != 0 && !p->sig_delivering) {
         for (int sig = 1; sig <= NSIG; sig++) {
-            if (!(p->sig_pending & (1UL << (sig - 1))))
+            uint64 sig_bit = 1UL << (sig - 1);
+            if (!(p->sig_pending & sig_bit) || (p->sig_mask & sig_bit))
                 continue;
             if (p->sig_handler[sig] == 1) {
                 p->sig_pending &= ~(1UL << (sig - 1));
@@ -127,7 +144,7 @@ void trap_user_handler()
             if (p->sig_handler[sig] == 0) {
                 if (sig == SIGINT || sig == SIGTERM || sig == SIGKILL || sig == SIGHUP ||
                     sig == SIGABRT || sig == SIGSEGV || sig == SIGBUS)
-                    proc_exit(128 + sig);
+                    fatal_signal_exit(sig);
                 p->sig_pending &= ~(1UL << (sig - 1));
                 continue;
             }
@@ -135,7 +152,7 @@ void trap_user_handler()
             p->sig_pending &= ~(1UL << (sig - 1));
             p->sig_delivering = 1;
 
-            uint64 frame[32];
+            uint64 frame[RISCV_SIGNAL_FRAME_WORDS];
             frame[0]  = tf->user_to_kern_epc;
             frame[1]  = tf->ra;
             frame[2]  = tf->sp;
@@ -168,9 +185,34 @@ void trap_user_handler()
             frame[29] = tf->t4;
             frame[30] = tf->t5;
             frame[31] = tf->t6;
+            uint64 ucontext_pc = frame[0];
+            if (tf->a0 == (uint64)(-EINTR) && ucontext_pc >= 4)
+                ucontext_pc -= 4;
+            frame[RISCV_SIGNAL_FRAME_UCONTEXT_PC] = ucontext_pc;
+            frame[33] = 0;
 
-            uint64 new_sp = (tf->sp - 256) & ~0xFUL;
+            uint8 siginfo[128];
+            uint8 ucontext[960];
+            memset(siginfo, 0, sizeof(siginfo));
+            memset(ucontext, 0, sizeof(ucontext));
+            int *si_fields = (int *)siginfo;
+            si_fields[0] = sig;
+            si_fields[2] = -6;
+            si_fields[4] = p->pid;
+            /* musl riscv64 ucontext_t places mcontext after
+             * uc_flags, uc_link, uc_stack and uc_sigmask. */
+            *(uint64 *)(ucontext + RISCV_UCONTEXT_SIGMASK_OFFSET) = p->sig_mask;
+            uint64 *gregs = (uint64 *)(ucontext + RISCV_UCONTEXT_MCONTEXT_OFFSET);
+            for (int i = 0; i < RISCV_SIGNAL_GREGS; i++)
+                gregs[i] = frame[i];
+            gregs[0] = ucontext_pc;
+
+            uint64 new_sp = (tf->sp - sizeof(frame) - sizeof(siginfo) - sizeof(ucontext)) & ~0xFUL;
+            uint64 siginfo_sp = new_sp + sizeof(frame);
+            uint64 ucontext_sp = siginfo_sp + sizeof(siginfo);
             uvm_copyout(p->pgtbl, new_sp, (uint64)frame, sizeof(frame));
+            uvm_copyout(p->pgtbl, siginfo_sp, (uint64)siginfo, sizeof(siginfo));
+            uvm_copyout(p->pgtbl, ucontext_sp, (uint64)ucontext, sizeof(ucontext));
 
             uint64 restorer = p->sig_restorer;
             if (restorer == 0) {
@@ -184,6 +226,8 @@ void trap_user_handler()
 
             tf->user_to_kern_epc = p->sig_handler[sig];
             tf->a0 = (uint64)sig;
+            tf->a1 = (p->sig_flags[sig] & SA_SIGINFO) ? siginfo_sp : 0;
+            tf->a2 = (p->sig_flags[sig] & SA_SIGINFO) ? ucontext_sp : 0;
             tf->sp = new_sp;
             tf->ra = restorer;
 

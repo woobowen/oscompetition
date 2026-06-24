@@ -240,3 +240,79 @@
 - Boundary: this is still a minimal Linux-compatible model, not full thread-group semantics. Futex timeout uses coarse kernel ticks and does not implement robust lists, PI futexes, or all futex operations. Orphan reaping is limited to processes explicitly marked by `proc_reparent()`, avoiding premature collection of initcode's direct test children.
 - Risk: process lifecycle code is a shared path. Mistakes can hide child exit status, leak zombies, or free process slots too early. The `reparented_to_init` marker was added after an intermediate run showed every group ending with `initcode: fork fail!` and missing `test sucess`; the final version restores normal initcode waits while still reclaiming abandoned descendants.
 - Verification: after a clean rebuild and the required docker command on 2026-06-18, RISC-V reached `sys_shutdown`. The generated `os_serial_out_rv.txt` contains `GROUP END` plus `test sucess` for all visible groups through `lmbench-glibc`, including the previously failing `cyclictest-glibc` (`kill hackbench: success`). The final log has no `panic`, `no more mmap`, `fork fail`, or group-level `test fail` marker.
+
+## D27: 2026-06-18 RISC-V rt_sigtimedwait minimum compatibility
+
+- Decision: implement syscall 137 (`rt_sigtimedwait`) on the RISC-V syscall path with the existing minimal signal state: validate an 8-byte signal set, wait/yield until a matching `sig_pending` bit appears or the relative timeout expires, consume one matching signal, and optionally write a zero-filled `siginfo_t` with `si_signo`.
+- Rationale: `libc-test/src/common/runtest.c` blocks `SIGCHLD`, installs a `SIGCHLD` handler, forks each test, then uses `sigtimedwait()` before `waitpid()`. Without syscall 137, the wrapper prints `unknown syscall 137` / `Function not implemented`, kills the child, and often reports `waitpid failed: Interrupted system call`. Consuming the pending `SIGCHLD` preserves the real child exit/wait path and removes that compatibility noise.
+- Boundary: this is not a full Linux signal mask implementation. `rt_sigprocmask` remains a no-op, and `rt_sigtimedwait` only observes signals already represented in `proc_t.sig_pending`. The current libctest wrapper is covered because its installed `SIGCHLD` handler causes `proc_try_wakeup()` to set that pending bit on child exit.
+- Risk: signal delivery is shared behavior. Returning from `rt_sigtimedwait` must clear the consumed pending bit so the normal trap return path does not deliver the handler and later interrupt `waitpid()`.
+
+## D28: 2026-06-18 RISC-V libctest follow-up after enabling rt_sigtimedwait
+
+- Decision: handle two deeper libc-test compatibility paths exposed after syscall 137 started letting wrapper children run:
+  - `utimensat(88)` accepts a NULL pathname as the `futimens(fd, ...)` compatibility form: valid fd returns 0, invalid fd returns `-EBADF`; `/dev/null/...` returns `-ENOTDIR` instead of treating it as a missing leaf.
+  - `mremap(216)` is registered in the syscall table with a minimal boundary: same-size/shrink requests return the original address, growth returns `-ENOMEM`, and unsupported flags return `-EINVAL`.
+- Rationale: the previous `utimensat` path unconditionally copied argument 1 as a string, so glibc `futimens()` could panic the kernel via `uvm_copyin_str` on a NULL user pointer. `mremap` appeared as the next unknown syscall once libc-test progressed past the old `rt_sigtimedwait` failure.
+- Boundary: this does not implement full timestamp mutation or movable/remapped VMAs. It prevents kernel panic and removes the unknown-syscall noise while keeping unsupported growth explicit.
+- Risk: these are syscall/VM-facing compatibility paths. `mremap` growth returning `-ENOMEM` may still make individual libc-test cases fail internally, but it preserves kernel stability and avoids pretending that pages were moved or copied.
+
+## D29: 2026-06-18 RISC-V pread64 compatibility for libc-test wrappers
+
+- Decision: implement syscall 67 (`pread64`) by temporarily reading from the supplied file offset and restoring `file->offset` before returning. Invalid fd returns `-EBADF`; socket fd returns `-ESPIPE`; offsets beyond the current 32-bit internal file offset model return EOF.
+- Rationale: after `rt_sigtimedwait` and `utimensat` progressed `libctest-glibc`, `fflush-exit` reached `pread()` and exposed `unknown syscall 67` / `Function not implemented`. The test needs a real positioned one-byte read from a regular file, not a broader VFS redesign.
+- Boundary: this is a minimal regular-file implementation. It does not widen the internal file offset type beyond 32 bits and does not add positioned socket/device semantics.
+
+## D30: 2026-06-19 RISC-V glibc protocol database seed for netperf
+
+- Decision: seed a small read-only `/etc/protocols` file through the existing memfs fallback, containing `ip`, `icmp`, `tcp`, and `udp`.
+- Rationale: `netperf-glibc` reports `enable_enobufs failed: getprotobyname` before its UDP control failure. glibc resolves protocol names through the standard protocol database; the read-only test image does not currently provide it.
+- Boundary: this is data compatibility for libc resolver APIs, not a network-stack shortcut. Netperf still has to create sockets, connect, send, and receive through the kernel socket layer.
+
+## D31: 2026-06-20 Rejected RISC-V CLONE_VM page-sync experiments for libcbench-glibc
+
+- Decision: do not retain the attempted RISC-V `CLONE_VM` page-table synchronization patches from this investigation.
+- Tried:
+  - propagating lazy mmap fault pages across live `CLONE_VM` thread page tables and unmapping them once across the group;
+  - extending the same idea to `brk` heap grow/shrink.
+- Evidence: the page-sync variants built with `make all` and were run through the fixed docker command. They did not remove the first `libcbench-glibc` pthread-area SEGV (`pc=0x236a6`, `stval=0xf0`) and later full runs exposed `pmem_alloc: free list corrupted`, so the page-table propagation experiment was reverted before the final verification run.
+- Rationale: the underlying problem is still likely a real shared-address-space/thread semantics gap, but piecemeal propagation between per-thread page-table copies is too easy to make inconsistent. A future fix should first define a coherent shared-mm owner model for `CLONE_VM` mappings, heap top, mmap list lifetime, and unmap/free ownership.
+- Current state: final RISC-V docker evidence was regenerated after reverting these experiments. `libcbench-glibc` remains a real failure and must not be treated as passed because the wrapper reaches `GROUP END`.
+
+## D32: 2026-06-20 RISC-V shared-VM mmap head synchronization
+
+- Decision: retain a narrower shared-VM metadata fix: each process now has a `vm_owner` pointer. Normal fork/exec processes own their own VM group; `CLONE_VM` children inherit the parent's owner. When `uvm_mmap()` or `uvm_munmap()` changes the `mmap_region_t` list head, the kernel synchronizes that head to live processes in the same VM owner group that still point at the old head.
+- Rationale: the previous `CLONE_VM` model copied the `mmap` head pointer into each pthread shell but did not share the pointer slot itself. If one pthread inserted or removed the head mapping, sibling threads could keep a stale head pointer, including a pointer to a returned mmap node. Glibc pthread stack/guard allocation churns through mmap/munmap heavily, so this was a real shared-address-space metadata corruption path.
+- Boundary: this is not a complete Linux `mm_struct`. It does not synchronize new leaf PTEs, heap/brk growth, or all unmap/free ownership across per-thread page-table roots. It only keeps the mmap-region list head coherent across one `vm_owner` group.
+- Verification: `make all` passed in the fixed docker build environment. The fixed docker command from 2026-06-20 22:44:53 to 2026-06-21 00:46:25 reached `sys_shutdown`, kept the visible RISC-V groups reaching `GROUP END` plus wrapper end markers, and showed no focused-grep `panic`, `fork fail`, `no more mmap`, `unknown syscall`, `pmem_alloc`, or group-level `test fail`.
+- Result: `libcbench-glibc` improved but did not pass. The later pthread SEGVs seen in earlier runs disappeared, but `free(): invalid pointer` and the first `[SEGV] pc=0x236a6 stval=0xf0` remain and must be investigated separately.
+
+## D33: 2026-06-20 RISC-V exit_group pending thread-group termination
+
+- Decision: `exit_group(94)` now uses minimal `CLONE_THREAD`/`CLONE_VM` semantics. A non-thread-group process still exits like `exit`. For a thread group, the caller marks live same-`vm_owner` siblings with `group_exit_pending`, wakes sleeping siblings, waits until no marked sibling remains live, and then exits itself. A marked sibling handles the request at `proc_return()` before returning to user mode.
+- Rationale: glibc pthread code expects `exit_group` to terminate all threads in the process, not just the calling thread shell. The earlier single-thread-only behavior left sibling pthreads running in a partially torn-down shared address space. A direct force-kill attempt regressed `unixbench-musl` with an instruction page fault, so the retained design makes each sibling leave through its normal `proc_exit` path.
+- Boundary: this is not a full Linux thread-group implementation. It relies on the current `CLONE_THREAD` flag, `shared_vm`, and `vm_owner` membership, and it does not add robust futex, signal-disposition, or leader-reparenting semantics beyond the existing SeaOS process model.
+- Risk: process lifecycle code is shared. Incorrect pending-exit handling can leak thread shells or exit siblings too early. The final fixed docker run is the regression evidence for the retained approach.
+
+## D34: 2026-06-21 RISC-V CLONE_VM brk grow synchronization
+
+- Decision: when `brk(214)` grows the heap in a process that shares a `vm_owner`, the kernel now maps the newly allocated heap leaf pages into live same-owner sibling page tables and raises their `heap_top` to the new value. Heap shrink remains the existing minimal current-thread behavior.
+- Rationale: glibc pthread malloc shares allocator metadata across `CLONE_VM` threads. If one worker thread grows the heap but the leader and siblings keep stale page tables and stale `heap_top`, later pthread creation/join can observe allocator pointers for pages that are not mapped in the current thread, producing `free(): invalid pointer` and the remaining `libcbench-glibc` pthread-area SEGV.
+- Boundary: this is a targeted grow-only compatibility fix, not a complete Linux `mm_struct`. It deliberately does not reintroduce the rejected lazy-mmap page propagation from D31.
+- Risk: process, page-table, and syscall paths are shared. Mapping failures during best-effort propagation are not currently rolled back; a future full shared-mm design should centralize ownership and make heap/mmap shrink semantics group-wide.
+- Verification: `make all` passed in the fixed docker build environment, and the fixed docker run from 2026-06-21 08:55:31 to 2026-06-21 10:49:32 reached `sys_shutdown` with the visible groups still reaching `GROUP END` plus wrapper end markers. This change did not remove the remaining `libcbench-glibc` `free(): invalid pointer` or first `[SEGV] pc=0x236a6`; those remain real failures.
+
+## D35: 2026-06-21 RISC-V CLONE_VM mmap leaf sharing and live-sibling teardown guard
+
+- Decision: retain a narrower shared-mmap leaf model for RISC-V `CLONE_VM` groups. On mmap page fault, the kernel first reuses any existing same-`vm_owner` leaf for that virtual page; otherwise it allocates one zeroed page and maps the same PA into live same-owner page tables. `munmap` now clears the page from live same-owner page tables and frees the PA once. When `proc_free()` sees live same-owner siblings, it destroys only the exiting process's page-table pages and does not free shared leaves.
+- Rationale: `libcbench-glibc` `b_malloc_thread_stress` passes allocator pointers between pthreads. With per-thread page-table roots, the old lazy mmap path could map the same VA to different PAs in different threads, so glibc could later free a pointer whose allocator metadata belonged to another physical page. The first retained run removed the earlier `free(): invalid pointer` lines, confirming this real shared-address-space gap. The live-sibling teardown guard was added after the first retained variant freed a shared leaf from a non-`shared_vm` leader while a sibling could still write it, corrupting the free list.
+- Boundary: this is still not a full Linux `mm_struct`. It synchronizes live same-owner page-table leaves at fault/unmap time, but it does not add reference counts, a central VMA lock, copy-on-write, robust futexes, or full signal/thread-group lifetime semantics. If a leader exits while siblings remain, shared leaves may be intentionally leaked rather than freed unsafely; later work should replace this with explicit shared-mm ownership and page reference accounting.
+- Risk: mmap, munmap, page-table teardown, and pthread lifecycle are shared kernel paths. Incorrect ownership can leak pages or corrupt the physical free list. The retained version is constrained by the final fixed docker run below: it reaches `sys_shutdown`, removes the `libcbench-glibc` `free(): invalid pointer` lines, and shows no `panic`, `pmem_alloc`, `fork fail`, `no more mmap`, or `unknown syscall`.
+- Verification: `make all` passed in the fixed docker build environment. The required docker command from 2026-06-21 14:50:59 to 2026-06-21 16:43:37 Asia/Shanghai completed under the 2.5 hour cap and reached `sys_shutdown`. `libcbench-glibc` still has the later `[SEGV] pc=0x236a6 stval=0xf0`; this D35 fix only removes the earlier malloc-thread invalid-free symptom and stabilizes the follow-on run.
+
+## D36: 2026-06-24 RISC-V initcode full enumeration and timeout boundary
+
+- Decision: RV initcode now scans test directories by repeatedly calling `SYS_get_dentries` until the syscall returns `<= 0`. A short positive read is treated as progress, not EOF. Long groups (`unixbench`, `lmbench`, `ltp`) are deferred after the shorter primary groups, and each spawned test gets an initcode timeout that records `test timeout`/`test fail` before continuing to the next group.
+- Rationale: Linux-style `getdents64` emits variable-length `dirent64` records. When the user buffer cannot hold the next directory entry, a short positive read can be returned even though more entries remain. The old RV short-read break stopped enumeration early and hid later tests that were present in `sdcard-rv.img`.
+- Boundary: the timeout is only a progress guard for enumeration coverage. It is not a testsuite success signal, and `rv-current.md` records timed-out groups as real failures. Wrapper `test end` remains non-authoritative; internal `FAIL`, `[SEGV]`, `end: fail`, pipe errors, `Function not implemented`, `Interrupted system call`, `panic`, and unknown syscall markers still determine the real status.
+- Verification: after `make all` and the fixed docker command, `os_serial_out_rv.txt` reached `sys_shutdown` and showed all 24 RV groups (`/musl` 12 + `/glibc` 12). The prior `iozone.DUMMY.*: Operation not permitted` blocker is absent; remaining pipe failures now report concrete errno such as `EBADF`/file-descriptor exhaustion and are tracked as real defects.

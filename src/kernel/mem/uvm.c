@@ -284,6 +284,7 @@ static uint64 uvm_mmap_find(mmap_region_t *head_mmap, uint64 len, mmap_region_t 
 uint64 uvm_mmap(uint64 begin, uint32 npages, int perm)
 {
     proc_t *p = myproc();
+    mmap_region_t *old_head = p->mmap;
     uint64 len = (uint64)npages * PGSIZE;
     mmap_region_t *prev = NULL;
     mmap_region_t *curr = p->mmap;
@@ -343,6 +344,8 @@ uint64 uvm_mmap(uint64 begin, uint32 npages, int perm)
         prev->next = node->next; // 【关键修复】先从链表中摘除 node
         mmap_merge(prev, node, true); // 然后合并并释放 node
     }
+    if (p->mmap != old_head)
+        proc_shared_vm_sync_mmap(old_head, p->mmap);
     return begin;
 }
 
@@ -363,14 +366,11 @@ uint64 uvm_mmap_handle_fault(pgtbl_t pgtbl, uint64 fault_addr)
         if (pte != NULL && (*pte & PTE_V))
             return (uint64)-1;
 
-        void *pa = pmem_alloc(false);
-        if (pa == NULL)
+        if (proc_shared_vm_fault_page(va, m->perm) < 0)
             return (uint64)-1;
-        memset(pa, 0, PGSIZE);
-        if (vm_try_mappages(pgtbl, va, (uint64)pa, PGSIZE, m->perm) < 0) {
-            pmem_free((uint64)pa, false);
+        pte = vm_getpte(pgtbl, va, false);
+        if (pte == NULL || !(*pte & PTE_V))
             return (uint64)-1;
-        }
         return va;
     }
     return (uint64)-1;
@@ -381,6 +381,7 @@ uint64 uvm_mmap_handle_fault(pgtbl_t pgtbl, uint64 fault_addr)
 void uvm_munmap(uint64 begin, uint32 npages)
 {
     proc_t *p = myproc();
+    mmap_region_t *old_head = p->mmap;
     uint64 end = begin + (uint64)npages * PGSIZE;
 
     mmap_region_t *prev = NULL;
@@ -401,8 +402,10 @@ void uvm_munmap(uint64 begin, uint32 npages)
             for (uint32 i = 0; i < o_npages; i++) {
                 uint64 va = o_begin + (uint64)i * PGSIZE;
                 pte_t *pte = vm_getpte(p->pgtbl, va, false);
-                if (pte != NULL && (*pte & PTE_V) && !PTE_CHECK(*pte))
-                    vm_unmappages(p->pgtbl, va, PGSIZE, true);
+                int is_shm = (pte != NULL && (*pte & PTE_V) && (*pte & PTE_SHM));
+                uint64 pa = proc_shared_vm_unmap_page(va);
+                if (pa != 0 && !is_shm)
+                    pmem_free(pa, false);
             }
 
             // 2. 根据交集在curr中的位置，处理 curr 节点
@@ -452,6 +455,8 @@ void uvm_munmap(uint64 begin, uint32 npages)
             curr = curr->next;
         }
     }
+    if (p->mmap != old_head)
+        proc_shared_vm_sync_mmap(old_head, p->mmap);
 }
 
 /*------------------part-3: 用户空间heap和stack管理相关------------------*/
@@ -589,7 +594,7 @@ static void destroy_pgtbl(pgtbl_t pgtbl, uint32 level)
 
         // 如果这是叶子（具有 R/W/X 权限）（普通页面或大页），释放对应的物理页
         if (level == 1 || (flags & (PTE_R | PTE_W | PTE_X))) {
-            if (pa != (uint64)trampoline) { // TRAMPOLINE页面是全局共享的，不能释放
+            if (pa != (uint64)trampoline && !(flags & PTE_SHM)) { // TRAMPOLINE页面是全局共享的，不能释放
                 pmem_free(pa, false);
             }
         } else {
@@ -662,13 +667,18 @@ static int copy_range(pgtbl_t old, pgtbl_t new, uint64 begin, uint64 end)
         pa = (uint64)PTE_TO_PA(*pte);
         flags = (int)PTE_FLAGS(*pte);
 
-        page = (uint64)pmem_alloc(false);
-        if (page == 0)
-            return -1;
-        memmove((char *)page, (const char *)pa, PGSIZE);
-        if (vm_try_mappages(new, va, page, PGSIZE, flags) < 0) {
-            pmem_free(page, false);
-            return -1;
+        if (flags & PTE_SHM) {
+            if (vm_try_mappages(new, va, pa, PGSIZE, flags) < 0)
+                return -1;
+        } else {
+            page = (uint64)pmem_alloc(false);
+            if (page == 0)
+                return -1;
+            memmove((char *)page, (const char *)pa, PGSIZE);
+            if (vm_try_mappages(new, va, page, PGSIZE, flags) < 0) {
+                pmem_free(page, false);
+                return -1;
+            }
         }
     }
     return 0;
@@ -716,13 +726,18 @@ static int copy_range_sparse_walk(pgtbl_t old, pgtbl_t new, uint64 begin, uint64
             for (; va < va_end; va += PGSIZE) {
                 if (va == SIGTRAMPOLINE)
                     continue;
-                uint64 page = (uint64)pmem_alloc(false);
-                if (page == 0)
-                    return -1;
-                memmove((char *)page, (const char *)(pa + (va - entry_begin)), PGSIZE);
-                if (vm_try_mappages(new, va, page, PGSIZE, flags) < 0) {
-                    pmem_free(page, false);
-                    return -1;
+                if (flags & PTE_SHM) {
+                    if (vm_try_mappages(new, va, pa + (va - entry_begin), PGSIZE, flags) < 0)
+                        return -1;
+                } else {
+                    uint64 page = (uint64)pmem_alloc(false);
+                    if (page == 0)
+                        return -1;
+                    memmove((char *)page, (const char *)(pa + (va - entry_begin)), PGSIZE);
+                    if (vm_try_mappages(new, va, page, PGSIZE, flags) < 0) {
+                        pmem_free(page, false);
+                        return -1;
+                    }
                 }
             }
             continue;

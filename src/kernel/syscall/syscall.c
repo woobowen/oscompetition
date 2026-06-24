@@ -5,6 +5,7 @@ static uint64 (*syscalls[])(void) = {
     [SYS_brk] sys_brk,
     [SYS_mmap] sys_mmap,
     [SYS_munmap] sys_munmap,
+    [SYS_mremap] sys_mremap,
     [SYS_fork] sys_fork,
     [SYS_wait] sys_wait,
     [SYS_exit] sys_exit,
@@ -17,6 +18,8 @@ static uint64 (*syscalls[])(void) = {
     [SYS_read] sys_read,
     [SYS_write] sys_write,
     [SYS_readv] sys_readv,
+    [SYS_pread64] sys_pread64,
+    [SYS_pwrite64] sys_pwrite64,
     [SYS_lseek] sys_lseek,
     [SYS_dup] sys_dup,
     [SYS_fstat] sys_fstat,
@@ -27,20 +30,27 @@ static uint64 (*syscalls[])(void) = {
     [SYS_mkdir] sys_mkdir,
     [SYS_chdir] sys_chdir,
     [SYS_getcwd] sys_getcwd,
+    [SYS_mount] sys_mount,
+    [SYS_umount2] sys_umount2,
     [SYS_link] sys_link,
     [SYS_renameat] sys_renameat,
     [SYS_statfs] sys_statfs,
     [SYS_fstatfs] sys_fstatfs,
     [SYS_ftruncate] sys_ftruncate,
     [SYS_faccessat] sys_faccessat,
+    [SYS_fchmodat] sys_fchmodat,
+    [SYS_fchownat] sys_fchownat,
     [SYS_unlink] sys_unlink,
     [SYS_newfstatat] sys_newfstatat,
     [SYS_rt_sigsuspend] sys_rt_sigsuspend,
     [SYS_rt_sigprocmask] sys_rt_sigprocmask,
+    [SYS_rt_sigtimedwait] sys_rt_sigtimedwait,
     [SYS_rt_sigreturn] sys_rt_sigreturn,
     [SYS_setgid] sys_setgid,
     [SYS_setuid] sys_setuid,
+    [SYS_setpgid] sys_setpgid,
     [SYS_setsid] sys_setsid,
+    [SYS_times] sys_times,
     [SYS_getuid] sys_getuid,
     [SYS_getgid] sys_getgid,
     [SYS_writev] sys_writev,
@@ -75,6 +85,10 @@ static uint64 (*syscalls[])(void) = {
     [SYS_tkill] sys_tkill,
     [SYS_tgkill] sys_tgkill,
     [SYS_sysinfo] sys_sysinfo,
+    [SYS_shmget] sys_shmget,
+    [SYS_shmctl] sys_shmctl,
+    [SYS_shmat] sys_shmat,
+    [SYS_shmdt] sys_shmdt,
     [SYS_madvise] sys_madvise,
     [SYS_utimensat] sys_utimensat,
     [SYS_readlinkat] sys_readlinkat,
@@ -110,6 +124,7 @@ static uint64 (*syscalls[])(void) = {
     [SYS_get_mempolicy] sys_get_mempolicy,
     [SYS_prlimit64] sys_prlimit64,
     [SYS_getrandom] sys_getrandom,
+    [SYS_membarrier] sys_membarrier,
     [SYS_schedstat] sys_schedstat,
     [SYS_spawn] sys_spawn,
     [SYS_shutdown] sys_shutdown,
@@ -163,7 +178,7 @@ uint64 arg_raw(int n)
         return proc->tf->a5;
     default:
         panic("arg_raw: illegal arg num");
-        return -1;
+        return 0;
     }
 }
 
@@ -190,21 +205,29 @@ void arg_str(int n, char *buf, int maxlen)
 }
 
 // 返回 n 号参数对应的文件
+static proc_t *fd_table_proc(proc_t *p)
+{
+    if (p != NULL && p->thread_group && p->vm_owner != NULL)
+        return p->vm_owner;
+    return p;
+}
+
 int arg_fd(int n, uint32 *pfd, file_t **pfile)
 {
     uint32 fd;
     file_t *file;
+    proc_t *p = fd_table_proc(myproc());
     arg_uint32(n, &fd);
 
     // 越界fd
     if (fd >= N_OPEN_FILE_PER_PROC)
-        return -1;
+        return -EBADF;
     
-    file = myproc()->open_file[fd];
+    file = p->open_file[fd];
     
     // 无效fd
     if (file == NULL)
-        return -1;
+        return -EBADF;
 
     if (pfd) *pfd = fd;
     if (pfile) *pfile = file;

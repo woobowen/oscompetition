@@ -1,5 +1,7 @@
 # SeaOS 当前对接 oscomp 初赛评测进度（截至本次调试）
 
+> 2026-06-24 当前 RV 状态：固定 docker 评测日志 `os_serial_out_rv.txt` 已到 `sys_shutdown`，RV initcode 已完整枚举 `/musl` 12 组 + `/glibc` 12 组，共 24 组。最新矩阵和真实失败点见 `rv-current.md`；旧章节中的 `unknown syscall 96` 已不是当前阻塞点。
+
 ## 一、已完成事项
 
 ### 1) 评测构建入口已打通

@@ -1,4 +1,5 @@
 #include "mod.h"
+#include "../arch/method.h"
 
 super_block_t sb; /* 超级块 */
 static bool fs_readonly_ext4;
@@ -326,6 +327,8 @@ static uint32 procfs_get_dents(file_t *file, uint64 user_dst, uint32 len)
 #define MEMFS_NODES 2048
 #define MEMFS_DATA_SIZE 16384
 #define MEMFS_LOGICAL_MAX 0xffffffffU
+#define MEMFS_INLINE_PAGES (MEMFS_DATA_SIZE / PGSIZE)
+#define MEMFS_EXTRA_EXTENTS 8192
 
 typedef struct memfs_node {
 	bool used;
@@ -334,10 +337,28 @@ typedef struct memfs_node {
 	char path[128];
 	uint8 data[MEMFS_DATA_SIZE];
 	uint32 size;
+	int extra_head;
+	uint64 atime_sec;
+	uint64 atime_nsec;
+	uint64 mtime_sec;
+	uint64 mtime_nsec;
 } memfs_node_t;
 
+typedef struct memfs_extent {
+	bool used;
+	int node_idx;
+	uint32 page_idx;
+	uint64 pa;
+	int next;
+} memfs_extent_t;
+
 static memfs_node_t memfs_nodes[MEMFS_NODES];
+static memfs_extent_t memfs_extents[MEMFS_EXTRA_EXTENTS];
 static int memfs_alloc_hint;
+static int memfs_extent_alloc_hint;
+
+static int memfs_open_ref_count(int mem_idx);
+static void memfs_maybe_reclaim_unlinked(int mem_idx);
 
 static const char unixbench_sort_src_data[] =
 	"version=\"1.2\"\n"
@@ -350,6 +371,12 @@ static const char unixbench_sort_src_data[] =
 	"alpha\n"
 	"gamma\n"
 	"beta\n";
+
+static const char etc_protocols_data[] =
+	"ip 0 IP\n"
+	"icmp 1 ICMP\n"
+	"tcp 6 TCP\n"
+	"udp 17 UDP\n";
 
 static void memfs_normalize(char *dst, char *path)
 {
@@ -403,6 +430,62 @@ static int memfs_find(char *path)
 	return memfs_find_key(key, hash);
 }
 
+static int memfs_extra_find(int node_idx, uint32 page_idx)
+{
+	if (node_idx < 0 || node_idx >= MEMFS_NODES)
+		return -1;
+	for (int e = memfs_nodes[node_idx].extra_head; e >= 0; e = memfs_extents[e].next) {
+		if (memfs_extents[e].used && memfs_extents[e].page_idx == page_idx)
+			return e;
+	}
+	return -1;
+}
+
+static int memfs_extra_alloc(int node_idx, uint32 page_idx)
+{
+	if (node_idx < 0 || node_idx >= MEMFS_NODES || page_idx < MEMFS_INLINE_PAGES)
+		return -1;
+	int existing = memfs_extra_find(node_idx, page_idx);
+	if (existing >= 0)
+		return existing;
+
+	for (int step = 0; step < MEMFS_EXTRA_EXTENTS; step++) {
+		int e = (memfs_extent_alloc_hint + step) % MEMFS_EXTRA_EXTENTS;
+		if (memfs_extents[e].used)
+			continue;
+
+		uint64 pa = (uint64)pmem_alloc(false);
+		if (pa == 0)
+			return -1;
+		memset((void *)pa, 0, PGSIZE);
+
+		memfs_extents[e].used = true;
+		memfs_extents[e].node_idx = node_idx;
+		memfs_extents[e].page_idx = page_idx;
+		memfs_extents[e].pa = pa;
+		memfs_extents[e].next = memfs_nodes[node_idx].extra_head;
+		memfs_nodes[node_idx].extra_head = e;
+		memfs_extent_alloc_hint = (e + 1) % MEMFS_EXTRA_EXTENTS;
+		return e;
+	}
+	return -1;
+}
+
+static void memfs_extra_free_all(int node_idx)
+{
+	if (node_idx < 0 || node_idx >= MEMFS_NODES)
+		return;
+	int e = memfs_nodes[node_idx].extra_head;
+	while (e >= 0) {
+		int next = memfs_extents[e].next;
+		if (memfs_extents[e].used && memfs_extents[e].pa != 0)
+			pmem_free(memfs_extents[e].pa, false);
+		memset(&memfs_extents[e], 0, sizeof(memfs_extents[e]));
+		e = next;
+	}
+	memfs_nodes[node_idx].extra_head = -1;
+}
+
 static int memfs_create(char *path, bool is_dir)
 {
 	char key[128];
@@ -421,6 +504,12 @@ static int memfs_create(char *path, bool is_dir)
 			node->is_dir = is_dir;
 			node->hash = hash;
 			node->size = 0;
+			node->extra_head = -1;
+			node->atime_sec = 0;
+			node->atime_nsec = 0;
+			node->mtime_sec = 0;
+			node->mtime_nsec = 0;
+			memset(node->data, 0, sizeof(node->data));
 			memset(node->path, 0, sizeof(node->path));
 			memmove(node->path, key, strlen(key) + 1);
 			memfs_alloc_hint = (i + 1) % MEMFS_NODES;
@@ -439,18 +528,26 @@ static int memfs_seed_readonly_file(char *path)
 {
 	char key[128];
 	memfs_normalize(key, path);
-	if (!streq(key, "sort.src"))
+	const char *data = NULL;
+	uint32 size = 0;
+	if (streq(key, "sort.src")) {
+		data = unixbench_sort_src_data;
+		size = sizeof(unixbench_sort_src_data) - 1;
+	} else if (streq(key, "/etc/protocols")) {
+		data = etc_protocols_data;
+		size = sizeof(etc_protocols_data) - 1;
+	} else {
 		return -1;
+	}
 
 	int idx = memfs_create(key, false);
 	if (idx < 0)
 		return -1;
 
 	memfs_node_t *node = &memfs_nodes[idx];
-	uint32 size = sizeof(unixbench_sort_src_data) - 1;
 	if (size > MEMFS_DATA_SIZE)
 		return -1;
-	memmove(node->data, unixbench_sort_src_data, size);
+	memmove(node->data, data, size);
 	node->size = size;
 	return idx;
 }
@@ -460,10 +557,34 @@ int memfs_path_exists(char *path)
 	return memfs_find(path) >= 0;
 }
 
+int memfs_path_is_dir(char *path)
+{
+	int idx = memfs_find(path);
+	return idx >= 0 && memfs_nodes[idx].is_dir;
+}
+
 int memfs_mkdir(char *path)
 {
 	int idx = memfs_create(path, true);
 	return idx >= 0 ? 0 : -1;
+}
+
+static void memfs_reclaim_node(int idx)
+{
+	if (idx < 0 || idx >= MEMFS_NODES)
+		return;
+	memfs_extra_free_all(idx);
+	memfs_nodes[idx].used = false;
+	memfs_nodes[idx].is_dir = false;
+	memfs_nodes[idx].hash = 0;
+	memfs_nodes[idx].size = 0;
+	memfs_nodes[idx].extra_head = -1;
+	memfs_nodes[idx].atime_sec = 0;
+	memfs_nodes[idx].atime_nsec = 0;
+	memfs_nodes[idx].mtime_sec = 0;
+	memfs_nodes[idx].mtime_nsec = 0;
+	memfs_nodes[idx].path[0] = 0;
+	memfs_alloc_hint = idx;
 }
 
 int memfs_unlink(char *path)
@@ -476,12 +597,12 @@ int memfs_unlink(char *path)
 	int idx = memfs_find_key(key, hash);
 	if (idx < 0)
 		return -1;
-	memfs_nodes[idx].used = false;
-	memfs_nodes[idx].is_dir = false;
-	memfs_nodes[idx].hash = 0;
-	memfs_nodes[idx].size = 0;
-	memfs_nodes[idx].path[0] = 0;
-	memfs_alloc_hint = idx;
+	if (memfs_open_ref_count(idx) > 0) {
+		memfs_nodes[idx].hash = 0;
+		memfs_nodes[idx].path[0] = 0;
+		return 0;
+	}
+	memfs_reclaim_node(idx);
 	return 0;
 }
 
@@ -521,6 +642,11 @@ static uint32 memfs_read(file_t *file, uint32 len, uint64 dst, bool is_user_dst)
 	while (copied < n) {
 		uint32 pos = file->offset + copied;
 		uint32 chunk = n - copied;
+		uint32 page_idx = pos / PGSIZE;
+		uint32 page_off = pos % PGSIZE;
+		uint32 page_left = PGSIZE - page_off;
+		if (chunk > page_left)
+			chunk = page_left;
 		if (pos < MEMFS_DATA_SIZE) {
 			uint32 stored = MEMFS_DATA_SIZE - pos;
 			if (chunk > stored)
@@ -530,16 +656,33 @@ static uint32 memfs_read(file_t *file, uint32 len, uint64 dst, bool is_user_dst)
 			else
 				memmove((void *)(dst + copied), node->data + pos, chunk);
 		} else {
-			if (chunk > sizeof(zero))
-				chunk = sizeof(zero);
-			if (is_user_dst)
-				uvm_copyout(myproc()->pgtbl, dst + copied, (uint64)zero, chunk);
-			else
-				memmove((void *)(dst + copied), zero, chunk);
+			int ext = memfs_extra_find(file->mem_index, page_idx);
+			if (ext >= 0) {
+				uint64 src = memfs_extents[ext].pa + page_off;
+				if (is_user_dst)
+					uvm_copyout(myproc()->pgtbl, dst + copied, src, chunk);
+				else
+					memmove((void *)(dst + copied), (void *)src, chunk);
+			} else {
+				uint32 zeroed = 0;
+				while (zeroed < chunk) {
+					uint32 z = chunk - zeroed;
+					if (z > sizeof(zero))
+						z = sizeof(zero);
+					if (is_user_dst)
+						uvm_copyout(myproc()->pgtbl, dst + copied + zeroed, (uint64)zero, z);
+					else
+						memmove((void *)(dst + copied + zeroed), zero, z);
+					zeroed += z;
+				}
+			}
 		}
 		copied += chunk;
 	}
 	file->offset += n;
+	uint64 now = r_time();
+	node->atime_sec = now / 10000000ull;
+	node->atime_nsec = (now % 10000000ull) * 100;
 	return n;
 }
 
@@ -550,28 +693,111 @@ static uint32 memfs_write(file_t *file, uint32 len, uint64 src, bool is_user_src
 	memfs_node_t *node = &memfs_nodes[file->mem_index];
 	if (!node->used || node->is_dir)
 		return (uint32)-1;
-	if (len > MEMFS_LOGICAL_MAX - file->offset)
+	if (file->offset > MEMFS_LOGICAL_MAX || len > MEMFS_LOGICAL_MAX - file->offset)
 		file->offset = 0;
 	uint32 n = len;
 	if (n == 0)
 		return 0;
-	if (file->offset < MEMFS_DATA_SIZE) {
-		uint32 stored = MEMFS_DATA_SIZE - file->offset;
-		if (stored > n)
-			stored = n;
-		if (is_user_src)
-			uvm_copyin(myproc()->pgtbl, (uint64)(node->data + file->offset), src, stored);
-		else
-			memmove(node->data + file->offset, (void *)src, stored);
+	uint32 copied = 0;
+	while (copied < n) {
+		uint32 pos = file->offset + copied;
+		uint32 chunk = n - copied;
+		uint32 page_idx = pos / PGSIZE;
+		uint32 page_off = pos % PGSIZE;
+		uint32 page_left = PGSIZE - page_off;
+		if (chunk > page_left)
+			chunk = page_left;
+		if (pos < MEMFS_DATA_SIZE) {
+			uint32 stored = MEMFS_DATA_SIZE - pos;
+			if (chunk > stored)
+				chunk = stored;
+			if (is_user_src)
+				uvm_copyin(myproc()->pgtbl, (uint64)(node->data + pos), src + copied, chunk);
+			else
+				memmove(node->data + pos, (void *)(src + copied), chunk);
+		} else {
+			int ext = memfs_extra_alloc(file->mem_index, page_idx);
+			if (ext < 0)
+				break;
+			uint64 dst = memfs_extents[ext].pa + page_off;
+			if (is_user_src)
+				uvm_copyin(myproc()->pgtbl, dst, src + copied, chunk);
+			else
+				memmove((void *)dst, (void *)(src + copied), chunk);
+		}
+		copied += chunk;
 	}
-	file->offset += n;
+	file->offset += copied;
 	if (file->offset > node->size)
 		node->size = file->offset;
-	return n;
+	uint64 now = r_time();
+	node->mtime_sec = now / 10000000ull;
+	node->mtime_nsec = (now % 10000000ull) * 100;
+	return copied;
+}
+
+#define MEMFS_UTIME_NOW 1073741823ull
+#define MEMFS_UTIME_OMIT 1073741822ull
+
+static void memfs_time_now(uint64 *sec, uint64 *nsec)
+{
+	uint64 now = r_time();
+	*sec = now / 10000000ull;
+	*nsec = (now % 10000000ull) * 100;
+}
+
+static void memfs_apply_time(memfs_node_t *node, uint64 times_addr)
+{
+	if (times_addr == 0) {
+		memfs_time_now(&node->atime_sec, &node->atime_nsec);
+		memfs_time_now(&node->mtime_sec, &node->mtime_nsec);
+		return;
+	}
+
+	uint64 ts[4];
+	uvm_copyin(myproc()->pgtbl, (uint64)ts, times_addr, sizeof(ts));
+	if (ts[1] == MEMFS_UTIME_NOW) {
+		memfs_time_now(&node->atime_sec, &node->atime_nsec);
+	} else if (ts[1] != MEMFS_UTIME_OMIT) {
+		node->atime_sec = ts[0];
+		node->atime_nsec = ts[1];
+	}
+	if (ts[3] == MEMFS_UTIME_NOW) {
+		memfs_time_now(&node->mtime_sec, &node->mtime_nsec);
+	} else if (ts[3] != MEMFS_UTIME_OMIT) {
+		node->mtime_sec = ts[2];
+		node->mtime_nsec = ts[3];
+	}
 }
 
 file_t file_table[N_FILE]; // 文件资源池
 spinlock_t lk_file_table; // 保护它的锁
+
+static int memfs_open_ref_count(int mem_idx)
+{
+	int refs = 0;
+	if (mem_idx < 0 || mem_idx >= MEMFS_NODES)
+		return 0;
+
+	spinlock_acquire(&lk_file_table);
+	for (int i = 0; i < (int)N_FILE; i++) {
+		if (file_table[i].ref > 0 && file_table[i].is_mem &&
+			file_table[i].mem_index == mem_idx)
+			refs++;
+	}
+	spinlock_release(&lk_file_table);
+	return refs;
+}
+
+static void memfs_maybe_reclaim_unlinked(int mem_idx)
+{
+	if (mem_idx < 0 || mem_idx >= MEMFS_NODES)
+		return;
+	if (!memfs_nodes[mem_idx].used || memfs_nodes[mem_idx].path[0] != 0)
+		return;
+	if (memfs_open_ref_count(mem_idx) == 0)
+		memfs_reclaim_node(mem_idx);
+}
 
 /* 初始化file_table */
 void file_init()
@@ -775,14 +1001,30 @@ static file_t *memfs_open_index(int mem_idx, bool want_r, bool want_w, uint32 op
 		file_close(mf);
 		return NULL;
 	}
-	if (!node->is_dir && (open_mode & FILE_OPEN_TRUNC))
+	if (!node->is_dir && (open_mode & FILE_OPEN_TRUNC)) {
 		node->size = 0;
+		memfs_extra_free_all(mem_idx);
+		memset(node->data, 0, sizeof(node->data));
+	}
 	mf->is_mem = true;
 	mf->mem_index = mem_idx;
 	mf->readable = want_r;
 	mf->writbale = want_w;
 	mf->offset = (open_mode & FILE_OPEN_APPEND) ? node->size : 0;
 	return mf;
+}
+
+int file_utimens(file_t *file, uint64 times_addr)
+{
+	if (file == NULL)
+		return -1;
+	if (file->is_mem && file->mem_index >= 0 && file->mem_index < MEMFS_NODES) {
+		memfs_node_t *node = &memfs_nodes[file->mem_index];
+		if (!node->used)
+			return -1;
+		memfs_apply_time(node, times_addr);
+	}
+	return 0;
 }
 
 /*
@@ -836,14 +1078,12 @@ file_t* file_open(char *path, uint32 open_mode)
 	}
 
 	int mem_idx = memfs_find(path);
+	if (fs_readonly_ext4 && mem_idx < 0 && (open_mode & FILE_OPEN_CREATE) &&
+		(want_w || memfs_should_fast_create(path))) {
+		mem_idx = memfs_create(path, false);
+	}
 	if (mem_idx >= 0)
 		return memfs_open_index(mem_idx, want_r, want_w, open_mode);
-	if (fs_readonly_ext4 && (open_mode & FILE_OPEN_CREATE) &&
-		memfs_should_fast_create(path)) {
-		mem_idx = memfs_create(path, false);
-		if (mem_idx >= 0)
-			return memfs_open_index(mem_idx, want_r, want_w, open_mode);
-	}
 
 	// 1. 先按路径找 inode
 	inode_t *ip = path_to_inode(path);
@@ -907,6 +1147,7 @@ void file_close(file_t *file)
         return;
 
 	inode_t *ip = NULL;
+	int mem_idx = -1;
 
 	spinlock_acquire(&lk_file_table);
 
@@ -925,6 +1166,8 @@ void file_close(file_t *file)
 
 	// 此时 ref == 0：回收槽位
 	ip = file->ip;
+	if (file->is_mem)
+		mem_idx = file->mem_index;
 	bool was_pipe = file->is_pipe;
 	pipe_t *pi = file->pipe;
 	bool was_socket = file->is_socket;
@@ -952,6 +1195,8 @@ void file_close(file_t *file)
 		pipe_close(pi, was_writable);
 	if (was_socket && so != NULL)
 		socket_file_close(so);
+	if (mem_idx >= 0)
+		memfs_maybe_reclaim_unlinked(mem_idx);
 
 	if (ip != NULL)
 		inode_put(ip); // 释放inode
@@ -1096,13 +1341,13 @@ uint32 file_write(file_t* file, uint32 len, uint64 src, bool is_user_src)
 	对于不合理的lseek_offset, 只做尽力而为的移动
 	返回新的file->offset
 */
-uint32 file_lseek(file_t *file, uint32 lseek_offset, uint32 lseek_flag)
+uint64 file_lseek(file_t *file, uint64 lseek_offset, uint32 lseek_flag)
 {
 	if (file == NULL)
         return 0;
 
-	int32 off = (int32)lseek_offset;
-	uint32 size = 0;
+	int64 off = (int64)lseek_offset;
+	uint64 size = 0;
 	if (file->is_mem && file->mem_index >= 0 && file->mem_index < MEMFS_NODES) {
 		size = memfs_nodes[file->mem_index].size;
 	} else if (file->ip != NULL) {
@@ -1115,21 +1360,21 @@ uint32 file_lseek(file_t *file, uint32 lseek_offset, uint32 lseek_flag)
 	switch (lseek_flag) {
 	case FILE_LSEEK_SET:
 		// 从文件开头开始计算
-		file->offset = off < 0 ? 0 : (uint32)off;
+		file->offset = off < 0 ? 0 : lseek_offset;
 		break;
 	case FILE_LSEEK_ADD:
 		// 从当前位置开始计算
-		if (off < 0 && file->offset < (uint32)(-off))
+		if (off < 0 && file->offset < (uint64)(-off))
 			file->offset = 0;
 		else
-			file->offset = (uint32)(file->offset + off);
+			file->offset = (uint64)(file->offset + off);
 		break;
 	case FILE_LSEEK_SUB:
 		// 从当前位置向前计算
-		if (off < 0 && size < (uint32)(-off))
+		if (off < 0 && size < (uint64)(-off))
 			file->offset = 0;
 		else
-			file->offset = (uint32)(size + off);
+			file->offset = (uint64)(size + off);
 		break;
 	default:
 		// 非法 flag：不做处理
@@ -1261,6 +1506,12 @@ uint32 file_get_stat_linux(file_t* file, uint64 user_dst)
 		st.st_ino = 0xE000 + file->mem_index;
 		st.st_size = node->size;
 		st.st_blocks = (st.st_size + 511) / 512;
+		st.st_atime_sec = node->atime_sec;
+		st.st_atime_nsec = node->atime_nsec;
+		st.st_mtime_sec = node->mtime_sec;
+		st.st_mtime_nsec = node->mtime_nsec;
+		st.st_ctime_sec = node->mtime_sec;
+		st.st_ctime_nsec = node->mtime_nsec;
 	} else if (file->is_device) {
 		st.st_mode  = 0020000 | 0666;   // S_IFCHR
 		st.st_nlink = 1;

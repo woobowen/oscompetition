@@ -32,6 +32,7 @@ SeaOS：华东师大·花狮小队，参加 oscomp 2026「OS 内核实现赛道�
 - 启动成功：`initcode: started`
 - 进入测试：`run /musl/unixbench_testcode.sh`
 - syscall 缺口：`unknown syscall N from pid = M`
+- 重要：`======== test end    ========` 是本项目 initcode/test wrapper 自己打印的收尾标记，只说明脚本走到某个收尾点；它不等于 testsuite 真实成功。历史日志中的旧误导性拼写也只应按同类 wrapper 标记理解。真实成功必须看 `testsuits-for-oskernel/` 中对应程序/脚本的实际输出和子项结果。若日志中仍有 `FAIL`、`[SEGV]`、`end: fail`、`Function not implemented`、`Interrupted system call`、panic 或子测试失败，就必须按真实缺口记录和修复，不能用 wrapper 的 `test end` 掩盖。
 
 ## 硬约束（违反即回退）
 1. 禁止让 `kernel-rv` 构建或运行回退；合并前用固定 docker 命令复跑确认无倒退。

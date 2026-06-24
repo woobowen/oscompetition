@@ -20,6 +20,7 @@
 #define SYS_print_cwd 17        // SeaOS print_cwd
 #define SYS_link 37             // Linux/RISC-V linkat
 #define SYS_unlink 35           // Linux/RISC-V unlinkat
+#define SYS_kill 129            // Linux/RISC-V kill
 
 #define SYS_schedstat 500       // SeaOS 私有: 拉取调度统计快照
 #define SYS_spawn 501           // SeaOS 私有: fork+exec+wait 串行执行程序

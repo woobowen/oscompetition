@@ -479,7 +479,7 @@ typedef struct file {
     int mem_index;       // mem overlay table index
     bool readable;      // 是否可读
     bool writbale;      // 是否可写
-    uint32 offset;      // 读/写指针的偏移量
+    uint64 offset;      // 读/写指针的偏移量
     uint32 ref;         // 引用数 (lk_file_table保护)
     bool is_pipe;       // 是否为管道
     struct pipe *pipe;  // 管道对象(is_pipe 时有效)
@@ -487,7 +487,7 @@ typedef struct file {
     socket_t *socket;   // socket object(is_socket 时有效)
 } file_t;
 
-#define N_FILE 1024      // file_table中file的数量
+#define N_FILE 4096      // file_table中file的数量
 
 typedef struct file_stat {
     uint16 type;        // inode_disk->type
