@@ -603,6 +603,8 @@ uint64 sys_clone()
     child->sig_restorer = parent->sig_restorer;
     child->sig_pending = 0;
     child->sig_mask = parent->sig_mask;
+    memset(child->sig_code, 0, sizeof(child->sig_code));
+    memset(child->sig_sender_pid, 0, sizeof(child->sig_sender_pid));
     child->sig_delivering = 0;
     child->group_exit_pending = 0;
     child->group_exit_code = 0;
@@ -717,7 +719,10 @@ uint64 sys_sleep()
 */
 uint64 sys_getpid()
 {
-    return (uint64)(myproc()->pid);
+    proc_t *p = myproc();
+    if (p->thread_group && p->vm_owner != NULL)
+        return (uint64)p->vm_owner->pid;
+    return (uint64)p->pid;
 }
 
 uint64 sys_gettid()
@@ -2144,7 +2149,11 @@ uint64 sys_rt_sigtimedwait()
                     break;
                 }
             }
+            int sig_code = p->sig_code[sig];
+            int sender_pid = p->sig_sender_pid[sig];
             p->sig_pending &= ~(1UL << (sig - 1));
+            p->sig_code[sig] = 0;
+            p->sig_sender_pid[sig] = 0;
             spinlock_release(&p->lk);
 
             if (info_addr != 0) {
@@ -2153,7 +2162,8 @@ uint64 sys_rt_sigtimedwait()
                 int *fields = (int *)info;
                 fields[0] = sig;  // si_signo
                 fields[1] = 0;    // si_errno
-                fields[2] = 0;    // si_code
+                fields[2] = sig_code;    // si_code
+                fields[4] = sender_pid;  // si_pid
                 uvm_copyout(p->pgtbl, info_addr, (uint64)info, sizeof(info));
             }
             return (uint64)sig;
@@ -2957,7 +2967,17 @@ uint64 sys_syslog()
     return 0;
 }
 
-static uint64 sys_signal_proc_locked(proc_t *p, int sig)
+static int signal_sender_tgid(void)
+{
+    proc_t *sender = myproc();
+    if (sender == NULL)
+        return 0;
+    if (sender->thread_group && sender->vm_owner != NULL)
+        return sender->vm_owner->pid;
+    return sender->pid;
+}
+
+static uint64 sys_signal_proc_locked(proc_t *p, int sig, int code, int sender_pid)
 {
     if (sig == 0) {
         spinlock_release(&p->lk);
@@ -2965,6 +2985,8 @@ static uint64 sys_signal_proc_locked(proc_t *p, int sig)
     }
     uint64 sig_bit = 1UL << (sig - 1);
     p->sig_pending |= sig_bit;
+    p->sig_code[sig] = code;
+    p->sig_sender_pid[sig] = sender_pid;
     if (p->state == SLEEPING && !(p->sig_mask & sig_bit)) {
         p->state = RUNNABLE;
         p->sleep_space = NULL;
@@ -2991,7 +3013,7 @@ uint64 sys_kill()
     proc_t *p = proc_get_by_pid(pid);
     if (p == NULL)
         return (uint64)(-ESRCH);
-    return sys_signal_proc_locked(p, sig);
+    return sys_signal_proc_locked(p, sig, SI_USER, signal_sender_tgid());
 }
 
 uint64 sys_tkill()
@@ -3005,7 +3027,7 @@ uint64 sys_tkill()
     proc_t *p = proc_get_by_pid(tid);
     if (p == NULL)
         return (uint64)(-ESRCH);
-    return sys_signal_proc_locked(p, sig);
+    return sys_signal_proc_locked(p, sig, SI_TKILL, signal_sender_tgid());
 }
 
 uint64 sys_tgkill()
@@ -3025,7 +3047,7 @@ uint64 sys_tgkill()
         spinlock_release(&p->lk);
         return (uint64)(-ESRCH);
     }
-    return sys_signal_proc_locked(p, sig);
+    return sys_signal_proc_locked(p, sig, SI_TKILL, signal_sender_tgid());
 }
 
 // 179 sysinfo(struct sysinfo *info): 绯荤粺淇℃伅銆傛渶灏忔々: 闆跺～鍏呫€?

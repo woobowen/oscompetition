@@ -111,6 +111,8 @@ void trap_user_handler()
                 if (res == (uint64)-1) {
                     if (!p->sig_delivering && p->sig_handler[SIGSEGV] > 1) {
                         p->sig_pending |= (1UL << (SIGSEGV - 1));
+                        p->sig_code[SIGSEGV] = SEGV_MAPERR;
+                        p->sig_sender_pid[SIGSEGV] = 0;
                         break;
                     }
                     printf("[SEGV] pid=%d t=%d pc=%p stval=%p gp=%p tp=%p sp=%p ra=%p\n",
@@ -139,6 +141,8 @@ void trap_user_handler()
                 continue;
             if (p->sig_handler[sig] == 1) {
                 p->sig_pending &= ~(1UL << (sig - 1));
+                p->sig_code[sig] = 0;
+                p->sig_sender_pid[sig] = 0;
                 continue;
             }
             if (p->sig_handler[sig] == 0) {
@@ -146,10 +150,16 @@ void trap_user_handler()
                     sig == SIGABRT || sig == SIGSEGV || sig == SIGBUS)
                     fatal_signal_exit(sig);
                 p->sig_pending &= ~(1UL << (sig - 1));
+                p->sig_code[sig] = 0;
+                p->sig_sender_pid[sig] = 0;
                 continue;
             }
 
+            int sig_code = p->sig_code[sig];
+            int sender_pid = p->sig_sender_pid[sig];
             p->sig_pending &= ~(1UL << (sig - 1));
+            p->sig_code[sig] = 0;
+            p->sig_sender_pid[sig] = 0;
             p->sig_delivering = 1;
 
             uint64 frame[RISCV_SIGNAL_FRAME_WORDS];
@@ -197,8 +207,8 @@ void trap_user_handler()
             memset(ucontext, 0, sizeof(ucontext));
             int *si_fields = (int *)siginfo;
             si_fields[0] = sig;
-            si_fields[2] = -6;
-            si_fields[4] = p->pid;
+            si_fields[2] = sig_code;
+            si_fields[4] = sender_pid;
             /* musl riscv64 ucontext_t places mcontext after
              * uc_flags, uc_link, uc_stack and uc_sigmask. */
             *(uint64 *)(ucontext + RISCV_UCONTEXT_SIGMASK_OFFSET) = p->sig_mask;

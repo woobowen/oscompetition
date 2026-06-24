@@ -67,13 +67,13 @@
 | 122 | sched_setaffinity | 单核兼容 |
 | 123 | sched_getaffinity | 单核 mask bit0=1 |
 | 124 | sched_yield | 调用 proc_yield |
-| 129 | kill | 最小 pid/signal 校验；有效目标返回成功 |
-| 130 | tkill | 最小线程 signal 兼容 |
-| 131 | tgkill | 最小线程组 signal 兼容 |
+| 129 | kill | 最小 pid/signal 校验；记录 `SI_USER`/sender pid |
+| 130 | tkill | 最小线程 signal 兼容；记录 `SI_TKILL`/sender tgid |
+| 131 | tgkill | 最小线程组 signal 兼容；记录 `SI_TKILL`/sender tgid |
 | 133 | rt_sigsuspend | 最小让出 CPU |
 | 134 | rt_sigaction | 读 musl sigaction，存 handler/restorer |
 | 135 | rt_sigprocmask | 桩，返回 0 |
-| 137 | rt_sigtimedwait | 最小 pending-signal 等待；支持 libctest SIGCHLD wrapper |
+| 137 | rt_sigtimedwait | 最小 pending-signal 等待；返回已记录的 `si_code`/`si_pid` |
 | 139 | rt_sigreturn | 从用户栈恢复 signal frame |
 | 144 | setgid | 桩，返回 0 |
 | 146 | setuid | 桩，返回 0 |
@@ -86,13 +86,13 @@
 | 165 | getrusage | 零填充桩 |
 | 166 | umask | 桩，返回 0 |
 | 169 | gettimeofday | |
-| 172 | getpid | |
+| 172 | getpid | `CLONE_THREAD` 成员返回 thread-group leader pid |
 | 173 | getppid | |
 | 174 | getuid | 返回 0 (root) |
 | 175 | geteuid | 返回 0 (root) |
 | 176 | getgid | 返回 0 |
 | 177 | getegid | 返回 0 |
-| 178 | gettid | 单线程 = pid |
+| 178 | gettid | 返回当前线程 id；单线程 = pid |
 | 179 | sysinfo | 零填充 112B，uptime 填入 |
 | 194 | shmget | SysV SHM 最小段分配，供 glibc/ltp 探测 |
 | 195 | shmctl | SysV SHM `IPC_STAT`/`IPC_RMID` 最小兼容 |
@@ -400,3 +400,15 @@ Output note: `/dev/stderr` now writes bytes unchanged instead of prefixing every
 | 260 | wait4 | Returns `-ECHILD` when no matching child exists; only unblocked pending signals interrupt waits; `SIGCHLD` wakes and rescans for zombies. |
 
 This closes the false `EPERM` userland decode caused by returning bare `(uint64)-1` from `wait4`, and prevents masked pending signals from spuriously becoming `EINTR`.
+
+## 2026-06-24 status update: signal `siginfo_t` source metadata
+
+| No. | Name | Current semantics |
+|---|---|---|
+| 129 | kill | Sets a pending signal and records `SI_USER` plus the sender pid/tgid for later delivery. |
+| 130 | tkill | Sets a pending thread signal and records `SI_TKILL` plus the sender thread-group id. |
+| 131 | tgkill | Validates tgid/tid relationship, sets the pending thread signal, and records `SI_TKILL` plus sender tgid. |
+| 137 | rt_sigtimedwait | Consumes one pending matching signal and copies stored `si_code`/`si_pid` into the optional `siginfo_t`. |
+| 172/178 | getpid/gettid | `getpid` returns the thread-group leader for `CLONE_THREAD` members; `gettid` remains the per-thread id. |
+
+The retained implementation keeps the existing SeaOS RISC-V signal-frame layout. A Linux-shaped frame/VDSO experiment was rejected after it regressed `libctest-musl`; future static glibc cancellation work should implement signal-unwind compatibility explicitly instead of silently changing the frame contract.

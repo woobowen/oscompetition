@@ -498,6 +498,8 @@ proc_t *proc_alloc()
             p->sig_restorer = 0;
             p->sig_pending = 0;
             p->sig_mask = 0;
+            memset(p->sig_code, 0, sizeof(p->sig_code));
+            memset(p->sig_sender_pid, 0, sizeof(p->sig_sender_pid));
             p->sig_delivering = 0;
             p->group_exit_pending = 0;
             p->group_exit_code = 0;
@@ -610,6 +612,8 @@ void proc_free(proc_t *p)
     p->sig_restorer = 0;
     p->sig_pending = 0;
     p->sig_mask = 0;
+    memset(p->sig_code, 0, sizeof(p->sig_code));
+    memset(p->sig_sender_pid, 0, sizeof(p->sig_sender_pid));
     p->sig_delivering = 0;
     p->group_exit_pending = 0;
     p->group_exit_code = 0;
@@ -822,6 +826,8 @@ int proc_fork_with_stack(uint64 child_stack)
     child->sig_restorer = parent->sig_restorer;
     child->sig_pending = 0;
     child->sig_mask = parent->sig_mask;
+    memset(child->sig_code, 0, sizeof(child->sig_code));
+    memset(child->sig_sender_pid, 0, sizeof(child->sig_sender_pid));
     child->sig_delivering = 0;
     child->group_exit_pending = 0;
     child->group_exit_code = 0;
@@ -1293,8 +1299,11 @@ static void proc_try_wakeup(proc_t *p)
     spinlock_acquire(&parent->lk);
     bool thread_exit = p->shared_vm && p->thread_group;
     bool sigchld = !thread_exit && parent->sig_handler[SIGCHLD] > 1;
-    if (sigchld)
+    if (sigchld) {
         parent->sig_pending |= (1UL << (SIGCHLD - 1));
+        parent->sig_code[SIGCHLD] = CLD_EXITED;
+        parent->sig_sender_pid[SIGCHLD] = p->pid;
+    }
     if (parent->state == SLEEPING && (parent->sleep_space == parent || sigchld)) {
         parent->state = RUNNABLE;
         parent->sleep_space = NULL;
@@ -1321,6 +1330,8 @@ void proc_check_itimers(uint64 now)
         if (p->state != UNUSED && p->state != ZOMBIE && p->itimer_expire != 0 &&
             now >= p->itimer_expire) {
             p->sig_pending |= (1UL << (SIGALRM - 1));
+            p->sig_code[SIGALRM] = SI_KERNEL;
+            p->sig_sender_pid[SIGALRM] = 0;
             if (p->itimer_interval != 0)
                 p->itimer_expire = now + p->itimer_interval;
             else
@@ -1510,8 +1521,11 @@ static int proc_wait_pending_interrupt(proc_t *parent)
     spinlock_acquire(&parent->lk);
     uint64 pending = parent->sig_pending & ~parent->sig_mask;
     int consumed_sigchld = (pending & sigchld_bit) != 0;
-    if (consumed_sigchld)
+    if (consumed_sigchld) {
         parent->sig_pending &= ~sigchld_bit;
+        parent->sig_code[SIGCHLD] = 0;
+        parent->sig_sender_pid[SIGCHLD] = 0;
+    }
     int interrupted = (pending & ~sigchld_bit) != 0;
     spinlock_release(&parent->lk);
     if (interrupted)
@@ -1525,6 +1539,8 @@ static void proc_wait_clear_sigchld(proc_t *parent)
 
     spinlock_acquire(&parent->lk);
     parent->sig_pending &= ~sigchld_bit;
+    parent->sig_code[SIGCHLD] = 0;
+    parent->sig_sender_pid[SIGCHLD] = 0;
     spinlock_release(&parent->lk);
 }
 

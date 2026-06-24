@@ -120,6 +120,11 @@ enum proc_state
 #define SIGCHLD     17
 #define SA_SIGINFO   4
 #define SA_RESTORER 0x04000000
+#define SI_USER      0
+#define SI_TKILL    -6
+#define SI_KERNEL  128
+#define CLD_EXITED   1
+#define SEGV_MAPERR  1
 
 #define PROC_NAME_LEN 16
 
@@ -203,6 +208,8 @@ typedef struct proc
     uint64 sig_restorer;          // musl 设置的 sa_restorer (调用 rt_sigreturn)
     uint64 sig_pending;           // 待投递信号位图 (bit N-1 = signal N)
     uint64 sig_mask;              // 当前线程信号屏蔽字 (bit N-1 = signal N)
+    int sig_code[NSIG + 1];       // si_code for pending signal delivery
+    int sig_sender_pid[NSIG + 1]; // si_pid for pending signal delivery
     uint8  sig_delivering;        // 正在投递信号中(防嵌套)
     uint8 group_exit_pending;      // internal exit_group request for CLONE_VM threads
     int group_exit_code;           // exit code used by group_exit_pending
