@@ -449,6 +449,7 @@ typedef struct dentry {
 #define FILE_OPEN_WRITE  0x04  // 打开文件时, 要求文件可写
 #define FILE_OPEN_APPEND 0x08  // append writes at end
 #define FILE_OPEN_TRUNC  0x10  // truncate existing file on open
+#define FILE_OPEN_PATH   0x20  // Linux O_PATH: closeable path-only fd
 
 #define FILE_LSEEK_SET   0     // file->offset = lseek_offset
 #define FILE_LSEEK_ADD   1     // file->offset += lseek_offset
@@ -475,6 +476,7 @@ typedef struct file {
     bool is_proc;        // in-memory /proc node
     uint16 proc_kind;    // proc node type
     int proc_pid;        // pid for /proc/<pid> nodes
+    bool is_path;        // Linux O_PATH descriptor, no read/write operations
     bool is_mem;         // small writable in-memory overlay node
     int mem_index;       // mem overlay table index
     bool readable;      // 是否可读

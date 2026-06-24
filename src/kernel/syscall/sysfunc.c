@@ -1,5 +1,7 @@
 #include "mod.h"
 
+static int user_fixed_range(uint64 addr, uint64 len);
+
 /*
     鐢ㄦ埛鍫嗙┖闂翠几缂?    uint64 new_heap_top (濡傛灉鏄?, 浠ｈ〃鏌ヨ褰撳墠鍫嗛《浣嶇疆)
     鎴愬姛杩斿洖new_heap_top, 澶辫触杩斿洖-1
@@ -549,6 +551,10 @@ uint64 sys_clone()
 
     child->tf = tf;
     child->parent = parent;
+    child->uid = parent->uid;
+    child->euid = parent->euid;
+    child->gid = parent->gid;
+    child->egid = parent->egid;
     child->exit_code = 0;
     child->pgtbl = proc_pgtbl_init((uint64)tf);
     if (!child->pgtbl) {
@@ -1007,7 +1013,11 @@ static uint32 alloc_fd(file_t *file)
 
 static uint32 linux_open_flags_to_file_mode(uint32 flags)
 {
+    const uint32 LINUX_O_PATH = 0x200000U;
     uint32 open_mode = 0;
+
+    if (flags & LINUX_O_PATH)
+        return FILE_OPEN_PATH;
 
     switch (flags & 3U) {
     case 0:
@@ -1032,7 +1042,7 @@ static uint32 linux_open_flags_to_file_mode(uint32 flags)
 
 static bool looks_like_linux_open_flags(uint32 flags)
 {
-    return (flags & (64U | 512U | 1024U | 0x800U | 0x80000U)) != 0;
+    return (flags & (64U | 512U | 1024U | 0x800U | 0x80000U | 0x200000U)) != 0;
 }
 
 static uint64 sys_file_rw_errno(file_t *file, int writing)
@@ -1053,10 +1063,14 @@ static uint64 sys_open_failure_errno(char *path, uint32 open_mode)
 {
     if (path == NULL || path[0] == 0)
         return (uint64)(-ENOENT);
-    if ((open_mode & (FILE_OPEN_READ | FILE_OPEN_WRITE)) == 0)
+    if ((open_mode & FILE_OPEN_PATH) == 0 &&
+        (open_mode & (FILE_OPEN_READ | FILE_OPEN_WRITE)) == 0)
         return (uint64)(-EINVAL);
 
     bool want_w = (open_mode & FILE_OPEN_WRITE) != 0;
+    if ((want_w || (open_mode & (FILE_OPEN_CREATE | FILE_OPEN_TRUNC))) &&
+        memfs_is_readonly(path))
+        return (uint64)(-EROFS);
     if (memfs_path_is_dir(path))
         return want_w ? (uint64)(-EISDIR) : (uint64)(-EACCES);
 
@@ -1558,14 +1572,13 @@ uint64 sys_get_dentries()
 uint64 sys_mkdir()
 {
     char path[STR_MAXLEN + 1];
+    uint32 mode = 0777;
     if (arg_raw(1) != 0 || arg_raw(2) != 0) {
         uint64 dirfd;
-        uint32 mode;
         arg_uint64(0, &dirfd);
         arg_str(1, path, STR_MAXLEN);
         arg_uint32(2, &mode);
         (void)dirfd;
-        (void)mode;
     } else {
         arg_str(0, path, STR_MAXLEN);
     }
@@ -1575,7 +1588,7 @@ uint64 sys_mkdir()
         inode_put(exists);
         return (uint64)(-EEXIST);
     }
-    if (memfs_mkdir(path) == 0)
+    if (memfs_mkdir_mode(path, mode) == 0)
         return 0;
 
     inode_t *ip = path_create_inode(path,INODE_TYPE_DIR, 0, 0);
@@ -1651,10 +1664,11 @@ uint64 sys_mount()
     uint64 fstype_addr = arg_raw(2);
     uint64 flags = arg_raw(3);
     uint64 data_addr = arg_raw(4);
+    const uint64 MS_RDONLY = 1;
+    const uint64 MS_REMOUNT = 32;
     char target[STR_MAXLEN + 1];
     (void)source_addr;
     (void)fstype_addr;
-    (void)flags;
     (void)data_addr;
 
     if (target_addr == 0)
@@ -1662,6 +1676,10 @@ uint64 sys_mount()
     arg_str(1, target, STR_MAXLEN);
     if (target[0] == 0)
         return (uint64)(-ENOENT);
+    if (flags & MS_REMOUNT)
+        memfs_mark_readonly(target, (flags & MS_RDONLY) != 0);
+    else if (flags & MS_RDONLY)
+        memfs_mark_readonly(target, 1);
     return 0;
 }
 
@@ -1678,6 +1696,7 @@ uint64 sys_umount2()
     arg_str(0, target, STR_MAXLEN);
     if (target[0] == 0)
         return (uint64)(-ENOENT);
+    memfs_mark_readonly(target, 0);
     return 0;
 }
 
@@ -1728,6 +1747,41 @@ uint64 sys_spawn()
     char *new_path
     鎴愬姛杩斿洖0, 澶辫触杩斿洖-1
 */
+// 36 symlinkat(target, newdirfd, linkpath): create a memfs symbolic link.
+uint64 sys_symlinkat()
+{
+    uint64 target_addr = arg_raw(0);
+    int newdirfd = (int)arg_raw(1);
+    uint64 link_addr = arg_raw(2);
+    char target[STR_MAXLEN + 1];
+    char link_path[STR_MAXLEN + 1];
+    (void)newdirfd;
+
+    if (target_addr == 0 || link_addr == 0 ||
+        !user_fixed_range(target_addr, 1) || !user_fixed_range(link_addr, 1))
+        return (uint64)(-EFAULT);
+
+    memset(target, 0, sizeof(target));
+    memset(link_path, 0, sizeof(link_path));
+    arg_str(0, target, STR_MAXLEN);
+    arg_str(2, link_path, STR_MAXLEN);
+    if (target[STR_MAXLEN - 1] != 0 || link_path[STR_MAXLEN - 1] != 0)
+        return (uint64)(-ENAMETOOLONG);
+    if (target[0] == 0 || link_path[0] == 0)
+        return (uint64)(-ENOENT);
+    if (procfs_path_exists(link_path))
+        return (uint64)(-EEXIST);
+
+    inode_t *ip = path_to_inode(link_path);
+    if (ip != NULL) {
+        inode_put(ip);
+        return (uint64)(-EEXIST);
+    }
+
+    int ret = memfs_symlink(target, link_path);
+    return ret < 0 ? (uint64)ret : 0;
+}
+
 uint64 sys_link()
 {
     char old_path[STR_MAXLEN + 1], new_path[STR_MAXLEN + 1];
@@ -1911,9 +1965,26 @@ static file_t *open_busybox_for_applet_stat(char *path)
 uint64 sys_faccessat()
 {
     char path[STR_MAXLEN + 1];
+    uint64 path_addr = arg_raw(1);
+    int mode = (int)arg_raw(2);
+
+    if (path_addr == 0 || !user_fixed_range(path_addr, 1))
+        return (uint64)(-EFAULT);
+    if ((mode & ~7) != 0)
+        return (uint64)(-EINVAL);
+    memset(path, 0, sizeof(path));
     arg_str(1, path, STR_MAXLEN);
-    if (procfs_path_exists(path) || memfs_path_exists(path))
+    if (path[STR_MAXLEN - 1] != 0)
+        return (uint64)(-ENAMETOOLONG);
+    if (path[0] == 0)
+        return (uint64)(-ENOENT);
+    if (procfs_path_exists(path))
         return 0;
+    int mem_access = memfs_access(path, mode, myproc()->euid, myproc()->egid);
+    if (mem_access == 0)
+        return 0;
+    if (mem_access != -ENOENT)
+        return (uint64)mem_access;
     uint32 len = (uint32)strlen(path);
     if ((len == 2 && path[0] == 'l' && path[1] == 's') ||
         (len >= 3 && path[len - 3] == '/' && path[len - 2] == 'l' && path[len - 1] == 's'))
@@ -1941,7 +2012,9 @@ uint64 sys_fchmodat()
     arg_str(1, path, STR_MAXLEN);
     if (path[0] == 0)
         return (uint64)(-ENOENT);
-    if (procfs_path_exists(path) || memfs_path_exists(path))
+    if (procfs_path_exists(path))
+        return 0;
+    if (memfs_chmod(path, (uint32)mode) == 0)
         return 0;
     inode_t *ip = path_to_inode(path);
     if (ip == NULL)
@@ -1963,9 +2036,6 @@ uint64 sys_fchownat()
     uint64 group = arg_raw(3);
     uint32 flags = (uint32)arg_raw(4);
     char path[STR_MAXLEN + 1];
-    (void)owner;
-    (void)group;
-
     if (flags & ~(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW))
         return (uint64)(-EINVAL);
     if (path_addr == 0)
@@ -1981,7 +2051,9 @@ uint64 sys_fchownat()
         return 0;
     }
 
-    if (procfs_path_exists(path) || memfs_path_exists(path))
+    if (procfs_path_exists(path))
+        return 0;
+    if (memfs_chown(path, (uint32)owner, (uint32)group) == 0)
         return 0;
     inode_t *ip = path_to_inode(path);
     if (ip == NULL)
@@ -2040,9 +2112,33 @@ uint64 sys_unlink()
     return (uint64)(-ENOENT);
 }
 
-// 174 getuid / 176 getgid锛氬綋鍓嶆棤澶氱敤鎴? 涓€寰?root
-uint64 sys_getuid() { return 0; }
-uint64 sys_getgid() { return 0; }
+static int cred_can_set_uid(proc_t *p, uint32 id)
+{
+    return p != NULL && (p->euid == 0 || id == p->uid || id == p->euid);
+}
+
+static int cred_can_set_gid(proc_t *p, uint32 id)
+{
+    return p != NULL && (p->egid == 0 || id == p->gid || id == p->egid);
+}
+
+static int cred_arg_is_keep(uint64 raw)
+{
+    return (uint32)raw == (uint32)-1;
+}
+
+// 174 getuid / 176 getgid: return the current minimal process credentials.
+uint64 sys_getuid()
+{
+    proc_t *p = myproc();
+    return p == NULL ? 0 : p->uid;
+}
+
+uint64 sys_getgid()
+{
+    proc_t *p = myproc();
+    return p == NULL ? 0 : p->gid;
+}
 
 // 135 rt_sigprocmask(how,set,oldset,sigsetsize)锛氭殏涓嶅仛淇″彿, 杩斿洖鎴愬姛
 uint64 sys_rt_sigsuspend()
@@ -2177,9 +2273,115 @@ uint64 sys_rt_sigtimedwait()
     }
 }
 
-// 144 setgid / 146 setuid锛氬崟鐢ㄦ埛鐜, 瑙嗕綔鎴愬姛 no-op
-uint64 sys_setgid() { return 0; }
-uint64 sys_setuid() { return 0; }
+// 143 setregid(rgid, egid): minimal credential state for libc/LTP.
+uint64 sys_setregid()
+{
+    proc_t *p = myproc();
+    uint64 rgid = arg_raw(0);
+    uint64 egid = arg_raw(1);
+    if (p == NULL)
+        return (uint64)(-EINVAL);
+    if (!cred_arg_is_keep(rgid) && !cred_can_set_gid(p, (uint32)rgid))
+        return (uint64)(-EPERM);
+    if (!cred_arg_is_keep(egid) && !cred_can_set_gid(p, (uint32)egid))
+        return (uint64)(-EPERM);
+    if (!cred_arg_is_keep(rgid))
+        p->gid = (uint32)rgid;
+    if (!cred_arg_is_keep(egid))
+        p->egid = (uint32)egid;
+    return 0;
+}
+
+// 144 setgid(gid): root may switch real/effective gid; non-root may keep own ids.
+uint64 sys_setgid()
+{
+    proc_t *p = myproc();
+    uint32 gid = (uint32)arg_raw(0);
+    if (p == NULL)
+        return (uint64)(-EINVAL);
+    if (!cred_can_set_gid(p, gid))
+        return (uint64)(-EPERM);
+    p->gid = gid;
+    p->egid = gid;
+    return 0;
+}
+
+// 145 setreuid(ruid, euid): minimal credential state for libc/LTP.
+uint64 sys_setreuid()
+{
+    proc_t *p = myproc();
+    uint64 ruid = arg_raw(0);
+    uint64 euid = arg_raw(1);
+    if (p == NULL)
+        return (uint64)(-EINVAL);
+    if (!cred_arg_is_keep(ruid) && !cred_can_set_uid(p, (uint32)ruid))
+        return (uint64)(-EPERM);
+    if (!cred_arg_is_keep(euid) && !cred_can_set_uid(p, (uint32)euid))
+        return (uint64)(-EPERM);
+    if (!cred_arg_is_keep(ruid))
+        p->uid = (uint32)ruid;
+    if (!cred_arg_is_keep(euid))
+        p->euid = (uint32)euid;
+    return 0;
+}
+
+// 146 setuid(uid): root switches real/effective uid; non-root may keep own ids.
+uint64 sys_setuid()
+{
+    proc_t *p = myproc();
+    uint32 uid = (uint32)arg_raw(0);
+    if (p == NULL)
+        return (uint64)(-EINVAL);
+    if (!cred_can_set_uid(p, uid))
+        return (uint64)(-EPERM);
+    p->uid = uid;
+    p->euid = uid;
+    return 0;
+}
+
+// 147 setresuid(ruid, euid, suid): store real/effective ids; saved uid is not modeled.
+uint64 sys_setresuid()
+{
+    proc_t *p = myproc();
+    uint64 ruid = arg_raw(0);
+    uint64 euid = arg_raw(1);
+    uint64 suid = arg_raw(2);
+    if (p == NULL)
+        return (uint64)(-EINVAL);
+    if (!cred_arg_is_keep(ruid) && !cred_can_set_uid(p, (uint32)ruid))
+        return (uint64)(-EPERM);
+    if (!cred_arg_is_keep(euid) && !cred_can_set_uid(p, (uint32)euid))
+        return (uint64)(-EPERM);
+    if (!cred_arg_is_keep(suid) && !cred_can_set_uid(p, (uint32)suid))
+        return (uint64)(-EPERM);
+    if (!cred_arg_is_keep(ruid))
+        p->uid = (uint32)ruid;
+    if (!cred_arg_is_keep(euid))
+        p->euid = (uint32)euid;
+    return 0;
+}
+
+// 149 setresgid(rgid, egid, sgid): store real/effective gids; saved gid is not modeled.
+uint64 sys_setresgid()
+{
+    proc_t *p = myproc();
+    uint64 rgid = arg_raw(0);
+    uint64 egid = arg_raw(1);
+    uint64 sgid = arg_raw(2);
+    if (p == NULL)
+        return (uint64)(-EINVAL);
+    if (!cred_arg_is_keep(rgid) && !cred_can_set_gid(p, (uint32)rgid))
+        return (uint64)(-EPERM);
+    if (!cred_arg_is_keep(egid) && !cred_can_set_gid(p, (uint32)egid))
+        return (uint64)(-EPERM);
+    if (!cred_arg_is_keep(sgid) && !cred_can_set_gid(p, (uint32)sgid))
+        return (uint64)(-EPERM);
+    if (!cred_arg_is_keep(rgid))
+        p->gid = (uint32)rgid;
+    if (!cred_arg_is_keep(egid))
+        p->egid = (uint32)egid;
+    return 0;
+}
 
 // 79 newfstatat(dirfd, path, statbuf, flags)
 uint64 sys_newfstatat()
@@ -2600,6 +2802,8 @@ static int arg_socket_fd(int n, socket_t **out)
 {
     file_t *file;
     if (arg_fd(n, NULL, &file) < 0)
+        return -EBADF;
+    if (file->is_path)
         return -EBADF;
     if (!file->is_socket || file->socket == NULL)
         return -ENOTSOCK;
@@ -3063,6 +3267,79 @@ uint64 sys_sysinfo()
     return 0;
 }
 
+// 89 acct(path): process accounting is not configured in SeaOS.
+uint64 sys_acct()
+{
+    return (uint64)(-ENOSYS);
+}
+
+static int user_fixed_range(uint64 addr, uint64 len)
+{
+    return addr >= USER_BASE && addr + len >= addr && addr + len <= TRAPFRAME;
+}
+
+// 171 adjtimex(buf): minimal clock-adjustment compatibility.
+uint64 sys_adjtimex()
+{
+    uint64 buf_addr = arg_raw(0);
+    const uint32 ADJ_OFFSET = 0x0001U;
+    const uint32 ADJ_FREQUENCY = 0x0002U;
+    const uint32 ADJ_MAXERROR = 0x0004U;
+    const uint32 ADJ_ESTERROR = 0x0008U;
+    const uint32 ADJ_STATUS = 0x0010U;
+    const uint32 ADJ_TIMECONST = 0x0020U;
+    const uint32 ADJ_TAI = 0x0080U;
+    const uint32 ADJ_SETOFFSET = 0x0100U;
+    const uint32 ADJ_MICRO = 0x1000U;
+    const uint32 ADJ_NANO = 0x2000U;
+    const uint32 ADJ_TICK = 0x4000U;
+    const uint32 ADJ_OFFSET_SINGLESHOT = 0x8001U;
+    const uint32 ADJ_OFFSET_SS_READ = 0xa001U;
+    const uint32 ADJ_VALID = ADJ_OFFSET | ADJ_FREQUENCY | ADJ_MAXERROR |
+        ADJ_ESTERROR | ADJ_STATUS | ADJ_TIMECONST | ADJ_TAI |
+        ADJ_SETOFFSET | ADJ_MICRO | ADJ_NANO | ADJ_TICK;
+    const uint64 TIMEX_TICK_OFFSET = 88;
+    const uint64 TIMEX_MIN_SIZE = TIMEX_TICK_OFFSET + sizeof(uint64);
+
+    if (!user_fixed_range(buf_addr, TIMEX_MIN_SIZE))
+        return (uint64)(-EFAULT);
+
+    uint32 modes = 0;
+    uvm_copyin(myproc()->pgtbl, (uint64)&modes, buf_addr, sizeof(modes));
+    if (modes != ADJ_OFFSET_SINGLESHOT && modes != ADJ_OFFSET_SS_READ &&
+        (modes & ~ADJ_VALID) != 0)
+        return (uint64)(-EINVAL);
+    if (modes != 0 && myproc()->euid != 0)
+        return (uint64)(-EPERM);
+
+    if (modes & ADJ_TICK) {
+        uint64 tick = 0;
+        uvm_copyin(myproc()->pgtbl, (uint64)&tick,
+                   buf_addr + TIMEX_TICK_OFFSET, sizeof(tick));
+        if (tick < 9000 || tick > 11000)
+            return (uint64)(-EINVAL);
+    }
+
+    uint32 zero_modes = 0;
+    uint64 tick = 10000;
+    uvm_copyout(myproc()->pgtbl, buf_addr, (uint64)&zero_modes, sizeof(zero_modes));
+    uvm_copyout(myproc()->pgtbl, buf_addr + TIMEX_TICK_OFFSET,
+                (uint64)&tick, sizeof(tick));
+    return 0;
+}
+
+// 217 add_key(...): Linux key retention service is unsupported.
+uint64 sys_add_key()
+{
+    return (uint64)(-ENOSYS);
+}
+
+// 219 keyctl(...): Linux key retention service is unsupported.
+uint64 sys_keyctl()
+{
+    return (uint64)(-ENOSYS);
+}
+
 // 233 madvise(addr, length, advice): 鍐呭瓨寤鸿銆傛々杩斿洖 0銆?
 uint64 sys_madvise()
 {
@@ -3072,12 +3349,37 @@ uint64 sys_madvise()
 // 78 readlinkat(dirfd, pathname, buf, bufsiz): 璇诲彇绗﹀彿閾炬帴銆?// 鐗规畩澶勭悊 /proc/self/exe 杩斿洖杩涚▼璺緞銆傚叾浣欒繑鍥?EINVAL銆?
 uint64 sys_readlinkat()
 {
-    char path[128];
-    arg_str(1, path, sizeof(path));
-    if (path[0] == 0) return (uint64)(-EINVAL);
+    char path[STR_MAXLEN + 1];
+    char target_buf[STR_MAXLEN + 1];
+    uint64 path_addr = arg_raw(1);
+    uint64 buf = arg_raw(2);
+    uint64 size = arg_raw(3);
+
+    if (path_addr == 0 || !user_fixed_range(path_addr, 1))
+        return (uint64)(-EFAULT);
+    if (size == 0)
+        return (uint64)(-EINVAL);
+    if (buf == 0 || !user_fixed_range(buf, size))
+        return (uint64)(-EFAULT);
+
+    memset(path, 0, sizeof(path));
+    arg_str(1, path, STR_MAXLEN);
+    if (path[STR_MAXLEN - 1] != 0)
+        return (uint64)(-ENAMETOOLONG);
+    if (path[0] == 0)
+        return (uint64)(-ENOENT);
+
+    int ret = memfs_readlink(path, target_buf, sizeof(target_buf));
+    if (ret >= 0) {
+        uint64 n = (uint64)ret;
+        if (n > size)
+            n = size;
+        if (n > 0)
+            uvm_copyout(myproc()->pgtbl, buf, (uint64)target_buf, n);
+        return n;
+    }
+
     if (strncmp(path, "/proc/self/exe", 15) == 0) {
-        uint64 buf = arg_raw(2);
-        uint64 size = arg_raw(3);
         const char *target = "/busybox";
         uint64 n = strlen(target);
         if (n > size)
@@ -3086,7 +3388,7 @@ uint64 sys_readlinkat()
             uvm_copyout(myproc()->pgtbl, buf, (uint64)target, n);
         return n;
     }
-    return (uint64)(-EINVAL);
+    return (uint64)ret;
 }
 
 // 124 sched_yield(): 璁╁嚭 CPU銆?
@@ -3171,13 +3473,15 @@ uint64 sys_get_mempolicy()
 // 177 getegid: 杩斿洖鏈夋晥 GID (root=0)
 uint64 sys_getegid()
 {
-    return 0;
+    proc_t *p = myproc();
+    return p == NULL ? 0 : p->egid;
 }
 
 // 175 geteuid: 杩斿洖鏈夋晥 UID (root=0)
 uint64 sys_geteuid()
 {
-    return 0;
+    proc_t *p = myproc();
+    return p == NULL ? 0 : p->euid;
 }
 
 #define RISCV_SIGINFO_SIZE 128

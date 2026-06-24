@@ -134,6 +134,10 @@ typedef struct proc
 {
     int pid;               // 标识符
     char name[PROC_NAME_LEN]; // 进程名称
+    uint32 uid;            // real user id
+    uint32 euid;           // effective user id
+    uint32 gid;            // real group id
+    uint32 egid;           // effective group id
 
     spinlock_t lk;         // 自旋锁, 保护下面4个字段
     enum proc_state state; // 进程状态

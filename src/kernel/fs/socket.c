@@ -519,7 +519,15 @@ int socket_accept(socket_t *listener, uint64 user_addr, uint64 user_addrlen, int
     file_t *file;
 
     spinlock_acquire(&socket_lk);
-    if (listener == NULL || !listener->used || listener->state != SOCK_LISTEN) {
+    if (listener == NULL || !listener->used) {
+        spinlock_release(&socket_lk);
+        return -ENOTSOCK;
+    }
+    if (listener->type != SOCK_STREAM_LOCAL) {
+        spinlock_release(&socket_lk);
+        return -EOPNOTSUPP;
+    }
+    if (listener->state != SOCK_LISTEN) {
         spinlock_release(&socket_lk);
         return -EINVAL;
     }

@@ -1,5 +1,6 @@
 #include "mod.h"
 #include "../arch/method.h"
+#include "../lib/errno.h"
 
 super_block_t sb; /* 超级块 */
 static bool fs_readonly_ext4;
@@ -14,11 +15,13 @@ enum {
 	PROC_SELF,
 	PROC_SELF_EXE,
 	PROC_SELF_FD,
+	PROC_SELF_MAPS,
 	PROC_PID_DIR,
 	PROC_PID_STAT,
 	PROC_PID_CMDLINE,
 	PROC_PID_COMM,
 	PROC_PID_STATUS,
+	PROC_PID_MAPS,
 };
 
 static bool streq(const char *a, const char *b)
@@ -108,6 +111,11 @@ static int procfs_lookup(char *path, uint16 *kind, int *pid)
 		*pid = myproc() ? myproc()->pid : 1;
 		return 0;
 	}
+	if (streq(path, "/proc/self/maps")) {
+		*kind = PROC_SELF_MAPS;
+		*pid = myproc() ? myproc()->pid : 1;
+		return 0;
+	}
 	if (!starts_with(path, "/proc/"))
 		return -1;
 
@@ -132,6 +140,10 @@ static int procfs_lookup(char *path, uint16 *kind, int *pid)
 	}
 	if (streq(rest, "/status")) {
 		*kind = PROC_PID_STATUS;
+		return 0;
+	}
+	if (streq(rest, "/maps")) {
+		*kind = PROC_PID_MAPS;
 		return 0;
 	}
 	return -1;
@@ -178,6 +190,78 @@ static void append_u64(char *buf, uint32 cap, uint32 *pos, uint64 v)
 	}
 	while (n > 0)
 		append_char(buf, cap, pos, tmp[--n]);
+}
+
+static void append_hex_width(char *buf, uint32 cap, uint32 *pos, uint64 v, int width)
+{
+	const char *hex = "0123456789abcdef";
+	for (int i = width - 1; i >= 0; i--)
+		append_char(buf, cap, pos, hex[(v >> (i * 4)) & 0xf]);
+}
+
+static void procfs_append_maps_line(char *buf, uint32 cap, uint32 *pos,
+	uint64 begin, uint64 end, int perm, const char *name)
+{
+	if (end <= begin)
+		return;
+	append_hex_width(buf, cap, pos, begin, 16);
+	append_char(buf, cap, pos, '-');
+	append_hex_width(buf, cap, pos, end, 16);
+	append_char(buf, cap, pos, ' ');
+	append_char(buf, cap, pos, (perm & PTE_R) ? 'r' : '-');
+	append_char(buf, cap, pos, (perm & PTE_W) ? 'w' : '-');
+	append_char(buf, cap, pos, (perm & PTE_X) ? 'x' : '-');
+	append_str(buf, cap, pos, "p 00000000 00:00 0");
+	if (name != NULL && name[0] != 0) {
+		append_str(buf, cap, pos, "  ");
+		append_str(buf, cap, pos, name);
+	}
+	append_char(buf, cap, pos, '\n');
+}
+
+static void procfs_emit_pte_maps(char *buf, uint32 cap, uint32 *pos,
+	proc_t *p, uint64 begin, uint64 end, const char *name)
+{
+	if (p == NULL || p->pgtbl == NULL || end <= begin)
+		return;
+	begin = (begin / PGSIZE) * PGSIZE;
+	end = ((end + PGSIZE - 1) / PGSIZE) * PGSIZE;
+
+	uint64 run_begin = 0;
+	int run_perm = 0;
+	bool in_run = false;
+	for (uint64 va = begin; va < end; va += PGSIZE) {
+		pte_t *pte = vm_getpte(p->pgtbl, va, false);
+		if (pte == NULL || !(*pte & PTE_V)) {
+			if (in_run) {
+				procfs_append_maps_line(buf, cap, pos, run_begin, va, run_perm, name);
+				in_run = false;
+			}
+			continue;
+		}
+		int perm = (int)(PTE_FLAGS(*pte) & (PTE_R | PTE_W | PTE_X));
+		if (!in_run) {
+			run_begin = va;
+			run_perm = perm;
+			in_run = true;
+		} else if (perm != run_perm) {
+			procfs_append_maps_line(buf, cap, pos, run_begin, va, run_perm, name);
+			run_begin = va;
+			run_perm = perm;
+		}
+	}
+	if (in_run)
+		procfs_append_maps_line(buf, cap, pos, run_begin, end, run_perm, name);
+}
+
+static void procfs_emit_mmap_maps(char *buf, uint32 cap, uint32 *pos, proc_t *p)
+{
+	if (p == NULL)
+		return;
+	for (mmap_region_t *m = p->mmap; m != NULL; m = m->next) {
+		uint64 end = m->begin + (uint64)m->npages * PGSIZE;
+		procfs_append_maps_line(buf, cap, pos, m->begin, end, m->perm, "");
+	}
 }
 
 static uint32 procfs_build_content(file_t *file, char *buf, uint32 cap)
@@ -230,6 +314,17 @@ static uint32 procfs_build_content(file_t *file, char *buf, uint32 cap)
 			"Cpus_allowed:\t1\nCpus_allowed_list:\t0\n"
 			"Mems_allowed:\t1\nMems_allowed_list:\t0\n");
 		break;
+	case PROC_SELF_MAPS:
+	case PROC_PID_MAPS: {
+		proc_t *p = myproc();
+		if (p != NULL) {
+			procfs_emit_pte_maps(buf, cap, &pos, p, USER_BASE, p->heap_top, "[heap]");
+			procfs_emit_mmap_maps(buf, cap, &pos, p);
+			uint64 stack_begin = TRAPFRAME - p->ustack_npage * PGSIZE;
+			procfs_emit_pte_maps(buf, cap, &pos, p, stack_begin, TRAPFRAME, "[stack]");
+		}
+		break;
+	}
 	default:
 		break;
 	}
@@ -245,7 +340,7 @@ static uint32 procfs_build_content(file_t *file, char *buf, uint32 cap)
 
 static uint32 procfs_read(file_t *file, uint32 len, uint64 dst, bool is_user_dst)
 {
-	char buf[1024];
+	char buf[4096];
 	uint32 size = procfs_build_content(file, buf, sizeof(buf));
 	if (file->offset >= size)
 		return 0;
@@ -281,7 +376,7 @@ static uint32 emit_linux_dirent(uint64 user_dst, uint32 len, uint32 copied,
 static uint32 procfs_get_dents(file_t *file, uint64 user_dst, uint32 len)
 {
 	struct proc_dirent { const char *name; uint8 type; uint64 ino; };
-	struct proc_dirent entries[8];
+	struct proc_dirent entries[10];
 	int count = 0;
 	char pidbuf[16];
 	uint32 p = 0;
@@ -306,6 +401,7 @@ static uint32 procfs_get_dents(file_t *file, uint64 user_dst, uint32 len)
 		entries[count++] = (struct proc_dirent){ "status", 8, 14 };
 		entries[count++] = (struct proc_dirent){ "fd", 4, 15 };
 		entries[count++] = (struct proc_dirent){ "exe", 10, 16 };
+		entries[count++] = (struct proc_dirent){ "maps", 8, 17 };
 	} else if (file->proc_kind == PROC_SELF_FD) {
 		entries[count++] = (struct proc_dirent){ "0", 10, 20 };
 		entries[count++] = (struct proc_dirent){ "1", 10, 21 };
@@ -333,6 +429,10 @@ static uint32 procfs_get_dents(file_t *file, uint64 user_dst, uint32 len)
 typedef struct memfs_node {
 	bool used;
 	bool is_dir;
+	bool is_symlink;
+	uint32 mode;
+	uint32 uid;
+	uint32 gid;
 	uint32 hash;
 	char path[128];
 	uint8 data[MEMFS_DATA_SIZE];
@@ -352,10 +452,14 @@ typedef struct memfs_extent {
 	int next;
 } memfs_extent_t;
 
+#define MEMFS_SYMLINK_LIMIT 8
+#define MEMFS_READONLY_MOUNTS 8
+
 static memfs_node_t memfs_nodes[MEMFS_NODES];
 static memfs_extent_t memfs_extents[MEMFS_EXTRA_EXTENTS];
 static int memfs_alloc_hint;
 static int memfs_extent_alloc_hint;
+static char memfs_readonly_mounts[MEMFS_READONLY_MOUNTS][128];
 
 static int memfs_open_ref_count(int mem_idx);
 static void memfs_maybe_reclaim_unlinked(int mem_idx);
@@ -377,6 +481,14 @@ static const char etc_protocols_data[] =
 	"icmp 1 ICMP\n"
 	"tcp 6 TCP\n"
 	"udp 17 UDP\n";
+
+static const char etc_passwd_data[] =
+	"root:x:0:0:root:/root:/bin/sh\n"
+	"nobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n";
+
+static const char etc_group_data[] =
+	"root:x:0:\n"
+	"nogroup:x:65534:nobody\n";
 
 static void memfs_normalize(char *dst, char *path)
 {
@@ -417,6 +529,128 @@ static int memfs_find_key(const char *key, uint32 hash)
 			streq(memfs_nodes[i].path, key))
 			return i;
 	}
+	return -1;
+}
+
+static void memfs_copy_bounded(char *dst, const char *src, uint32 size)
+{
+	if (size == 0)
+		return;
+	uint32 i = 0;
+	while (src[i] != 0 && i + 1 < size) {
+		dst[i] = src[i];
+		i++;
+	}
+	dst[i] = 0;
+}
+
+static int memfs_key_under_mount(const char *key, const char *mount)
+{
+	uint32 mlen = (uint32)strlen(mount);
+	if (mlen == 0)
+		return 0;
+	if (streq(key, mount))
+		return 1;
+	if (strncmp(key, mount, mlen) != 0)
+		return 0;
+	return mount[mlen - 1] == '/' || key[mlen] == '/';
+}
+
+static int memfs_key_is_readonly(const char *key)
+{
+	for (int i = 0; i < MEMFS_READONLY_MOUNTS; i++) {
+		if (memfs_readonly_mounts[i][0] != 0 &&
+			memfs_key_under_mount(key, memfs_readonly_mounts[i]))
+			return 1;
+	}
+	return 0;
+}
+
+static int memfs_missing_errno(char *key)
+{
+	char prefix[128];
+	uint32 pos = 0;
+
+	for (uint32 i = 0; key[i] != 0 && i + 1 < sizeof(prefix); i++) {
+		prefix[pos++] = key[i];
+		prefix[pos] = 0;
+		if (key[i] != '/')
+			continue;
+		if (pos == 1)
+			continue;
+		prefix[pos - 1] = 0;
+		int dir_idx = memfs_find_key(prefix, memfs_hash_key(prefix));
+		prefix[pos - 1] = '/';
+		if (dir_idx >= 0 && !memfs_nodes[dir_idx].is_dir)
+			return -ENOTDIR;
+	}
+	return -ENOENT;
+}
+
+static void memfs_join_symlink_target(char *dst, const char *link_key, const char *target)
+{
+	if (target[0] == '/') {
+		memfs_copy_bounded(dst, target, 128);
+		return;
+	}
+
+	int slash = -1;
+	for (int i = 0; link_key[i] != 0; i++) {
+		if (link_key[i] == '/')
+			slash = i;
+	}
+
+	uint32 pos = 0;
+	if (slash >= 0) {
+		for (int i = 0; i <= slash && pos + 1 < 128; i++)
+			dst[pos++] = link_key[i];
+	}
+	for (uint32 i = 0; target[i] != 0 && pos + 1 < 128; i++)
+		dst[pos++] = target[i];
+	dst[pos] = 0;
+}
+
+static int memfs_find_resolved(char *path, int *err, char *resolved, uint32 resolved_size)
+{
+	char key[128];
+	memfs_normalize(key, path);
+	if (resolved != NULL && resolved_size > 0)
+		resolved[0] = 0;
+	if (key[0] == 0) {
+		if (err != NULL)
+			*err = -ENOENT;
+		return -1;
+	}
+
+	for (int depth = 0; depth < MEMFS_SYMLINK_LIMIT; depth++) {
+		int idx = memfs_find_key(key, memfs_hash_key(key));
+		if (idx < 0) {
+			if (err != NULL)
+				*err = memfs_missing_errno(key);
+			return -1;
+		}
+		if (!memfs_nodes[idx].is_symlink) {
+			if (resolved != NULL)
+				memfs_copy_bounded(resolved, key, resolved_size);
+			if (err != NULL)
+				*err = 0;
+			return idx;
+		}
+
+		char target[128];
+		uint32 n = memfs_nodes[idx].size;
+		if (n >= sizeof(target))
+			n = sizeof(target) - 1;
+		memmove(target, memfs_nodes[idx].data, n);
+		target[n] = 0;
+
+		char next[128];
+		memfs_join_symlink_target(next, key, target);
+		memfs_normalize(key, next);
+	}
+
+	if (err != NULL)
+		*err = -ELOOP;
 	return -1;
 }
 
@@ -502,6 +736,11 @@ static int memfs_create(char *path, bool is_dir)
 			memfs_node_t *node = &memfs_nodes[i];
 			node->used = true;
 			node->is_dir = is_dir;
+			node->is_symlink = false;
+			node->mode = is_dir ? 0777 : 0666;
+			proc_t *p = myproc();
+			node->uid = p == NULL ? 0 : p->euid;
+			node->gid = p == NULL ? 0 : p->egid;
 			node->hash = hash;
 			node->size = 0;
 			node->extra_head = -1;
@@ -536,6 +775,12 @@ static int memfs_seed_readonly_file(char *path)
 	} else if (streq(key, "/etc/protocols")) {
 		data = etc_protocols_data;
 		size = sizeof(etc_protocols_data) - 1;
+	} else if (streq(key, "/etc/passwd")) {
+		data = etc_passwd_data;
+		size = sizeof(etc_passwd_data) - 1;
+	} else if (streq(key, "/etc/group")) {
+		data = etc_group_data;
+		size = sizeof(etc_group_data) - 1;
 	} else {
 		return -1;
 	}
@@ -549,6 +794,9 @@ static int memfs_seed_readonly_file(char *path)
 		return -1;
 	memmove(node->data, data, size);
 	node->size = size;
+	node->mode = 0644;
+	node->uid = 0;
+	node->gid = 0;
 	return idx;
 }
 
@@ -563,10 +811,177 @@ int memfs_path_is_dir(char *path)
 	return idx >= 0 && memfs_nodes[idx].is_dir;
 }
 
+int memfs_is_readonly(char *path)
+{
+	char key[128];
+	memfs_normalize(key, path);
+	return memfs_key_is_readonly(key);
+}
+
+int memfs_mark_readonly(char *path, int readonly)
+{
+	char key[128];
+	memfs_normalize(key, path);
+	if (key[0] == 0)
+		return -1;
+
+	for (int i = 0; i < MEMFS_READONLY_MOUNTS; i++) {
+		if (streq(memfs_readonly_mounts[i], key)) {
+			if (!readonly)
+				memfs_readonly_mounts[i][0] = 0;
+			return 0;
+		}
+	}
+
+	if (!readonly)
+		return 0;
+
+	for (int i = 0; i < MEMFS_READONLY_MOUNTS; i++) {
+		if (memfs_readonly_mounts[i][0] == 0) {
+			memfs_copy_bounded(memfs_readonly_mounts[i], key,
+							   sizeof(memfs_readonly_mounts[i]));
+			return 0;
+		}
+	}
+	return -1;
+}
+
+int memfs_symlink(char *target, char *linkpath)
+{
+	char target_key[128], link_key[128];
+	memfs_normalize(target_key, target);
+	memfs_normalize(link_key, linkpath);
+	if (target_key[0] == 0 || link_key[0] == 0)
+		return -ENOENT;
+	if (memfs_key_is_readonly(link_key))
+		return -EROFS;
+	if (memfs_find_key(link_key, memfs_hash_key(link_key)) >= 0)
+		return -EEXIST;
+	if (strlen(target_key) >= MEMFS_DATA_SIZE)
+		return -ENAMETOOLONG;
+
+	int idx = memfs_create(link_key, false);
+	if (idx < 0)
+		return -ENOSPC;
+	memfs_node_t *node = &memfs_nodes[idx];
+	node->is_symlink = true;
+	node->mode = 0777;
+	node->size = (uint32)strlen(target_key);
+	memset(node->data, 0, sizeof(node->data));
+	memmove(node->data, target_key, node->size);
+	return 0;
+}
+
+int memfs_readlink(char *path, char *dst, uint32 size)
+{
+	char key[128];
+	memfs_normalize(key, path);
+	int idx = memfs_find_key(key, memfs_hash_key(key));
+	if (idx < 0)
+		return -ENOENT;
+	if (!memfs_nodes[idx].is_symlink)
+		return -EINVAL;
+	uint32 n = memfs_nodes[idx].size;
+	if (n > size)
+		n = size;
+	memmove(dst, memfs_nodes[idx].data, n);
+	return (int)n;
+}
+
+int memfs_chmod(char *path, uint32 mode)
+{
+	int idx = memfs_find(path);
+	if (idx < 0)
+		return -1;
+	memfs_nodes[idx].mode = mode & 07777;
+	return 0;
+}
+
+int memfs_chown(char *path, uint32 uid, uint32 gid)
+{
+	int idx = memfs_find(path);
+	if (idx < 0)
+		return -1;
+	if (uid != (uint32)-1)
+		memfs_nodes[idx].uid = uid;
+	if (gid != (uint32)-1)
+		memfs_nodes[idx].gid = gid;
+	return 0;
+}
+
+static uint32 memfs_perm_bits(memfs_node_t *node, uint32 uid, uint32 gid)
+{
+	if (uid == node->uid)
+		return (node->mode >> 6) & 7;
+	if (gid == node->gid)
+		return (node->mode >> 3) & 7;
+	return node->mode & 7;
+}
+
+static int memfs_mode_allows(memfs_node_t *node, int mode, uint32 euid, uint32 egid)
+{
+	if (mode == 0)
+		return 0;
+	if (euid == 0) {
+		if ((mode & 1) && (node->mode & 0111) == 0)
+			return -EACCES;
+		return 0;
+	}
+	uint32 bits = memfs_perm_bits(node, euid, egid);
+	if ((mode & 4) && (bits & 4) == 0)
+		return -EACCES;
+	if ((mode & 2) && (bits & 2) == 0)
+		return -EACCES;
+	if ((mode & 1) && (bits & 1) == 0)
+		return -EACCES;
+	return 0;
+}
+
+int memfs_access(char *path, int mode, uint32 euid, uint32 egid)
+{
+	char key[128];
+	int err = 0;
+	int idx = memfs_find_resolved(path, &err, key, sizeof(key));
+	if (idx < 0)
+		return err;
+	if ((mode & 2) && memfs_key_is_readonly(key))
+		return -EROFS;
+
+	if (euid != 0) {
+		char prefix[128];
+		uint32 pos = 0;
+		for (uint32 i = 0; key[i] != 0 && i + 1 < sizeof(prefix); i++) {
+			prefix[pos++] = key[i];
+			prefix[pos] = 0;
+			if (key[i] != '/')
+				continue;
+			if (pos == 1)
+				continue;
+			prefix[pos - 1] = 0;
+			int dir_idx = memfs_find_key(prefix, memfs_hash_key(prefix));
+			prefix[pos - 1] = '/';
+			if (dir_idx >= 0 && memfs_nodes[dir_idx].is_dir &&
+				memfs_mode_allows(&memfs_nodes[dir_idx], 1, euid, egid) < 0)
+				return -EACCES;
+		}
+	}
+
+	return memfs_mode_allows(&memfs_nodes[idx], mode, euid, egid);
+}
+
 int memfs_mkdir(char *path)
 {
 	int idx = memfs_create(path, true);
 	return idx >= 0 ? 0 : -1;
+}
+
+int memfs_mkdir_mode(char *path, uint32 mode)
+{
+	int idx = memfs_create(path, true);
+	if (idx < 0)
+		return -1;
+	memfs_nodes[idx].mode = mode & 07777;
+	return 0;
 }
 
 static void memfs_reclaim_node(int idx)
@@ -576,6 +991,10 @@ static void memfs_reclaim_node(int idx)
 	memfs_extra_free_all(idx);
 	memfs_nodes[idx].used = false;
 	memfs_nodes[idx].is_dir = false;
+	memfs_nodes[idx].is_symlink = false;
+	memfs_nodes[idx].mode = 0;
+	memfs_nodes[idx].uid = 0;
+	memfs_nodes[idx].gid = 0;
 	memfs_nodes[idx].hash = 0;
 	memfs_nodes[idx].size = 0;
 	memfs_nodes[idx].extra_head = -1;
@@ -802,6 +1221,8 @@ static void memfs_maybe_reclaim_unlinked(int mem_idx)
 static void memfs_init_tmp_dirs(void)
 {
 	memfs_create("/tmp", true);
+	memfs_create("/etc", true);
+	memfs_chmod("/etc", 0755);
 	memfs_create("/var", true);
 	memfs_create("/var/tmp", true);
 }
@@ -815,21 +1236,22 @@ void file_init()
 	spinlock_acquire(&lk_file_table);
 	for (int i = 0; i < (int)N_FILE; i++) {
 		file_table[i].ip = NULL;
-	file_table[i].is_device = false;
-	file_table[i].dev_major = 0;
-	file_table[i].is_proc = false;
-	file_table[i].proc_kind = PROC_NONE;
-	file_table[i].proc_pid = 0;
-	file_table[i].is_mem = false;
-	file_table[i].mem_index = -1;
-        file_table[i].readable = false;
-        file_table[i].writbale = false;
-        file_table[i].offset = 0;
-        file_table[i].ref = 0;
-	file_table[i].is_pipe = false;
-	file_table[i].pipe = NULL;
-	file_table[i].is_socket = false;
-	file_table[i].socket = NULL;
+		file_table[i].is_device = false;
+		file_table[i].dev_major = 0;
+		file_table[i].is_proc = false;
+		file_table[i].proc_kind = PROC_NONE;
+		file_table[i].proc_pid = 0;
+		file_table[i].is_path = false;
+		file_table[i].is_mem = false;
+		file_table[i].mem_index = -1;
+		file_table[i].readable = false;
+		file_table[i].writbale = false;
+		file_table[i].offset = 0;
+		file_table[i].ref = 0;
+		file_table[i].is_pipe = false;
+		file_table[i].pipe = NULL;
+		file_table[i].is_socket = false;
+		file_table[i].socket = NULL;
 	}
 	spinlock_release(&lk_file_table);
 
@@ -982,6 +1404,7 @@ file_t* file_alloc()
 		file_table[i].is_proc = false;
 		file_table[i].proc_kind = PROC_NONE;
 		file_table[i].proc_pid = 0;
+            file_table[i].is_path = false;
             file_table[i].is_mem = false;
             file_table[i].mem_index = -1;
             file_table[i].readable = false;
@@ -1017,8 +1440,9 @@ static file_t *memfs_open_index(int mem_idx, bool want_r, bool want_w, uint32 op
 	}
 	mf->is_mem = true;
 	mf->mem_index = mem_idx;
-	mf->readable = want_r;
-	mf->writbale = want_w;
+	mf->is_path = (open_mode & FILE_OPEN_PATH) != 0;
+	mf->readable = want_r && !mf->is_path;
+	mf->writbale = want_w && !mf->is_path;
 	mf->offset = (open_mode & FILE_OPEN_APPEND) ? node->size : 0;
 	return mf;
 }
@@ -1047,9 +1471,14 @@ file_t* file_open(char *path, uint32 open_mode)
 
 	bool want_r = (open_mode & FILE_OPEN_READ) != 0;
     bool want_w = (open_mode & FILE_OPEN_WRITE) != 0;
+	bool path_only = (open_mode & FILE_OPEN_PATH) != 0;
+	if (path_only) {
+		want_r = false;
+		want_w = false;
+	}
 
 	// 必须至少读/写之一
-    if (!want_r && !want_w)   return NULL;
+    if (!path_only && !want_r && !want_w)   return NULL;
 
 	uint16 proc_kind = PROC_NONE;
 	int proc_pid = 0;
@@ -1062,6 +1491,7 @@ file_t* file_open(char *path, uint32 open_mode)
 		pf->is_proc = true;
 		pf->proc_kind = proc_kind;
 		pf->proc_pid = proc_pid;
+		pf->is_path = path_only;
 		pf->readable = want_r;
 		pf->writbale = false;
 		pf->offset = 0;
@@ -1070,7 +1500,7 @@ file_t* file_open(char *path, uint32 open_mode)
 
 	uint16 dev_major = 0;
 	if (device_path_lookup(path, &dev_major)) {
-		if (!device_open_check(dev_major, open_mode))
+		if (!path_only && !device_open_check(dev_major, open_mode))
 			return NULL;
 
 		file_t *devf = file_alloc();
@@ -1080,15 +1510,20 @@ file_t* file_open(char *path, uint32 open_mode)
 		devf->ip = NULL;
 		devf->is_device = true;
 		devf->dev_major = dev_major;
+		devf->is_path = path_only;
 		devf->readable = want_r;
 		devf->writbale = want_w;
 		devf->offset = 0;
 		return devf;
 	}
 
-	int mem_idx = memfs_find(path);
+	char mem_key[128];
+	int mem_idx = memfs_find_resolved(path, NULL, mem_key, sizeof(mem_key));
+	if (mem_idx >= 0 && (want_w || (open_mode & (FILE_OPEN_CREATE | FILE_OPEN_TRUNC))) &&
+		memfs_key_is_readonly(mem_key))
+		return NULL;
 	if (fs_readonly_ext4 && mem_idx < 0 && (open_mode & FILE_OPEN_CREATE) &&
-		(want_w || memfs_should_fast_create(path))) {
+		(want_w || memfs_should_fast_create(path)) && !memfs_is_readonly(path)) {
 		mem_idx = memfs_create(path, false);
 	}
 	if (mem_idx >= 0)
@@ -1101,7 +1536,7 @@ file_t* file_open(char *path, uint32 open_mode)
 		if (mem_idx < 0 && fs_readonly_ext4 && want_r && !want_w &&
 			!(open_mode & (FILE_OPEN_CREATE | FILE_OPEN_TRUNC)))
 			mem_idx = memfs_seed_readonly_file(path);
-		if (mem_idx < 0 && (open_mode & FILE_OPEN_CREATE))
+		if (mem_idx < 0 && (open_mode & FILE_OPEN_CREATE) && !memfs_is_readonly(path))
 			mem_idx = memfs_create(path, false);
 		if (mem_idx >= 0)
 			return memfs_open_index(mem_idx, want_r, want_w, open_mode);
@@ -1130,7 +1565,7 @@ file_t* file_open(char *path, uint32 open_mode)
 			inode_put(ip);
 			return NULL; // 设备文件打开权限检查失败
 		}
-	} else if (fs_readonly_ext4 && (want_w || (open_mode & FILE_OPEN_CREATE))) {
+	} else if (fs_readonly_ext4 && !path_only && (want_w || (open_mode & FILE_OPEN_CREATE))) {
 		inode_put(ip);
 		return NULL;
 	}
@@ -1143,6 +1578,7 @@ file_t* file_open(char *path, uint32 open_mode)
 	}
 
 	f->ip = ip;
+    f->is_path = path_only;
     f->readable = want_r;
     f->writbale = want_w;
     f->offset = 0;
@@ -1188,6 +1624,7 @@ void file_close(file_t *file)
 	file->is_proc = false;
 	file->proc_kind = PROC_NONE;
 	file->proc_pid = 0;
+	file->is_path = false;
 	file->is_mem = false;
 	file->mem_index = -1;
     file->readable = false;
@@ -1510,8 +1947,10 @@ uint32 file_get_stat_linux(file_t* file, uint64 user_dst)
 		st.st_blocks = (st.st_size + 511) / 512;
 	} else if (file->is_mem) {
 		memfs_node_t *node = &memfs_nodes[file->mem_index];
-		st.st_mode = (node->is_dir ? 0040000 : 0100000) | 0777;
+		st.st_mode = (node->is_dir ? 0040000 : 0100000) | (node->mode & 07777);
 		st.st_nlink = 1;
+		st.st_uid = node->uid;
+		st.st_gid = node->gid;
 		st.st_ino = 0xE000 + file->mem_index;
 		st.st_size = node->size;
 		st.st_blocks = (st.st_size + 511) / 512;

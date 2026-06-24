@@ -4,29 +4,30 @@
 > 返回值约定：成功返回结果（uint64）；失败返回 (uint64)(-EXXX)，见 docs/DECISIONS.md D1/D2。
 > 分发表上限 SYS_MAX_NUM=502（src/kernel/syscall/type.h）。
 
-## 已实现（共 126 个分发表入口，含 3 个 SeaOS 私有入口）
+## 已实现（共 135 个分发表入口，含 3 个 SeaOS 私有入口）
 | 号 | 名 | 备注 |
 |---|---|---|
 | 4 | fork | SeaOS |
 | 17 | getcwd | Linux/RISC-V ABI；写出当前工作目录 |
 | 39 | umount2 | 最小兼容卸载入口；当前镜像路径返回成功边界 |
-| 40 | mount | 最小兼容挂载入口；基础测试挂载路径返回成功边界 |
+| 40 | mount | 最小兼容挂载入口；记录 memfs 只读 remount 边界 |
 | 23 | dup | |
 | 24 | dup3 | 支持 `O_CLOEXEC` 标志 |
 | 25 | fcntl | 支持 `F_DUPFD`、`F_DUPFD_CLOEXEC`、`F_GETFD`、`F_SETFD` |
 | 29 | ioctl | 默认 `-ENOTTY`；RTC 设备支持 `RTC_RD_TIME` |
 | 34 | mkdir(at) | |
 | 35 | unlink(at) | |
+| 36 | symlinkat | memfs 符号链接；支持 access/open 跟随、readlinkat 读取和 ELOOP 环检测 |
 | 37 | link(at) | |
 | 38 | renameat | 同文件系统重命名；支持目录重命名 |
 | 43 | statfs | 最小 Linux `struct statfs` |
 | 44 | fstatfs | 最小 Linux `struct statfs` |
 | 46 | ftruncate | 最小兼容：有效 fd 返回 0 |
-| 48 | faccessat | 路径存在性/可读可执行检查 |
-| 53 | fchmodat | 权限修改最小兼容；有效路径返回成功边界 |
-| 54 | fchownat | 属主修改最小兼容；有效路径返回成功边界 |
+| 48 | faccessat | 路径存在性/权限检查；memfs 支持 uid/gid/mode、symlink 跟随和 EROFS/ELOOP/ENOTDIR |
+| 53 | fchmodat | memfs 更新 mode；其他有效路径保持最小成功边界 |
+| 54 | fchownat | memfs 更新 uid/gid；其他有效路径保持最小成功边界 |
 | 49 | chdir | |
-| 56 | open(at) | |
+| 56 | open(at) | 支持 Linux `O_PATH` 为 closeable path-only fd |
 | 57 | close | |
 | 59 | pipe2 | 阻塞管道；支持 `O_CLOEXEC` |
 | 61 | getdents64 | 输出 Linux `struct linux_dirent64` |
@@ -40,13 +41,14 @@
 | 71 | sendfile | |
 | 72 | pselect6 | Linux fd_set copyin/copyout；socket 使用真实 readiness |
 | 73 | ppoll | |
-| 78 | readlinkat | `/proc/self/exe` 返回当前程序路径 |
+| 78 | readlinkat | memfs symlink 读取；`/proc/self/exe` 返回当前程序路径 |
 | 79 | newfstatat | 按路径 stat；已对已知 BusyBox applet 名提供 bounded stat 兼容 |
 | 80 | fstat | 输出 Linux `struct stat` |
 | 81 | sync | 桩，返回 0 |
 | 82 | fsync | 最小兼容：有效 fd 返回 0 |
 | 83 | fdatasync | 最小兼容：有效 fd 返回 0 |
 | 88 | utimensat | 最小时间戳更新/存在性检查；兼容 `futimens(fd, NULL pathname)` |
+| 89 | acct | 已注册；进程 accounting 未配置，返回 `-ENOSYS` 供 LTP 正确 TCONF |
 | 93 | exit | |
 | 94 | exit_group | 单进程等价 `exit`；`CLONE_THREAD`/`CLONE_VM` 组内 sibling 通过 pending self-exit 退出 |
 | 96 | set_tid_address | 返回 pid（D3 最小实现） |
@@ -75,8 +77,12 @@
 | 135 | rt_sigprocmask | 桩，返回 0 |
 | 137 | rt_sigtimedwait | 最小 pending-signal 等待；返回已记录的 `si_code`/`si_pid` |
 | 139 | rt_sigreturn | 从用户栈恢复 signal frame |
-| 144 | setgid | 桩，返回 0 |
-| 146 | setuid | 桩，返回 0 |
+| 143 | setregid | 最小 real/effective GID 状态；root 可切换，非 root 仅可保留已有 id |
+| 144 | setgid | 最小 real/effective GID 状态 |
+| 145 | setreuid | 最小 real/effective UID 状态；root 可切换，非 root 仅可保留已有 id |
+| 146 | setuid | 最小 real/effective UID 状态 |
+| 147 | setresuid | 最小 real/effective UID 状态；saved uid 不建模 |
+| 149 | setresgid | 最小 real/effective GID 状态；saved gid 不建模 |
 | 153 | times | 返回进程时间结构，供基础测试读取 |
 | 154 | setpgid | 最小进程组兼容入口 |
 | 157 | setsid | 返回调用进程 pid 作为最小 session id |
@@ -86,12 +92,13 @@
 | 165 | getrusage | 零填充桩 |
 | 166 | umask | 桩，返回 0 |
 | 169 | gettimeofday | |
+| 171 | adjtimex | 最小 `timex` 查询/校验：返回 `TIME_OK`，无真实调时 |
 | 172 | getpid | `CLONE_THREAD` 成员返回 thread-group leader pid |
 | 173 | getppid | |
-| 174 | getuid | 返回 0 (root) |
-| 175 | geteuid | 返回 0 (root) |
-| 176 | getgid | 返回 0 |
-| 177 | getegid | 返回 0 |
+| 174 | getuid | 返回当前最小 credential uid |
+| 175 | geteuid | 返回当前最小 credential euid |
+| 176 | getgid | 返回当前最小 credential gid |
+| 177 | getegid | 返回当前最小 credential egid |
 | 178 | gettid | 返回当前线程 id；单线程 = pid |
 | 179 | sysinfo | 零填充 112B，uptime 填入 |
 | 194 | shmget | SysV SHM 最小段分配，供 glibc/ltp 探测 |
@@ -102,7 +109,7 @@
 | 199 | socketpair | AF_UNIX/SOCK_STREAM 最小 pipe-like 兼容 |
 | 200 | bind | loopback/any IPv4，端口 0 自动分配 |
 | 201 | listen | TCP listener，维护 accept 队列 |
-| 202 | accept | 阻塞等待 TCP 连接；信号待处理时返回 `-EINTR` |
+| 202 | accept | 阻塞等待 TCP 连接；信号待处理时返回 `-EINTR`；UDP 返回 `-EOPNOTSUPP`，`O_PATH` fd 返回 `-EBADF` |
 | 203 | connect | TCP 建立本机 socket pair；UDP 记录默认 peer |
 | 204 | getsockname | 返回本地 IPv4 sockaddr |
 | 205 | getpeername | 返回 peer IPv4 sockaddr |
@@ -116,6 +123,8 @@
 | 214 | brk | `CLONE_VM` heap grow 同步 live sibling 页表和 `heap_top`；shrink 仍是最小当前线程语义 |
 | 215 | munmap | `addr` 必须页对齐；`len` 按 Linux 语义向上页对齐；`CLONE_VM` live siblings 同步清 PTE 并单次释放 PA |
 | 216 | mremap | 最小兼容；收缩/同尺寸返回原地址，增长返回 `-ENOMEM` |
+| 217 | add_key | 已注册；Linux key retention service 未支持，返回 `-ENOSYS` |
+| 219 | keyctl | 已注册；Linux key retention service 未支持，返回 `-ENOSYS` |
 | 220 | clone | musl fork/pthread 依赖；按 flag 区分 parent_tid、child_tid 与 clear_child_tid |
 | 221 | execve | 支持动态链接 ELF (D4) |
 | 222 | mmap | len 自动 page 对齐；lazy fault 在 `CLONE_VM` live siblings 间复用/同步同 VA 的 PA |
@@ -124,13 +133,32 @@
 | 228 | mlock | 最小兼容，返回 0 |
 | 233 | madvise | 桩返回 0 |
 | 236 | get_mempolicy | 最小 NUMA default node 0 兼容 |
-| 242 | accept4 | accept + `SOCK_CLOEXEC` |
+| 242 | accept4 | accept + `SOCK_CLOEXEC`；沿用 accept errno 语义 |
 | 260 | wait4 | Returns `-ECHILD` when no matching child exists; supports minimal `SA_RESTART` restart after signal handlers by restoring the original syscall arguments. |
 | 261 | prlimit64 | 支持当前进程 `RLIMIT_NOFILE` |
 | 276 | renameat2 | 无 flags 时转 `renameat`，其他 flags 返回 `-EINVAL` |
 | 278 | getrandom | 非阻塞伪随机字节，支持 Linux flags 子集 |
 | 283 | membarrier | 单核最小兼容；支持 query 和 no-op barrier |
 | 500/501/502 | schedstat/spawn/shutdown | SeaOS 私有 |
+
+## 2026-06-24 状态更新：RISC-V LTP access/passwd/symlink 兼容
+
+本轮为 LTP early access/adjtimex 路径补齐最小 Linux/RISC-V 兼容面：
+
+| 号/模块 | 名 | 当前语义/修正 |
+|---|---|---|
+| 36 | symlinkat | 在 memfs 上创建符号链接；`access/open/stat` 默认跟随最终链接，最多 8 跳，环返回 `-ELOOP`。 |
+| 39/40 | umount2/mount | 记录 memfs 只读 remount，`access(W_OK)` 对只读挂载点返回 `-EROFS`。 |
+| 48 | faccessat | 校验非法 mode、空/过长/坏指针路径；memfs mode/uid/gid 权限返回 `EACCES/ENOTDIR/ELOOP/EROFS` 等真实 errno。 |
+| 53/54 | fchmodat/fchownat | 对 memfs 文件更新 mode/uid/gid，供 LTP setup 后的 `access()` 权限检查使用。 |
+| 78 | readlinkat | 读取 memfs symlink target；保留 `/proc/self/exe` 特例。 |
+| 143/145/147/149 | set*id | 补最小 real/effective uid/gid 状态，使 root/nobody 场景不再全都表现为 root。 |
+| 174-177 | get*id | 返回当前最小 credential 字段。 |
+| memfs | `/etc/passwd`/`/etc/group` | 只读提供 root/nobody/nogroup 文本，供 libc `getpwnam("nobody")` 解析。 |
+
+语义边界：这不是完整 VFS symlink、Linux mount namespace、saved-id/capability 模型或用户数据库。符号链接当前只覆盖 memfs 节点；只读 remount 只记录当前 LTP 需要的 memfs mount point；credential 只建模 real/effective uid/gid。
+
+验证：`make all` 在固定 docker 构建环境通过；固定 RV docker 于 2026-06-24 19:05:58 Asia/Shanghai 到达 `sys_shutdown` line 5268。最新 `ltp-musl` 中 `unknown syscall 36` 消失，`access02` 不再因 `symlink(...)=ENOSYS` TBROK，`access04` 的 `EINVAL/ENOENT/ENAMETOOLONG/ENOTDIR/ELOOP/EROFS` root+nobody 检查均 TPASS，`adjtimex02` 内部检查保持 TPASS。`access01` 仍有 LTP harness 子进程结果上报缺口，`access02` 仍因执行 `file_x` 的脚本/exec 语义 TFAIL，整组状态仍按真实失败记录在 `rv-current.md`。
 
 ## 2026-06-24 状态更新：RISC-V BusyBox applet stat 兼容
 
@@ -250,7 +278,7 @@ Unixbench SHELL16 test(lpm): 1
 | 88 | utimensat | 支持 `touch` |
 | 116 | syslog | 支持 BusyBox `dmesg` |
 | 129 | kill | 支持 BusyBox `kill $!` 的最小语义 |
-| — | procfs | 最小 in-memory procfs 支持 `/proc/mounts`、`/proc/meminfo`、`/proc/uptime`、`/proc/stat`、`/proc/self/*`、`/proc/<pid>/*` |
+| — | procfs | 最小 in-memory procfs 支持 `/proc/mounts`、`/proc/meminfo`、`/proc/uptime`、`/proc/stat`、`/proc/self/*`、`/proc/<pid>/*`；`/proc/self/maps` 输出当前进程 heap/mmap/stack 元数据 |
 | — | RTC | `/dev/rtc`、`/dev/rtc0` 支持 `RTC_RD_TIME`，`hwclock` 通过 |
 | — | FD_CLOEXEC | `openat/dup3/fcntl/pipe2/exec` 维护 close-on-exec |
 | — | 评测超时 | `data/config.json` 设置 `qemu.timeout=3600` |

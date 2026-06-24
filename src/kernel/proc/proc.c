@@ -425,6 +425,10 @@ proc_t *proc_alloc()
         if (p->state == UNUSED) {
             memset(p->name, 0, sizeof(p->name));
             p->pid = alloc_pid();
+            p->uid = 0;
+            p->euid = 0;
+            p->gid = 0;
+            p->egid = 0;
             p->exit_code = 0;
             p->sleep_space = NULL;
             p->sleep_deadline = 0;
@@ -783,6 +787,10 @@ int proc_fork_with_stack(uint64 child_stack)
     // 填充子进程结构体
     child->tf = tf;
     child->parent = parent;
+    child->uid = parent->uid;
+    child->euid = parent->euid;
+    child->gid = parent->gid;
+    child->egid = parent->egid;
     child->exit_code = 0;
     child->pgtbl = proc_pgtbl_init((uint64)tf);
     if (!child->pgtbl) {

@@ -17,7 +17,7 @@ Before each rerun, remove only root-level temporary image files such as `sdcard-
 
 Generated log: `os_serial_out_rv.txt`
 
-The latest regenerated RISC-V log was written on 2026-06-24 11:21:10 Asia/Shanghai. It reached `sys_shutdown: powering off via SBI SRST` at line 5026 after all 24 groups were enumerated. The docker/QEMU container was stopped after `sys_shutdown` had already appeared.
+The latest regenerated RISC-V log was written on 2026-06-24 19:05:58 Asia/Shanghai. It reached `sys_shutdown: powering off via SBI SRST` at line 5268 after all 24 groups were enumerated. The docker/QEMU container was stopped after `sys_shutdown` had already appeared.
 
 ## Run Monitoring Rule
 
@@ -25,7 +25,7 @@ During long fixed-docker reruns, inspect `os_serial_out_rv.txt` about every 15 m
 
 - If `sys_shutdown: powering off via SBI SRST` appears, treat the run as complete, stop any stale docker/QEMU container if it remains alive, then analyze the log.
 - If the file size and mtime do not change for one 15-minute polling interval and no `sys_shutdown` appears, treat the run as stuck and stop waiting so the log can be analyzed as a hang.
-- Never treat wrapper `======== test end ========` or `GROUP END` as success by itself.
+- Never treat wrapper `======== test end ========`, `GROUP END`, or `FAIL LTP CASE ... : 0` as success by itself.
 
 ## Important Interpretation Rule
 
@@ -40,29 +40,29 @@ RV initcode enumerates the full `/musl` 12 groups plus `/glibc` 12 groups. The c
 | Test group | Latest RV log marker | Real testsuite status notes |
 |---|---|---|
 | `libcbench-musl` | `GROUP END` line 154 | Clean in this log: no focused failure marker in the group. |
-| `libctest-musl` | `GROUP END` line 813 | Clean in this log: no focused failure marker in the group. Static and dynamic `pthread_robust_detach` both reach END. |
-| `busybox-musl` | `GROUP END` line 1060 | Clean in this log: focused busybox subtests report success, including `which ls` and shell `kill $!`. |
-| `cyclictest-musl` | `GROUP END` line 1111 | Clean in this log. `/dev/cpu_dma_latency` warnings are optional cyclictest PM-QoS noise and are not treated as failures by themselves. |
-| `netperf-musl` | `GROUP END` line 1169 | Clean in this log: all netperf subtests report success. |
-| `iperf-musl` | `GROUP END` line 1295 | Clean in this log: no focused failure marker in the group. |
-| `iozone-musl` | `GROUP END` line 1700 | Clean in this log: no focused failure marker in the group. |
-| `lua-musl` | `GROUP END` line 1717 | Clean in this log: no focused failure marker in the group. |
-| `basic-musl` | `GROUP END` line 1906 | Clean in this log: no focused failure marker in the group. |
-| `libcbench-glibc` | `GROUP END` line 1995 | Clean in this log. The previous stdio `[SEGV]` remains gone after memfs initializes `/tmp`, `/var`, and `/var/tmp`. |
-| `libctest-glibc` | `GROUP END` line 3424 | Fails internally. First visible failing case is still `FAIL clocale_mbfuncs [status 1]` at line 2320. Static `pthread_cancel` times out, dynamic pthread cancellation aborts because `libgcc_s.so.1` is not installed, and dynamic `daemon_failure` still reports the glibc-vs-musl daemon semantic mismatch. No `[SEGV]` occurs. |
-| `busybox-glibc` | `GROUP END` line 3671 | Clean in this log: focused busybox subtests report success, including `which ls` and shell `kill $!`. |
-| `cyclictest-glibc` | `GROUP END` line 3721 | Clean in this log: no `Creating fdpair` marker, and `kill hackbench` reports success. |
-| `netperf-glibc` | `GROUP END` line 3773 | Fails internally, but improved: only `UDP_STREAM` reports `end: fail` at line 3732. The previous `TCP_STREAM`, `UDP_RR`, `TCP_RR`, and `TCP_CRR` `end: fail` markers are absent. No `[SEGV]` occurs. |
-| `iperf-glibc` | `GROUP END` line 3900 | Clean in this log: no focused failure marker in the group. |
-| `iozone-glibc` | `GROUP END` line 4151 | Fails internally: `Fork failed` appears seven times at lines 3969/3999/4029/4059/4089/4119/4150. |
-| `lua-glibc` | `GROUP END` line 4168 | Clean in this log: no focused failure marker in the group. |
-| `basic-glibc` | `GROUP END` line 4357 | Clean in this log: no focused failure marker in the group. |
-| `unixbench-musl` | `GROUP START` line 4364, timeout line 4381, `test fail` line 4383 | Fails by initcode timeout after running benchmark output. No early `can't create pipe` marker. |
-| `lmbench-musl` | `GROUP START` line 4388, timeout line 4402, `test fail` line 4404 | Fails by initcode timeout after partial latency output. No `cp: not found` marker. |
-| `ltp-musl` | `GROUP START` line 4409, timeout line 4957, `test fail` line 4959 | Fails after running named LTP cases. The previous 33 `waitpid(...,0) failed: EINTR` lines are gone. Real failures remain: unknown syscalls 89/217/219/171, missing LTP shell helper paths, missing kernel config/proc data, socket/protocol gaps, and named LTP case failures. |
-| `unixbench-glibc` | `GROUP START` line 4964, timeout line 4981, `test fail` line 4983 | Fails by initcode timeout after running benchmark output. No early `can't create pipe` marker. |
-| `lmbench-glibc` | `GROUP START` line 4988, timeout line 4998, `test fail` line 5000 | Fails by initcode timeout after partial latency output. No `cp: not found` marker. |
-| `ltp-glibc` | `GROUP START` line 5005, timeout line 5023, `test fail` line 5025 | Fails after starting `abort01`. The previous 4 `waitpid(...,0) failed: EINTR` lines are gone. Real failures remain: `abort01` coredump expectation fails, the group still hits wrapper timeout, and later glibc LTP cases are not reached in this run. |
+| `libctest-musl` | `GROUP END` line 813 | Clean in this log: no focused failure marker in the group. Static and dynamic pthread cases reach END. |
+| `busybox-musl` | `GROUP END` line 1060 | Clean in this log: focused busybox subtests report success, including `which ls` line 852 and shell `kill $!` line 868. |
+| `cyclictest-musl` | `GROUP END` line 1110 | Clean in this log. `/dev/cpu_dma_latency` warnings remain optional cyclictest PM-QoS noise. |
+| `netperf-musl` | `GROUP END` line 1168 | Clean in this log: all five netperf subtests report success at lines 1128-1167. |
+| `iperf-musl` | `GROUP END` line 1294 | Clean in this log: no focused failure marker in the group. |
+| `iozone-musl` | `GROUP END` line 1699 | Clean in this log: all visible iozone phases reach `iozone test complete`. |
+| `lua-musl` | `GROUP END` line 1716 | Clean in this log: all Lua subtests report success. |
+| `basic-musl` | `GROUP END` line 1905 | Clean in this log: no focused failure marker in the group. |
+| `libcbench-glibc` | `GROUP END` line 1994 | Clean in this log. The previous stdio `[SEGV]` remains gone. |
+| `libctest-glibc` | `GROUP END` line 3423 | Fails internally. First visible failing case is `FAIL clocale_mbfuncs [status 1]` at line 2319; multiple glibc libc semantic cases, `pthread_cancel`, and `sscanf_long` still fail or time out. No `[SEGV]` occurs. |
+| `busybox-glibc` | `GROUP END` line 3670 | Clean in this log: focused busybox subtests report success, including `which ls` line 3462 and shell `kill $!` line 3478. |
+| `cyclictest-glibc` | `GROUP END` line 3720 | Clean in this log: no focused failure marker. |
+| `netperf-glibc` | `GROUP END` line 3772 | Fails internally: `UDP_STREAM` reports `end: fail` at line 3732; TCP_STREAM, UDP_RR, TCP_RR, and TCP_CRR all report success at lines 3741/3751/3761/3771. |
+| `iperf-glibc` | `GROUP END` line 3899 | Clean in this log: no focused failure marker in the group. |
+| `iozone-glibc` | `GROUP END` line 4304 | Clean in this log: no `Fork failed` marker; all visible iozone phases reach `iozone test complete`. |
+| `lua-glibc` | `GROUP END` line 4321 | Clean in this log: all Lua subtests report success. |
+| `basic-glibc` | `GROUP END` line 4510 | Clean in this log: no focused failure marker in the group. |
+| `unixbench-musl` | `GROUP START` line 4517, timeout line 4534, `test fail` line 4536 | Fails by initcode timeout after running benchmark output. No early `can't create pipe` marker. |
+| `lmbench-musl` | `GROUP START` line 4541, timeout line 4552, `test fail` line 4554 | Fails by initcode timeout after partial latency output. No `cp: not found` marker. |
+| `ltp-musl` | `GROUP START` line 4559, timeout line 5201, `test fail` line 5203 | Fails after running named LTP cases. New targeted progress: no unknown syscall 36/89/171/217/219; `access02` passes symlink setup and reports TPASS for file/symlink access checks before executable script behavior TFAIL; `access04` reports TPASS for all six errno checks as root and nobody; `adjtimex02` internal checks are TPASS. Real failures remain: `abort01`, `accept02` checkpoint timeout, `access01` child-result reporting, `access02` executable script behavior, kernel config/proc gaps, AF_ALG/AIO unsupported configs, alarm semantics, protocol gaps, and shell helper failures. |
+| `unixbench-glibc` | `GROUP START` line 5208, timeout line 5224, `test fail` line 5226 | Fails by initcode timeout after running benchmark output. No early `can't create pipe` marker. |
+| `lmbench-glibc` | `GROUP START` line 5232, timeout line 5240, `test fail` line 5242 | Fails by initcode timeout after partial latency output. No `cp: not found` marker. |
+| `ltp-glibc` | `GROUP START` line 5247, timeout line 5265, `test fail` line 5267 | Fails after starting `abort01`: coredump expectation fails, then the group hits wrapper timeout before later glibc LTP cases are reached. |
 
 Focused checks in the latest RISC-V log:
 
@@ -70,50 +70,51 @@ Focused checks in the latest RISC-V log:
 all_24_groups_seen=True
 sys_shutdown=True
 panic=False
-unknown_syscall=True              # LTP-only: 89, 217, 219, 171
+unknown_syscall=False
 function_not_implemented=False
 interrupted_system_call=False
 segv=False
 wait_failed_eperm=False
-waitpid_eintr=False               # was 37 total in the previous log
+waitpid_eintr=False
 explicit_group_or_wrapper_fail=True
 busybox_subtest_fail=False
 pipe_or_fd_startup_error=False
 cp_not_found=False
 basename_not_found=False
-fork_failed=True                  # iozone-glibc internal marker
+fork_failed=False
 netperf_end_fail=True             # netperf-glibc UDP_STREAM only
 ```
 
-Strict current count: 15 clean groups, 9 failing groups. This deliberately treats internal `FAIL`, netperf `end: fail`, iozone `Fork failed`, benchmark timeouts, and LTP `FAIL LTP CASE` lines as real failures instead of relying on `GROUP END` or wrapper markers.
+Strict current count: 16 clean groups, 8 failing groups. This deliberately treats internal `FAIL`, netperf `end: fail`, benchmark timeouts, and LTP `FAIL LTP CASE` lines as real failures instead of relying on `GROUP END` or wrapper markers.
 
 ## This Iteration
 
-- RISC-V signal delivery now supports minimal `SA_RESTART` for `wait4(260)`. The syscall dispatcher snapshots the current syscall number and original `a0`-`a5` arguments before the return value overwrites `a0`; signal delivery uses that snapshot only when a `wait4` returns `-EINTR` and the delivered handler has `SA_RESTART`.
-- This fixes the LTP harness-level `waitpid(...,0) failed: EINTR` breakage without making futex, accept, nanosleep, or other interruptible syscalls restart implicitly. Those paths still return `-EINTR` where cancellation or timeout behavior depends on it.
-- `SA_RESTART` is now defined in the RISC-V signal constants, and the restart snapshot is reset in `proc_alloc` with the rest of per-process signal state.
-- `libctest-glibc` was investigated first. The current visible failures are not a small kernel-semantic patch: locale/stdio/fnmatch cases are glibc-vs-musl libc-test semantics, dynamic pthread cancellation aborts before kernel behavior because `libgcc_s.so.1` is absent, `daemon_failure` is explicitly documented by the test as musl-specific behavior, and static glibc `pthread_cancel` still needs future RISC-V signal-unwind/VDSO-compatible work.
+- RISC-V syscall table now registers `symlinkat(36)` and the set*id family needed by libc/LTP (`setregid(143)`, `setreuid(145)`, `setresuid(147)`, `setresgid(149)`), in addition to the earlier `acct(89)`, `adjtimex(171)`, `add_key(217)`, and `keyctl(219)` work.
+- `proc_t` now carries minimal `uid/euid/gid/egid`; fork/clone inherit these credentials; `getuid/geteuid/getgid/getegid` return the current fields. Root can switch ids, non-root can only keep already held ids, and saved ids are not modeled.
+- memfs now stores file mode/uid/gid, exposes read-only `/etc/passwd` and `/etc/group` with root/nobody/nogroup entries, and lets `fchmodat`/`fchownat` update memfs metadata.
+- memfs symlinks are supported for current LTP needs: `symlinkat` creates links, `readlinkat` reads them, `open`/`access` follow final symlinks, and loops return `ELOOP`.
+- `mount(..., MS_REMOUNT|MS_RDONLY, ...)` records a memfs read-only mount point so `access(W_OK)` returns `EROFS` for LTP read-only filesystem checks.
+- The fixed RV docker rerun reached `sys_shutdown` and confirms `access04` fully reaches TPASS markers for its errno matrix, while remaining failures are still recorded as real gaps.
 
 ## Remaining Real Gaps
 
 Current failing groups in log order:
 
-1. `libctest-glibc`: earliest marker is `FAIL clocale_mbfuncs [status 1]`; static `pthread_cancel` still times out, dynamic pthread cancellation aborts due missing `libgcc_s.so.1`, and several locale/stdio/regex cases fail under glibc libc semantics.
-2. `netperf-glibc`: improved but still fails internally; only `UDP_STREAM end: fail` remains in the latest log.
-3. `iozone-glibc`: internal `Fork failed` markers remain.
-4. `unixbench-musl`: benchmark runs but hits initcode timeout/test-fail.
-5. `lmbench-musl`: latency measurements run but hits initcode timeout/test-fail.
-6. `ltp-musl`: LTP runs with named cases and no longer has harness `waitpid(...)=EINTR`, but still has unknown syscalls, helper/proc/config gaps, socket/protocol gaps, and many named case failures.
-7. `unixbench-glibc`: benchmark runs but hits initcode timeout/test-fail.
-8. `lmbench-glibc`: latency measurements run but hits initcode timeout/test-fail.
-9. `ltp-glibc`: no longer has harness `waitpid(...)=EINTR`, but starts with `abort01` coredump failure and still hits wrapper timeout before later cases.
+1. `libctest-glibc`: earliest marker is `FAIL clocale_mbfuncs [status 1]`; static/dynamic cancellation, stdio, locale, DNS, and regex cases still fail or time out under glibc libc semantics.
+2. `netperf-glibc`: `UDP_STREAM end: fail` remains; TCP_STREAM, UDP_RR, TCP_RR, and TCP_CRR are success in the latest log.
+3. `unixbench-musl`: benchmark runs but hits initcode timeout/test-fail.
+4. `lmbench-musl`: latency measurements run but hits initcode timeout/test-fail.
+5. `ltp-musl`: early syscall/socket/procfs/passwd/symlink/access/adjtimex blockers improved, but real failures remain in coredump, checkpointing, child result reporting, executable script behavior, config/proc exposure, AF/protocol support, alarm semantics, and helper scripts.
+6. `unixbench-glibc`: benchmark runs but hits initcode timeout/test-fail.
+7. `lmbench-glibc`: latency measurements run but hits initcode timeout/test-fail.
+8. `ltp-glibc`: starts with `abort01` coredump failure and hits wrapper timeout before later cases.
 
-Do not treat wrapper `test end` or `GROUP END` as testsuite success.
+Do not treat wrapper `test end`, `GROUP END`, or `FAIL LTP CASE ... : 0` as testsuite success.
 
 ## Public-Path Risk Notes
 
-This iteration touched shared process, syscall, and signal paths: `src/kernel/proc/type.h`, `src/kernel/proc/proc.c`, `src/kernel/syscall/syscall.c`, and `src/kernel/trap/trap_user.c`. Future work must regression-check with `make all` and the fixed RV docker command before committing.
+This iteration touched shared syscall, process, and filesystem paths: `src/kernel/syscall/type.h`, `src/kernel/syscall/syscall.c`, `src/kernel/syscall/sysfunc.c`, `src/kernel/fs/type.h`, `src/kernel/fs/method.h`, `src/kernel/fs/fs.c`, `src/kernel/fs/socket.c`, `src/kernel/proc/type.h`, and `src/kernel/proc/proc.c`. Future work must regression-check with `make all` and the fixed RV docker command before committing semantic changes.
 
-The `SA_RESTART` fix is intentionally narrow. It does not implement Linux restart blocks, queued signals, alternate signal stacks, VDSO `__vdso_rt_sigreturn`, signal-frame CFI, job control, or complete process-group signaling. It only restores the original syscall PC and arguments for `wait4` when the interrupted handler explicitly has restart semantics.
+The compatibility work is intentionally narrow. It does not implement BSD process accounting, Linux key retention, real adjtimex clock discipline, full `O_PATH`/`open_tree` semantics, full VFS symlink/component resolution, mount namespaces, saved uid/gid/capabilities, or a full procfs maps implementation for arbitrary target processes.
 
 The forbidden grader images `data/sdcard-rv.img.gz` and `data/sdcard-la.img.gz` must remain unmodified. Root-level temporary image files may be removed before fixed RV reruns and before commit staging.

@@ -33,6 +33,7 @@
 #define SYS_getcwd 17            // Linux/RISC-V getcwd
 #define SYS_mount 40             // Linux/RISC-V mount
 #define SYS_umount2 39           // Linux/RISC-V umount2
+#define SYS_symlinkat 36         // Linux/RISC-V symlinkat
 #define SYS_link 37              // Linux/RISC-V linkat
 #define SYS_renameat 38          // Linux/RISC-V renameat
 #define SYS_statfs 43            // Linux/RISC-V statfs
@@ -48,13 +49,17 @@
 #define SYS_rt_sigprocmask 135   // 信号屏蔽 (暂桩)
 #define SYS_rt_sigtimedwait 137  // Linux/RISC-V rt_sigtimedwait
 #define SYS_rt_sigreturn 139     // Linux/RISC-V rt_sigreturn
-#define SYS_setgid 144           // 暂桩返回 0
-#define SYS_setuid 146           // 暂桩返回 0
+#define SYS_setregid 143         // Linux/RISC-V setregid
+#define SYS_setgid 144           // Linux/RISC-V setgid
+#define SYS_setreuid 145         // Linux/RISC-V setreuid
+#define SYS_setuid 146           // Linux/RISC-V setuid
+#define SYS_setresuid 147        // Linux/RISC-V setresuid
+#define SYS_setresgid 149        // Linux/RISC-V setresgid
 #define SYS_setpgid 154          // Linux/RISC-V setpgid
 #define SYS_setsid 157           // Linux/RISC-V setsid
 #define SYS_times 153            // Linux/RISC-V times
-#define SYS_getuid 174           // 返回 0 (root)
-#define SYS_getgid 176           // 返回 0
+#define SYS_getuid 174           // Linux/RISC-V getuid
+#define SYS_getgid 176           // Linux/RISC-V getgid
 #define SYS_writev 66            // Linux/RISC-V writev
 #define SYS_exit_group 94        // exit_group (单线程下等价 exit)
 #define SYS_fcntl 25             // fcntl(fd,cmd,arg)
@@ -91,6 +96,10 @@
 #define SYS_shmctl 195           // Linux/RISC-V shmctl
 #define SYS_shmat 196            // Linux/RISC-V shmat
 #define SYS_shmdt 197            // Linux/RISC-V shmdt
+#define SYS_acct 89              // Linux/RISC-V acct
+#define SYS_adjtimex 171         // Linux/RISC-V adjtimex
+#define SYS_add_key 217          // Linux/RISC-V add_key
+#define SYS_keyctl 219           // Linux/RISC-V keyctl
 #define SYS_madvise 233          // Linux/RISC-V madvise
 #define SYS_readlinkat 78        // Linux/RISC-V readlinkat
 #define SYS_sched_yield 124      // Linux/RISC-V sched_yield
