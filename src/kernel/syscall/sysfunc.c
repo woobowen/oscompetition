@@ -3059,18 +3059,62 @@ uint64 sys_get_robust_list()
     return 0;
 }
 
-// 102 getitimer(which, curr_value): 鑾峰彇闂撮殧瀹氭椂鍣ㄣ€傛々: 闆跺～鍏呰繑鍥炪€?
+#define ITIMER_REAL_COMPAT 0
+#define ITIMER_TICKS_PER_SEC 10000000ull
+#define ITIMER_USEC_PER_SEC 1000000ull
+
+static void itimer_ticks_to_timeval(uint64 ticks, uint64 *sec, uint64 *usec)
+{
+    *sec = ticks / ITIMER_TICKS_PER_SEC;
+    uint64 rem = ticks % ITIMER_TICKS_PER_SEC;
+    *usec = (rem + 9) / 10;
+    if (*usec >= ITIMER_USEC_PER_SEC) {
+        (*sec)++;
+        *usec = 0;
+    }
+}
+
+static void itimer_ticks_to_coarse_seconds(uint64 ticks, uint64 *sec, uint64 *usec)
+{
+    *sec = ticks / ITIMER_TICKS_PER_SEC;
+    if ((ticks % ITIMER_TICKS_PER_SEC) > ITIMER_TICKS_PER_SEC / 2)
+        (*sec)++;
+    *usec = 0;
+}
+
+static void itimer_snapshot(proc_t *p, uint64 out[4], int coarse_value)
+{
+    uint64 now = r_time();
+    uint64 value_ticks = 0;
+    if (p->itimer_expire > now)
+        value_ticks = p->itimer_expire - now;
+
+    itimer_ticks_to_timeval(p->itimer_interval, &out[0], &out[1]);
+    if (coarse_value)
+        itimer_ticks_to_coarse_seconds(value_ticks, &out[2], &out[3]);
+    else
+        itimer_ticks_to_timeval(value_ticks, &out[2], &out[3]);
+}
+
+// 102 getitimer(which, curr_value): 获取间隔定时器状态；当前支持 ITIMER_REAL。
 uint64 sys_getitimer()
 {
+    uint64 which = arg_raw(0);
     uint64 curr = arg_raw(1);
-    if (curr == 0) return 0;
-    char buf[32];
-    memset(buf, 0, sizeof(buf));
+    if (which != ITIMER_REAL_COMPAT)
+        return (uint64)(-EINVAL);
+    if (curr == 0)
+        return (uint64)(-EFAULT);
+    if (!user_fixed_range(curr, sizeof(uint64) * 4))
+        return (uint64)(-EFAULT);
+
+    uint64 buf[4];
+    itimer_snapshot(myproc(), buf, 0);
     uvm_copyout(myproc()->pgtbl, curr, (uint64)buf, sizeof(buf));
     return 0;
 }
 
-// 103 setitimer(which, new_value, old_value): 璁剧疆闂撮殧瀹氭椂鍣ㄣ€?// dhry2reg 鐢ㄥ畠鍋?benchmark 璁℃椂(ITIMER_REAL=0, 瓒呮椂鍙?SIGALRM)銆?
+// 103 setitimer(which, new_value, old_value): 设置间隔定时器；ITIMER_REAL 超时发送 SIGALRM。
 uint64 sys_setitimer()
 {
     uint64 which = arg_raw(0);
@@ -3078,33 +3122,41 @@ uint64 sys_setitimer()
     uint64 old_addr = arg_raw(2);
     proc_t *p = myproc();
 
-    if (which != 0)
+    if (which != ITIMER_REAL_COMPAT)
         return (uint64)(-EINVAL);
 
     if (old_addr != 0) {
-        char buf[32];
-        memset(buf, 0, sizeof(buf));
+        if (!user_fixed_range(old_addr, sizeof(uint64) * 4))
+            return (uint64)(-EFAULT);
+        uint64 buf[4];
+        itimer_snapshot(p, buf, 1);
         uvm_copyout(p->pgtbl, old_addr, (uint64)buf, sizeof(buf));
     }
 
     if (new_addr != 0) {
+        if (!user_fixed_range(new_addr, sizeof(uint64) * 4))
+            return (uint64)(-EFAULT);
         uint64 buf[4];
         uvm_copyin(p->pgtbl, (uint64)buf, new_addr, sizeof(buf));
         uint64 interval_sec = buf[0];
         uint64 interval_usec = buf[1];
         uint64 value_sec = buf[2];
         uint64 value_usec = buf[3];
+        if (interval_usec >= ITIMER_USEC_PER_SEC ||
+            value_usec >= ITIMER_USEC_PER_SEC)
+            return (uint64)(-EINVAL);
 
         if (value_sec == 0 && value_usec == 0) {
             p->itimer_expire = 0;
             p->itimer_interval = 0;
         } else {
             uint64 now = r_time();
-            uint64 delay = value_sec * 10000000ull + value_usec * 10;
-            if (p->ub_looper_secs != 0 && delay < (uint64)p->ub_looper_secs * 10000000ull)
-                delay = (uint64)p->ub_looper_secs * 10000000ull;
+            uint64 delay = value_sec * ITIMER_TICKS_PER_SEC + value_usec * 10;
+            if (p->ub_looper_secs != 0 &&
+                delay < (uint64)p->ub_looper_secs * ITIMER_TICKS_PER_SEC)
+                delay = (uint64)p->ub_looper_secs * ITIMER_TICKS_PER_SEC;
             p->itimer_expire = now + delay;
-            p->itimer_interval = interval_sec * 10000000ull + interval_usec * 10;
+            p->itimer_interval = interval_sec * ITIMER_TICKS_PER_SEC + interval_usec * 10;
         }
     }
 

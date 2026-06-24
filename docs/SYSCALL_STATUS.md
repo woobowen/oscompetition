@@ -56,8 +56,8 @@
 | 99 | set_robust_list | 记录每线程 robust futex list head/len，退出时用于 owner-death 标记 |
 | 100 | get_robust_list | 返回当前或指定 pid 的 robust futex list head/len |
 | 101 | nanosleep(兼容) | |
-| 102 | getitimer | 桩，零填充返回 |
-| 103 | setitimer | ITIMER_REAL → proc_t.itimer_expire/interval |
+| 102 | getitimer | ITIMER_REAL current/interval snapshot；暂不支持 VIRTUAL/PROF |
+| 103 | setitimer | ITIMER_REAL → proc_t.itimer_expire/interval；old_value 返回兼容 alarm 的剩余秒数 |
 | 113 | clock_gettime | |
 | 114 | clock_getres | 最小兼容分辨率返回 |
 | 115 | clock_nanosleep | 支持相对睡眠与 TIMER_ABSTIME 绝对睡眠 |

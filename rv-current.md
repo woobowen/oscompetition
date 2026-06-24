@@ -59,10 +59,10 @@ RV initcode enumerates the full `/musl` 12 groups plus `/glibc` 12 groups. The c
 | `basic-glibc` | `GROUP END` line 4510 | Clean in this log: no focused failure marker in the group. |
 | `unixbench-musl` | `GROUP START` line 4517, timeout line 4534, `test fail` line 4536 | Fails by initcode timeout after running benchmark output. No early `can't create pipe` marker. |
 | `lmbench-musl` | `GROUP START` line 4541, timeout line 4552, `test fail` line 4554 | Fails by initcode timeout after partial latency output. No `cp: not found` marker. |
-| `ltp-musl` | `GROUP START` line 4559, timeout line 5201, `test fail` line 5203 | Fails after running named LTP cases. New targeted progress: no unknown syscall 36/89/171/217/219; `access02` passes symlink setup and reports TPASS for file/symlink access checks before executable script behavior TFAIL; `access04` reports TPASS for all six errno checks as root and nobody; `adjtimex02` internal checks are TPASS. Real failures remain: `abort01`, `accept02` checkpoint timeout, `access01` child-result reporting, `access02` executable script behavior, kernel config/proc gaps, AF_ALG/AIO unsupported configs, alarm semantics, protocol gaps, and shell helper failures. |
+| `ltp-musl` | `GROUP START` line 4560, timeout line 5201, `test fail` line 5203 | Fails after running named LTP cases. New targeted progress: `alarm02`, `alarm03`, `alarm05`, and `alarm06` now report only TPASS lines for their real assertions; alarm-related TFAIL count dropped from 6 to 0 versus the previous baseline. Existing progress remains: no unknown syscall 36/89/171/217/219; `access02` passes symlink setup and reports TPASS for file/symlink access checks before executable script behavior TFAIL; `access04` reports TPASS for all six errno checks as root and nobody; `adjtimex02` internal checks are TPASS. Real failures remain: `abort01`, `accept02` checkpoint timeout, `access01` child-result reporting, `access02` executable script behavior, kernel config/proc gaps, AF_ALG/AIO unsupported configs, protocol gaps, and shell helper failures. |
 | `unixbench-glibc` | `GROUP START` line 5208, timeout line 5224, `test fail` line 5226 | Fails by initcode timeout after running benchmark output. No early `can't create pipe` marker. |
 | `lmbench-glibc` | `GROUP START` line 5232, timeout line 5240, `test fail` line 5242 | Fails by initcode timeout after partial latency output. No `cp: not found` marker. |
-| `ltp-glibc` | `GROUP START` line 5247, timeout line 5265, `test fail` line 5267 | Fails after starting `abort01`: coredump expectation fails, then the group hits wrapper timeout before later glibc LTP cases are reached. |
+| `ltp-glibc` | `GROUP START` line 5246, timeout line 5264, `test fail` line 5266 | Fails after starting `abort01`: coredump expectation fails, then the group hits wrapper timeout before later glibc LTP cases are reached. |
 
 Focused checks in the latest RISC-V log:
 
@@ -89,12 +89,11 @@ Strict current count: 16 clean groups, 8 failing groups. This deliberately treat
 
 ## This Iteration
 
-- RISC-V syscall table now registers `symlinkat(36)` and the set*id family needed by libc/LTP (`setregid(143)`, `setreuid(145)`, `setresuid(147)`, `setresgid(149)`), in addition to the earlier `acct(89)`, `adjtimex(171)`, `add_key(217)`, and `keyctl(219)` work.
-- `proc_t` now carries minimal `uid/euid/gid/egid`; fork/clone inherit these credentials; `getuid/geteuid/getgid/getegid` return the current fields. Root can switch ids, non-root can only keep already held ids, and saved ids are not modeled.
-- memfs now stores file mode/uid/gid, exposes read-only `/etc/passwd` and `/etc/group` with root/nobody/nogroup entries, and lets `fchmodat`/`fchownat` update memfs metadata.
-- memfs symlinks are supported for current LTP needs: `symlinkat` creates links, `readlinkat` reads them, `open`/`access` follow final symlinks, and loops return `ELOOP`.
-- `mount(..., MS_REMOUNT|MS_RDONLY, ...)` records a memfs read-only mount point so `access(W_OK)` returns `EROFS` for LTP read-only filesystem checks.
-- The fixed RV docker rerun reached `sys_shutdown` and confirms `access04` fully reaches TPASS markers for its errno matrix, while remaining failures are still recorded as real gaps.
+- `getitimer(102)` now reports the current `ITIMER_REAL` interval and remaining value instead of zero-filling the user buffer.
+- `setitimer(103)` now fills `old_value`, validates user pointers and microsecond fields, and keeps `ITIMER_REAL` delivery through `proc_t.itimer_expire/interval`.
+- `setitimer(..., old_value)` reports the active remaining value in coarse seconds for the current 0.1s SeaOS timer granularity. This preserves immediate `alarm(sec); alarm(0)` results and avoids musl `alarm()` returning one extra second after `sleep(1)`.
+- The fixed RV docker rerun reached `sys_shutdown` at line 5267. The 24-group status remains unchanged from the baseline: 24 groups seen, 18 groups with `GROUP END`, and 6 timeout/test-fail wrapper markers.
+- LTP alarm evidence improved: alarm-related TFAIL lines dropped from 6 to 0, and alarm-related TPASS lines rose from 7 to 13. `alarm02`, `alarm03`, `alarm05`, and `alarm06` now all pass their visible real assertions in `ltp-musl`.
 
 ## Remaining Real Gaps
 
@@ -104,7 +103,7 @@ Current failing groups in log order:
 2. `netperf-glibc`: `UDP_STREAM end: fail` remains; TCP_STREAM, UDP_RR, TCP_RR, and TCP_CRR are success in the latest log.
 3. `unixbench-musl`: benchmark runs but hits initcode timeout/test-fail.
 4. `lmbench-musl`: latency measurements run but hits initcode timeout/test-fail.
-5. `ltp-musl`: early syscall/socket/procfs/passwd/symlink/access/adjtimex blockers improved, but real failures remain in coredump, checkpointing, child result reporting, executable script behavior, config/proc exposure, AF/protocol support, alarm semantics, and helper scripts.
+5. `ltp-musl`: early syscall/socket/procfs/passwd/symlink/access/adjtimex/alarm blockers improved, but real failures remain in coredump, checkpointing, child result reporting, executable script behavior, config/proc exposure, AF/protocol support, and helper scripts.
 6. `unixbench-glibc`: benchmark runs but hits initcode timeout/test-fail.
 7. `lmbench-glibc`: latency measurements run but hits initcode timeout/test-fail.
 8. `ltp-glibc`: starts with `abort01` coredump failure and hits wrapper timeout before later cases.
@@ -113,8 +112,8 @@ Do not treat wrapper `test end`, `GROUP END`, or `FAIL LTP CASE ... : 0` as test
 
 ## Public-Path Risk Notes
 
-This iteration touched shared syscall, process, and filesystem paths: `src/kernel/syscall/type.h`, `src/kernel/syscall/syscall.c`, `src/kernel/syscall/sysfunc.c`, `src/kernel/fs/type.h`, `src/kernel/fs/method.h`, `src/kernel/fs/fs.c`, `src/kernel/fs/socket.c`, `src/kernel/proc/type.h`, and `src/kernel/proc/proc.c`. Future work must regression-check with `make all` and the fixed RV docker command before committing semantic changes.
+This iteration touched the shared syscall implementation path: `src/kernel/syscall/sysfunc.c`. Future work must regression-check with `make all` and the fixed RV docker command before committing semantic changes.
 
-The compatibility work is intentionally narrow. It does not implement BSD process accounting, Linux key retention, real adjtimex clock discipline, full `O_PATH`/`open_tree` semantics, full VFS symlink/component resolution, mount namespaces, saved uid/gid/capabilities, or a full procfs maps implementation for arbitrary target processes.
+The compatibility work is intentionally narrow. It does not implement BSD process accounting, Linux key retention, real adjtimex clock discipline, full `O_PATH`/`open_tree` semantics, full VFS symlink/component resolution, mount namespaces, saved uid/gid/capabilities, full VIRTUAL/PROF interval timers, or a full procfs maps implementation for arbitrary target processes.
 
 The forbidden grader images `data/sdcard-rv.img.gz` and `data/sdcard-la.img.gz` must remain unmodified. Root-level temporary image files may be removed before fixed RV reruns and before commit staging.
