@@ -727,10 +727,13 @@ void la_signal_deliver(struct la_trap_frame *tf)
 
     /* Default actions */
     if (p->sig_actions[sig].handler == LA_SIG_DFL) {
-        /* Most signals terminate the process by default.
-         * SIGCHLD, SIGCONT, SIGURG are ignored by default.
-         * SIGSTOP/SIGTSTP stop by default. */
-        if (sig == LA_SIGCHLD || sig == LA_SIGCONT) {
+        /* Signals ignored by default on Linux:
+         *   SIGCHLD(17), SIGURG(23), SIGWINCH(28), SIGCONT(18).
+         * RT signals (32–63) are used by libc internally (SIGCANCEL,
+         * SIGSETXID, etc.) — ignoring by default lets the libc install
+         * its own handler before the signal can kill the process. */
+        if (sig == LA_SIGCHLD || sig == LA_SIGCONT
+            || sig == 23 || sig == 28 || sig >= 32) {
             return;  /* default: ignore */
         }
         /* Default: terminate */

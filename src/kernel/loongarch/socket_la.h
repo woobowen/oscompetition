@@ -95,6 +95,8 @@ int  la_sock_accept(int idx, uint32_t *uaddr, uint16_t *uport);
 int  la_sock_send(int idx, const void *buf, uint32_t len);
 int  la_sock_recv(int idx, void *buf, uint32_t len);
 void la_sock_close(int idx);
+void la_sock_connect_pair(int a, int b);
+int  la_sock_alloc(void);
 int  la_sock_sendto(int idx, const void *buf, uint32_t len,
                     uint32_t addr, uint16_t port);
 int  la_sock_recvfrom(int idx, void *buf, uint32_t len,

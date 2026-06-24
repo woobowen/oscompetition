@@ -132,6 +132,7 @@
 
 /* Socket family (real loopback implementations) */
 #define SYS_socket          198
+#define SYS_socketpair      199
 #define SYS_bind            200
 #define SYS_listen          201
 #define SYS_accept          202
@@ -172,6 +173,8 @@
 #define LA_ENOSPC  28
 #define LA_ESPIPE  29
 #define LA_ENAMETOOLONG 36
+#define LA_ENFILE  23
+#define LA_EAFNOSUPPORT 97
 #define LA_EPIPE   32
 #define LA_ECONNRESET  104
 #define LA_ECONNREFUSED 111
@@ -1049,36 +1052,14 @@ static uint64_t sys_exec(struct la_trap_frame *tf)
     if (la_copy_str_from_user(path, upath, sizeof(path) - 1) < 0)
         return (uint64_t)(-LA_EFAULT);
 
-    /* Redirect any busybox binary to the musl-linked one.  glibc-linked
-     * busybox crashes on exit due to incomplete TLS/TCB setup.  The
-     * musl version is functionally identical for all test-script uses
-     * (echo, sh, etc.).  argv[0] is preserved so applet dispatch works. */
-    {
-        int len = 0;
-        while (path[len] && len < 255) len++;
-        char *name = path + len;
-        while (name > path && name[-1] != '/') name--;
-        if (len >= 7 && name[0] == 'b' && name[1] == 'u' && name[2] == 's'
-            && name[3] == 'y' && name[4] == 'b' && name[5] == 'o'
-            && name[6] == 'x' && (name[7] == 0 || name[7] == '/')) {
-            /* busybox found — use musl version */
-            uint64_t rc = la_do_exec_syscall(tf, "/musl/busybox", uargv);
-            if (rc != (uint64_t)-1) return rc;
-            /* fall through if musl busybox can't be loaded */
-        }
-    }
-
-    /* la_do_exec_syscall returns (uint64_t)-1 on any failure (file not
-     * found, bad ELF, no memory).  Map that to -ENOENT so callers see a
-     * sensible errno instead of -1, which musl reads as EPERM and busybox
-     * prints as "Operation not permitted". */
+    /* Exec the target binary.  Static glibc binaries self-initialise TLS
+     * via __libc_setup_tls() when tp=0 — the kernel no longer redirects
+     * them to musl equivalents. */
     uint64_t rc = la_do_exec_syscall(tf, path, uargv);
     if (rc == (uint64_t)-1) {
-        /* Busybox applet fallback: for bare command names or standard
-         * bin paths, retry with /musl/busybox.  argv[0] is preserved. */
-        la_uart_puts("  exec: FAIL for ");
-        la_uart_puts(path);
-        la_uart_puts("\n");
+        /* Busybox applet fallback: for missing commands (e.g. basename,
+         * dirname), retry with /musl/busybox.  argv[0] is preserved so
+         * busybox dispatches to the right applet. */
         rc = la_do_exec_syscall(tf, "/musl/busybox", uargv);
         if (rc == (uint64_t)-1)
             return (uint64_t)(-LA_ENOENT);
@@ -1395,7 +1376,7 @@ static uint64_t sys_set_tid_address(struct la_trap_frame *tf)
 static uint64_t sys_set_robust_list(struct la_trap_frame *tf)
 {
     (void)tf;
-    return 0;
+    return 0; /* stub: glibc needs ENOSYS ideally, but musl expects 0 */
 }
 
 /* SYS_futex (98): fast userspace mutual exclusion.
@@ -2238,17 +2219,28 @@ static uint64_t sys_clone(struct la_trap_frame *tf)
     uint64_t ctid     = tf->gpr[LA_GPR_A3];   /* a3 = child_tid */
     uint64_t tls      = tf->gpr[LA_GPR_A4];   /* a4 = tls */
 
-    /* ---- Non-CLONE_VM: act like fork ---- */
+    /* ---- Non-CLONE_VM: act like fork, but honour clone's tid pointers ---- */
     if ((flags & 0x00000100UL) == 0) {
-        if (new_stack == 0)
-            return sys_fork(tf);
-        /* Clone without VM sharing but with a new stack — fork semantics. */
         uint64_t ret = sys_fork(tf);
-        if (ret == 0) {
-            /* Child: set new stack pointer */
-            struct la_proc *child = la_current_proc();
-            if (child && child->tf)
-                child->tf->gpr[LA_GPR_SP] = new_stack;
+        if (ret > 0) {
+            /* Parent: write child tid to ptid if CLONE_PARENT_SETTID */
+            if ((flags & 0x00100000UL) && ptid != 0) {
+                int cpid = (int)ret;
+                la_copy_to_user(ptid, &cpid, sizeof(cpid));
+            }
+            /* Find child to set clear_child_tid */
+            if ((flags & 0x00200000UL) && ctid != 0) {
+                struct la_proc *child = la_proc_by_pid((int)ret);
+                if (child)
+                    child->clear_child_tid = ctid;
+            }
+        } else if (ret == 0) {
+            /* Child: set new stack pointer if provided */
+            if (new_stack != 0) {
+                struct la_proc *child = la_current_proc();
+                if (child && child->tf)
+                    child->tf->gpr[LA_GPR_SP] = new_stack;
+            }
         }
         return ret;
     }
@@ -2928,6 +2920,59 @@ static int la_put_sockaddr_in(uint64_t usockaddr, uint64_t uaddrlen,
     return 0;
 }
 
+/* SYS_socketpair(199): create a pair of connected sockets.
+ * Minimal AF_UNIX SOCK_STREAM pair — two loopback sockets cross-connected.
+ * glibc calls this during startup for internal notification. */
+static uint64_t sys_socketpair(struct la_trap_frame *tf)
+{
+    int domain    = (int)tf->gpr[LA_GPR_A0];
+    int type      = (int)tf->gpr[LA_GPR_A1];
+    uint64_t usv  = tf->gpr[LA_GPR_A3];  /* sv[2] in userspace */
+    struct la_proc *p = la_current_proc();
+
+    if (!p || !usv) return (uint64_t)(-LA_EINVAL);
+
+    /* Only AF_UNIX (1) / AF_LOCAL with SOCK_STREAM */
+    if (domain != 1 || (type & 0xf) != 1)
+        return (uint64_t)(-LA_EAFNOSUPPORT);
+
+    /* Allocate two loopback sockets and connect them to each other */
+    int s1 = la_sock_alloc();
+    int s2 = la_sock_alloc();
+    if (s1 < 0 || s2 < 0) {
+        if (s1 >= 0) la_sock_close(s1);
+        if (s2 >= 0) la_sock_close(s2);
+        return (uint64_t)(-LA_ENFILE);
+    }
+
+    /* Cross-connect: s1 sends → s2 receives, s2 sends → s1 receives */
+    la_sock_connect_pair(s1, s2);
+
+    /* Allocate fd for s1 */
+    int fd1 = -1;
+    for (int i = 0; i < LA_NFD; i++)
+        if (p->fds[i].type == LA_FD_UNUSED) { fd1 = i; break; }
+    if (fd1 < 0) { la_sock_close(s1); la_sock_close(s2); return (uint64_t)(-LA_EMFILE); }
+
+    /* Allocate fd for s2 */
+    int fd2 = -1;
+    for (int i = 0; i < LA_NFD; i++)
+        if (p->fds[i].type == LA_FD_UNUSED && i != fd1) { fd2 = i; break; }
+    if (fd2 < 0) { la_sock_close(s1); la_sock_close(s2); return (uint64_t)(-LA_EMFILE); }
+
+    p->fds[fd1].type     = LA_FD_SOCKET;
+    p->fds[fd1].writable = 1;
+    p->fds[fd1].sock_idx = s1;
+    p->fds[fd2].type     = LA_FD_SOCKET;
+    p->fds[fd2].writable = 1;
+    p->fds[fd2].sock_idx = s2;
+
+    /* Write [fd1, fd2] to user sv */
+    int sv[2] = { fd1, fd2 };
+    la_copy_to_user(usv, sv, sizeof(sv));
+    return 0;
+}
+
 /* SYS_socket(198): socket(domain, type, protocol) → fd */
 static uint64_t sys_socket(struct la_trap_frame *tf)
 {
@@ -3328,8 +3373,7 @@ static uint64_t sys_shutdown(void)
 }
 
 /* ---- Syscall trace counter (first N only) ---- */
-static int la_syscall_trace_count = 0;
-#define LA_SYSCALL_TRACE_MAX 0  /* set to >0 for debugging; UNKNOWN syscalls always logged */
+/* unused: static int la_syscall_trace_count = 0; */
 
 /* SYS_madvise(233): give advice about use of memory (stub).
  * glibc's dynamic linker calls this to mark pages as MADV_DONTNEED. */
@@ -3717,17 +3761,7 @@ uint64_t la_syscall_dispatch(struct la_trap_frame *tf)
         la_fs_cwd_ino = cp ? cp->cwd_ino : 0;
     }
 
-    /* Trace first N syscalls for diagnostics */
-    if (la_syscall_trace_count < LA_SYSCALL_TRACE_MAX) {
-        la_uart_puts("  sys#");
-        la_uart_put_hex(sysno);
-        la_uart_puts(" a0=");
-        la_uart_put_hex(tf->gpr[LA_GPR_A0]);
-        la_uart_puts(" a1=");
-        la_uart_put_hex(tf->gpr[LA_GPR_A1]);
-        la_uart_puts("\n");
-        la_syscall_trace_count++;
-    }
+    /* Per-process syscall trace disabled — set trace_sys=1 on a proc to enable */
 
     switch (sysno) {
     /* Process management */
@@ -3854,6 +3888,7 @@ uint64_t la_syscall_dispatch(struct la_trap_frame *tf)
 
     /* Socket family (real loopback implementations) */
     case SYS_socket:     return sys_socket(tf);
+    case SYS_socketpair: return sys_socketpair(tf);
     case SYS_bind:       return sys_bind(tf);
     case SYS_listen:     return sys_listen(tf);
     case SYS_accept:     return sys_accept(tf);

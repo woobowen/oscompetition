@@ -55,7 +55,7 @@ void la_socket_init(void)
 }
 
 /* Allocate a free socket slot.  Returns index or -1. */
-static int la_sock_alloc(void)
+int la_sock_alloc(void)
 {
     for (int i = 0; i < LA_NSOCK; i++) {
         if (!la_sockets[i].used) {
@@ -391,6 +391,28 @@ int la_sock_recv(int idx, void *buf, uint32_t len)
     }
 
     return (int)chunk;
+}
+
+/* connect_pair(a, b) — cross-connect two sockets directly (no listen/accept).
+ * Used by socketpair(AF_UNIX, SOCK_STREAM).  After this call, data written
+ * to `a` is readable from `b` and vice versa. */
+void la_sock_connect_pair(int a, int b)
+{
+    if (a < 0 || a >= LA_NSOCK || b < 0 || b >= LA_NSOCK) return;
+    if (!la_sockets[a].used || !la_sockets[b].used) return;
+
+    struct la_socket *sa = &la_sockets[a];
+    struct la_socket *sb = &la_sockets[b];
+
+    sa->state = LA_SOCK_ESTABLISHED;
+    sa->peer  = sb;
+    sa->laddr = 0x0100007F;  /* 127.0.0.1 */
+    sa->lport = 0;
+
+    sb->state = LA_SOCK_ESTABLISHED;
+    sb->peer  = sa;
+    sb->laddr = 0x0100007F;
+    sb->lport = 0;
 }
 
 /* close(idx) — TCP close.

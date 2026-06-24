@@ -38,7 +38,6 @@ void *memset(void *d, int c, unsigned long n) __attribute__((alias("la_memset_im
 #define LA_ELF_PROG_LOAD   1
 #define LA_ELF_PROG_INTERP 3
 #define LA_ELF_PROG_PHDR   6
-#define LA_ELF_PROG_TLS    7
 
 /* Fixed base address for loading the dynamic linker (1 GB).
  * Must not overlap the main executable (loaded at 0x120000000+). */
@@ -681,9 +680,6 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
     uint64_t ph_first_vaddr = 0;
     uint64_t max_vaddr = 0;  /* track highest VA+memsz for heap_top init */
     uint64_t phdr_addr = 0;  /* AT_PHDR value: VA of program headers in user memory */
-    uint64_t tls_offset = 0;  /* PT_TLS: file offset of init image */
-    uint64_t tls_filesz = 0;  /* PT_TLS: initialized .tdata size */
-    uint64_t tls_memsz  = 0;  /* PT_TLS: total TLS size (.tdata+.tbss) */
     char     interp_path[128];
     interp_path[0] = '\0';
     uint64_t interp_entry = 0;
@@ -715,14 +711,6 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
             continue;
         }
 
-        /* ---- PT_TLS: record thread-local storage layout ---- */
-        if (ph.p_type == LA_ELF_PROG_TLS) {
-            tls_offset = ph.p_offset;
-            tls_filesz = ph.p_filesz;
-            tls_memsz  = ph.p_memsz;
-            continue;
-        }
-
         if (ph.p_type != LA_ELF_PROG_LOAD || ph.p_memsz == 0)
             continue;
 
@@ -736,6 +724,8 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
 
         la_uart_puts("  exec: LOAD va=");
         la_uart_put_hex(ph.p_vaddr);
+        la_uart_puts(" off=");
+        la_uart_put_hex(ph.p_offset);
         la_uart_puts(" filesz=");
         la_uart_put_hex(ph.p_filesz);
         la_uart_puts(" memsz=");
@@ -816,9 +806,12 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
     if (phdr_addr == 0 && ph_first_vaddr != 0)
         phdr_addr = ph_first_vaddr + eh.e_phoff;
 
-    /* Allocate stack (8 pages, including top page for busybox argv/envp scan) */
+    /* Allocate stack (64 pages = 256 KB).  glibc's __libc_setup_tls and
+     * internal TLS allocator need substantially more stack than the 32 KB
+     * musl uses.  Reference OS 334 allocates 100 pages; 64 is a safe floor
+     * that keeps the pre-mapped stack below the grow_stack threshold. */
     uint64_t stack_top = LA_USER_STACK;
-    for (int si = 0; si < 8; si++) {
+    for (int si = 0; si < 64; si++) {
         uint64_t va = stack_top - (uint64_t)si * LA_PGSIZE;
         uint64_t pa = la_uvm_alloc_page(new_pgtbl, va, EXE_PTE_U_RWX);
         if (pa == 0)
@@ -837,7 +830,7 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
      * one page lower (stack_top - 8*PGSIZE) would leave a permanent 1-page
      * unmapped gap just below the pre-mapped region that growth can never
      * fill, killing any process whose stack pointer crosses it. */
-    p->stack_bottom = stack_top - 8ULL * LA_PGSIZE + LA_PGSIZE;
+    p->stack_bottom = stack_top - 64ULL * LA_PGSIZE + LA_PGSIZE;
 
     /* Initialize heap_top to the end of the highest LOAD segment, page-aligned.
      * brk(0) returns this so busybox knows where heap starts. */
@@ -929,14 +922,14 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
      * check then fails, and musl deliberately crashes (a_crash → badv=0).
      * We therefore push the random bytes ABOVE the AT_NULL terminator,
      * where the loader never parses them. */
-    sp -= 16;                       /* 16 random bytes — highest on stack */
+    sp -= 16;                       /* 16 "random" bytes — highest on stack */
     uint64_t at_rand_base = sp;
-    uint64_t seed = 0xDEADBEEFCAFEBABEULL;
-    seed ^= (uint64_t)new_pgtbl;
-    seed ^= sp;
-    seed ^= (uint64_t)&la_kernel_end;
+    /* Use all-zero bytes: PTR_MANGLE(X) = X ^ 0 = X (no-op).
+     * glibc's __cxa_atexit uses pointer mangling; if guard != 0 it
+     * encrypts function pointers with a key that must match exactly
+     * between mangling and demangling.  Zero guard avoids this. */
     {
-        uint64_t rand_data[2] = { seed, seed * 6364136223846793005ULL + 1ULL };
+        uint64_t rand_data[2] = { 0, 0 };
         la_uvm_copy_in(new_pgtbl, sp, rand_data, 16);
     }
 
@@ -1008,11 +1001,22 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
         la_pmem_free((void *)old_tf);
 
     /* exec replaces the entire process image, so the new image is always a
-     * standalone process (not a CLONE_VM thread).  Reset mm ownership and
-     * thread fields to their default values. */
+     * standalone process (not a CLONE_VM thread).  Reset mm ownership,
+     * thread fields, and signal state to their default values.  Signal
+     * handlers from the old image point to code that no longer exists —
+     * keeping them causes spurious "default kill" on signals like SIGCANCEL
+     * that musl/glibc expect to handle after fresh installation. */
     p->mm         = &p->__mm;
     p->shared_vm  = 0;
     p->clear_child_tid = 0;
+    p->sig_pending = 0;
+    p->sig_mask    = 0;
+    for (int s = 0; s < LA_NSIG; s++) {
+        p->sig_actions[s].handler  = LA_SIG_DFL;
+        p->sig_actions[s].flags    = 0;
+        p->sig_actions[s].restorer = 0;
+        p->sig_actions[s].mask     = 0;
+    }
 
     uint64_t *d = (uint64_t *)new_tf;
     uint64_t *e = (uint64_t *)(new_tf + 1);
@@ -1027,69 +1031,11 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
     new_tf->gpr[LA_GPR_A0] = (uint64_t)argc;
     new_tf->gpr[LA_GPR_A1] = argv_uaddr;      /* &argv[0] = sp + 8 */
 
-    /* ---- TLS (Thread-Local Storage) setup ----
-     * Static glibc binaries need the $tp register set to a valid TLS area
-     * with properly initialized .tdata.  Without this, glibc startup
-     * dereferences a NULL tp → crash at badv=0x3.
-     * TLS Variant 1 (glibc LoongArch): tp points to the TCB at the END of
-     * the TLS data block.  TLS data = .tdata (init image) + .tbss (zero). */
-    if (tls_memsz > 0) {
-        uint64_t tls_block = LA_MMAP_BASE + 0x20000000; /* leave room for mmap */
-        uint64_t tls_pages = (tls_memsz + 0x10 + LA_PGSIZE - 1) / LA_PGSIZE;
-        for (uint64_t pg = 0; pg < tls_pages; pg++) {
-            if (la_uvm_alloc_page(new_pgtbl, tls_block + pg * LA_PGSIZE,
-                                  EXE_PTE_U_RWX) == 0)
-                goto exec_fail;
-        }
-        /* Copy .tdata from ELF file */
-        if (tls_filesz > 0) {
-            uint64_t copied = 0;
-            while (copied < tls_filesz) {
-                uint32_t chunk = 512;
-                if (chunk > (uint32_t)(tls_filesz - copied))
-                    chunk = (uint32_t)(tls_filesz - copied);
-                static __attribute__((aligned(8))) char tls_buf[512];
-                uint32_t n2 = la_fs_read_file(ino, tls_offset + copied,
-                                              tls_buf, chunk);
-                if (n2 != chunk) goto exec_fail;
-                la_uvm_copy_in(new_pgtbl, tls_block + copied, tls_buf, chunk);
-                copied += chunk;
-            }
-        }
-        /* Zero .tbss (from end of .tdata to end of tls_memsz) */
-        if (tls_memsz > tls_filesz) {
-            uint64_t tls_bss_start = tls_block + tls_filesz;
-            uint64_t tls_bss_end   = tls_block + tls_memsz;
-            for (uint64_t zb = tls_bss_start; zb < tls_bss_end; zb++) {
-                uint64_t pa = la_uva_to_pa(new_pgtbl, zb);
-                if (pa) { *(uint8_t *)pa = 0; }
-            }
-        }
-        /* Set up TCB + DTV (Dynamic Thread Vector).
-         * TCB layout (LoongArch glibc tcbhead_t):
-         *   [ 0] dtv_t *dtv    → points to first DTV entry
-         *   [ 8] void  *self   → points back to TCB
-         *   [16] pointer_guard  [24] stack_guard  [32+] ...
-         * DTV: dtv[-1]=generation=1, dtv[0]=tls_block (TLS data for module 0)
-         * tp = TCB address = tls_block + tls_memsz */
-        {
-            uint64_t tcb = tls_block + tls_memsz;
-            uint64_t dtv_arr = ((tcb + 64 + 7) & ~7ULL);
-            uint64_t tcb_pa = la_uva_to_pa(new_pgtbl, tcb);
-            uint64_t dtv_pa = la_uva_to_pa(new_pgtbl, dtv_arr);
-            if (tcb_pa && dtv_pa) {
-                /* dtv[-1] = 1 (generation counter, odd = valid) */
-                *(uint64_t *)(dtv_pa + 0) = 1;
-                /* dtv[0] = base address of TLS block for module 0 */
-                *(uint64_t *)(dtv_pa + 8) = tls_block;
-                /* TCB[0] = &dtv[0] (points to second slot of dtv array) */
-                *(uint64_t *)(tcb_pa + 0) = dtv_arr + 8;
-                /* TCB[8] = self pointer */
-                *(uint64_t *)(tcb_pa + 8) = tcb;
-            }
-        }
-        new_tf->gpr[LA_TF_GPR_TP] = tls_block + tls_memsz;
-    }
+    /* ---- TLS — set tp=0, let glibc self-init via __libc_setup_tls().
+     * Kernel-provided TLS is causing crashes because glibc's internal
+     * TLS layout conventions are version-dependent.  tp=0 triggers
+     * glibc's own TLS bootstrap using AT_PHDR, AT_PHNUM, AT_PHENT. */
+    new_tf->gpr[LA_TF_GPR_TP] = 0;
 
     la_uart_puts("  exec: era=");
     la_uart_put_hex(start_pc);

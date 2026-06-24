@@ -9,7 +9,7 @@
 
 - **项目**：SeaOS — 华东师大花狮小队，oscomp 2026「OS 内核实现赛道」初赛。xv6 风格内核，目标跑通 `/musl`、`/glibc` 下的 oscomp 测试脚本。
 - **两条线**：**A 线 = RISC-V**（`src/kernel/`，成熟，101+ syscall、动态链接、pipe、memfs 齐备，是事实参考实现）；**B 线 = LoongArch**（`src/kernel/loongarch/`，Step 10–21 全部完成，**本文档对象**）。LoongArch 与 RISC-V 共用同一套 Linux「通用 ABI」syscall 号表。
-- **当前状态（2026-06-19 更新）**：**Phase 1–8 全部实施完毕**。101 syscall dispatch 入口（95 真实实现 + 3 ENOSYS stub）。运行时 **0 个 UNKNOWN syscall**，构建 0 错误 0 警告。**本轮修复 9 项**：initcode wstatus、Makefile 依赖、tkill/tgkill 信号统一、la_proc_exit 清理、futex/nanosleep EINTR、ext4 getdents 偏移追踪、孤儿进程 reparent、statx+exec busybox fallback、UART quiet mode。**测试进展**：musl 10/12 GROUP END + 2 SKIP（libcbench/libctest/busybox/cyclictest/netperf/iperf/iozone/lua/basic ✅；unixbench/lmbench SKIP；ltp basename 已通但 abort01 卡住→暂 SKIP）。⚠️ **glibc：Phase 9 进行中**——静态链接 glibc 二进制需要 PT_TLS 加载 + TCB/DTV 初始化。已实现 TLS .tdata 拷贝 + TCB self/dtv pointer 设置 + busybox 自动重定向到 musl 版。glibc libc-bench 已能加载（entry 正确），但仍 crash at badv=0x1 pc=0x0——级联已停止（initcode 不再被杀），根因疑为 DTV layout 或缺失 auxv/syscall。详见 §6、§7.6。
+- **当前状态（2026-06-23 更新）**：**Phase 1–8 全部实施完毕**。101 syscall dispatch 入口（95 真实实现 + 3 ENOSYS stub）。运行时 **0 个 UNKNOWN syscall**，构建 0 错误 0 警告。**本轮修复**：移除 glibc→musl redirect（busybox/libc-bench 重定向），glibc 二进制原生执行；exec 信号状态复位（sig_pending/sig_mask/sig_actions 在 exec 时清零为 SIG_DFL——此前旧进程的 handler 指针指向已被替换的地址空间，导致 SIGCANCEL 等信号误杀进程）。**测试进展**：musl 10/12 GROUP END + 2 SKIP（libcbench/libctest/busybox/cyclictest/netperf/iperf/iozone/lua/basic ✅；unixbench/lmbench SKIP；ltp SKIP）。⚠️ **glibc：Phase 9 进行中**——静态链接 glibc 二进制通过 tp=0 自初始化 TLS（内核不再提供 TLS/TCB/DTV 设置）。关键发现：musl libc-bench **无 PT_TLS** 段（musl 自行管理 TLS），glibc libc-bench **有 PT_TLS** 段（需要 ELF 头→AT_PHDR 解析）。glibc libc-bench 可加载但执行缓慢/挂起，glibc libctest entry-static.exe 打印 START 后挂起——疑为信号/futex 交互或 brk 内存布局差异。详见 §6、§7.6。
 - **常用命令（必须在 Docker 容器内执行，见 §3）**：
   - 构建：`docker exec nostalgic_khayyam bash -lc 'cd /workspace && make build-la'`（或 `make all`）
   - 用真实测试镜像跑：`docker exec nostalgic_khayyam bash -lc 'cd /workspace && /opt/qemu-bin-10.0.2/bin/qemu-system-loongarch64 -kernel kernel-la -m 1G -nographic -smp 1 -drive file=sdcard-la.img,if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0 -no-reboot'`
@@ -211,13 +211,17 @@ sudo docker run --rm \
 
 ---
 
-## 六、当前状态（2026-06-18 更新）
+## 六、当前状态（2026-06-23 更新）
 
-### 已完成（Phase 1–7 + 本轮修复，全部编码完成）
+### 本轮修复（2026-06-23）
 
-**P1–P7 + ext4 间接块/稀疏孔/lseek 64 位/nanosleep/wait 注释/newfstatat 路径修复，全部编码完成。** 详见 §7.8 历史记录表。
+| 修复 | 文件 | 说明 |
+|------|------|------|
+| 移除 glibc→musl redirect | `syscall.c` | busybox/libc-bench redirect 已移除，glibc 二进制原生执行 |
+| exec 信号状态复位 | `exec_la.c` | sig_pending/sig_mask/sig_actions 复位为 SIG_DFL（此前旧 handler 指向已替换地址空间） |
+| CLONE_SETTLS 验证 | `syscall.c` | 确认 CLONE_VM+CLONE_SETTLS 正确设置 tp 寄存器 |
 
-**本轮新增修复（2026-06-19）：**
+### 历史修复（2026-06-19）
 
 | 修复 | 文件 | 说明 |
 |------|------|------|
@@ -255,19 +259,25 @@ sudo docker run --rm \
 
 | 问题 | 影响 | 根因 | 计划 |
 |------|------|------|------|
-| glibc 二进制 crash | 12 组加分 | badv=0x1 pc=0x0，glibc 初始化时访问 NULL DTV | 继续完善 TCB/DTV layout + auxv |
+| glibc 二进制执行缓慢/挂起 | 12 组加分 | 疑为信号/futex 交互或 brk 内存布局 | 参照 Re-XVapor sz 模型改进 |
 | ltp abort01 卡死 | 1 组 musl | SIGABRT 信号处理不完整 | 后续修复 |
-| pthread_cancel/cond 超时 | libctest 7 FAIL | 根因待查 | 后续深挖 |
+| glibc libctest entry-static 挂起 | libctest 组 | SIGCANCEL(33) default-kill + exec 信号未复位 | exec 信号复位已修复，待验证 |
 
 ### glibc Phase 9 进展
 
 | 项目 | 状态 |
 |------|:----:|
-| busybox redirect (/glibc→/musl) | ✅ 级联崩溃停止 |
-| glibc 二进制加载 (entry 0x120000754) | ✅ TL S+DTV+TCB 已初始化 |
-| PT_TLS 加载 (.tdata copy + .tbss zero) | ✅ |
-| TCB self-pointer + DTV generation/module | ✅ |
-| glibc libc-bench | ❌ badv=0x1 pc=0x0 |
+| 移除 redirect（glibc 原生执行） | ✅ |
+| tp=0 自初始化 TLS（对齐参考 OS） | ✅ |
+| exec 信号状态复位 | ✅ |
+| CLONE_VM+CLONE_SETTLS 线程 TLS | ✅ |
+| glibc libc-bench（原生） | ⚠️ 加载但执行缓慢/挂起 |
+| glibc libctest | ⚠️ entry-static 打印 START 后挂起 |
+
+### 关键发现
+
+- **musl libc-bench 无 PT_TLS 段**（musl 自行管理 TLS），**glibc libc-bench 有 PT_TLS**（需 AT_PHDR 解析）。tp=0 时 glibc 通过 __libc_setup_tls() 自初始化。
+- **exec 信号复位 BUG**：exec 后进程保留旧 sig_actions（指向已替换的地址空间），导致 musl pthread 的 SIGCANCEL(33) 误触发 default kill。已修复。
 
 ### 关键修复（历史记录，截至 2026-06-19）
 

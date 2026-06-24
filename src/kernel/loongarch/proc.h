@@ -151,6 +151,7 @@ struct la_proc {
     int ticks;                 /* remaining timer ticks in this time slice */
     int sched_priority;        /* RT priority (0 = normal, 1–99 = SCHED_FIFO) */
     uint64_t clear_child_tid;  /* user VA of cleartid word (0 = none) */
+    int    trace_sys;           /* 1 = trace syscalls for this proc */
     void  *wait_chan;          /* futex sleep channel (0 = pid-wakeup sleeper) */
 
     /* Signal handling */

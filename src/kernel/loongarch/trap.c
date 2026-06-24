@@ -81,6 +81,14 @@ void la_trap_dispatch(struct la_trap_frame *tf)
                 la_uart_puts("\n");
                 struct la_proc *p = la_current_proc();
                 if (p && p->is_user) {
+                    /* Dump key registers: $ra ($r1), $tp ($r2), $sp ($r3) */
+                    la_uart_puts("  regs: ra=");
+                    la_uart_put_hex(p->tf->gpr[1]);
+                    la_uart_puts(" tp=");
+                    la_uart_put_hex(p->tf->gpr[2]);
+                    la_uart_puts(" sp=");
+                    la_uart_put_hex(p->tf->gpr[3]);
+                    la_uart_puts("\n");
                     la_uart_puts("trap: kill user proc (segv) badv=");
                     la_uart_put_hex(badv);
                     la_uart_puts(" pid=");
