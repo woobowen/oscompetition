@@ -133,12 +133,30 @@ static uint64 (*syscalls[])(void) = {
 // 每个未知 syscall 号只打印一次，避免 UART 洪水
 static uint8 warned[SYS_MAX_NUM + 1];
 
+static int syscall_is_restartable(int sys_num)
+{
+    return sys_num == SYS_wait;
+}
+
+static void syscall_save_restart_frame(proc_t *p, int sys_num)
+{
+    p->last_syscall_num = sys_num;
+    p->last_syscall_args[0] = p->tf->a0;
+    p->last_syscall_args[1] = p->tf->a1;
+    p->last_syscall_args[2] = p->tf->a2;
+    p->last_syscall_args[3] = p->tf->a3;
+    p->last_syscall_args[4] = p->tf->a4;
+    p->last_syscall_args[5] = p->tf->a5;
+    p->last_syscall_restartable = syscall_is_restartable(sys_num);
+}
+
 // 基于系统调用表的请求跳转
 void syscall()
 {
     proc_t *p = myproc();
 
     int sys_num = p->tf->a7;
+    syscall_save_restart_frame(p, sys_num);
     if (sys_num < 0 || sys_num > SYS_MAX_NUM || syscalls[sys_num] == NULL) {
         if (sys_num >= 0 && sys_num <= SYS_MAX_NUM && !warned[sys_num]) {
             warned[sys_num] = 1;

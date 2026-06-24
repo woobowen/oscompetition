@@ -501,6 +501,9 @@ proc_t *proc_alloc()
             memset(p->sig_code, 0, sizeof(p->sig_code));
             memset(p->sig_sender_pid, 0, sizeof(p->sig_sender_pid));
             p->sig_delivering = 0;
+            p->last_syscall_num = 0;
+            memset(p->last_syscall_args, 0, sizeof(p->last_syscall_args));
+            p->last_syscall_restartable = 0;
             p->group_exit_pending = 0;
             p->group_exit_code = 0;
             p->clear_child_tid = 0;

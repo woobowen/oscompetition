@@ -120,6 +120,7 @@ enum proc_state
 #define SIGCHLD     17
 #define SA_SIGINFO   4
 #define SA_RESTORER 0x04000000
+#define SA_RESTART  0x10000000
 #define SI_USER      0
 #define SI_TKILL    -6
 #define SI_KERNEL  128
@@ -211,6 +212,9 @@ typedef struct proc
     int sig_code[NSIG + 1];       // si_code for pending signal delivery
     int sig_sender_pid[NSIG + 1]; // si_pid for pending signal delivery
     uint8  sig_delivering;        // 正在投递信号中(防嵌套)
+    int last_syscall_num;          // interrupted syscall number for SA_RESTART
+    uint64 last_syscall_args[6];   // original a0-a5 before syscall return overwrite
+    uint8 last_syscall_restartable; // current minimal restart whitelist
     uint8 group_exit_pending;      // internal exit_group request for CLONE_VM threads
     int group_exit_code;           // exit code used by group_exit_pending
     uint8 shared_vm;              // CLONE_VM thread: page-table leaves are shared

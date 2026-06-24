@@ -125,7 +125,7 @@
 | 233 | madvise | 桩返回 0 |
 | 236 | get_mempolicy | 最小 NUMA default node 0 兼容 |
 | 242 | accept4 | accept + `SOCK_CLOEXEC` |
-| 260 | wait4 | |
+| 260 | wait4 | Returns `-ECHILD` when no matching child exists; supports minimal `SA_RESTART` restart after signal handlers by restoring the original syscall arguments. |
 | 261 | prlimit64 | 支持当前进程 `RLIMIT_NOFILE` |
 | 276 | renameat2 | 无 flags 时转 `renameat`，其他 flags 返回 `-EINVAL` |
 | 278 | getrandom | 非阻塞伪随机字节，支持 Linux flags 子集 |
@@ -412,3 +412,15 @@ This closes the false `EPERM` userland decode caused by returning bare `(uint64)
 | 172/178 | getpid/gettid | `getpid` returns the thread-group leader for `CLONE_THREAD` members; `gettid` remains the per-thread id. |
 
 The retained implementation keeps the existing SeaOS RISC-V signal-frame layout. A Linux-shaped frame/VDSO experiment was rejected after it regressed `libctest-musl`; future static glibc cancellation work should implement signal-unwind compatibility explicitly instead of silently changing the frame contract.
+
+## 2026-06-24 status update: minimal `SA_RESTART` for `wait4`
+
+| No. | Name | Current semantics |
+|---|---|---|
+| 134 | rt_sigaction | Records `SA_RESTART` in the existing per-signal flags. |
+| 139 | rt_sigreturn | Restores the existing SeaOS signal frame; for a restarted `wait4`, the frame already contains the original `ecall` PC and argument registers. |
+| 260 | wait4 | If interrupted by a delivered signal whose handler has `SA_RESTART`, restarts with the original `pid/status/options` arguments instead of leaking `EINTR` to userland. |
+
+Boundary: only `wait4` is whitelisted for restart in this iteration. Futex, accept, sleep, and other interruptible calls still return `-EINTR` so pthread cancellation and timeout-driven networking paths keep their existing behavior.
+
+Verification: `make all` passed in the fixed docker build environment, and the fixed RV docker run reached `sys_shutdown` after all 24 groups. The latest `os_serial_out_rv.txt` has zero `waitpid(...,0) failed: EINTR` markers; the previous log had 37.

@@ -196,8 +196,21 @@ void trap_user_handler()
             frame[30] = tf->t5;
             frame[31] = tf->t6;
             uint64 ucontext_pc = frame[0];
-            if (tf->a0 == (uint64)(-EINTR) && ucontext_pc >= 4)
+            int restart_syscall = tf->a0 == (uint64)(-EINTR) &&
+                p->last_syscall_restartable &&
+                p->last_syscall_num == (int)tf->a7 &&
+                (p->sig_flags[sig] & SA_RESTART) != 0 &&
+                ucontext_pc >= 4;
+            if (restart_syscall) {
                 ucontext_pc -= 4;
+                frame[0] = ucontext_pc;
+                frame[10] = p->last_syscall_args[0];
+                frame[11] = p->last_syscall_args[1];
+                frame[12] = p->last_syscall_args[2];
+                frame[13] = p->last_syscall_args[3];
+                frame[14] = p->last_syscall_args[4];
+                frame[15] = p->last_syscall_args[5];
+            }
             frame[RISCV_SIGNAL_FRAME_UCONTEXT_PC] = ucontext_pc;
             frame[33] = 0;
 
