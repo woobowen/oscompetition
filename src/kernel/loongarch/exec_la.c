@@ -1073,23 +1073,6 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
         la_tlb_inval_all();
     }
 
-    /* CRITICAL: Set DA=0, PG=1 before returning to user mode.
-     * Without this, CRMD.DA stays 1 (from boot) and the CPU uses
-     * DA mode (direct addressing) instead of TLB-based paging.
-     * In DA mode at PLV3, DMW0 doesn't match → all user addresses
-     * cause ADEF (BADADDR).  proc.c:la_proc_return() does this,
-     * but exec bypasses proc_return. */
-    {
-        uint64_t pre_crmd = la_csr_read(LA_CSR_CRMD);
-        la_uart_puts("  pre-crmd=");
-        la_uart_put_hex(pre_crmd);
-        la_csr_write(LA_CRMD_PG | LA_CRMD_IE, LA_CSR_CRMD);
-        uint64_t post_crmd = la_csr_read(LA_CSR_CRMD);
-        la_uart_puts(" post-crmd=");
-        la_uart_put_hex(post_crmd);
-        la_uart_puts("\n");
-    }
-
     /* Free the previous address space.  new_pgtbl is now p->pgtbl, the
      * hardware PGD points at it (la_uvm_switch above), the TLB was
      * invalidated and refilled with the new mappings — so old_pgtbl's pages
@@ -1098,10 +1081,21 @@ uint64_t la_do_exec_syscall(struct la_trap_frame *tf, const char *path,
     if (old_pgtbl && old_pgtbl != new_pgtbl)
         la_uvm_free_pgtbl(old_pgtbl);
 
-    la_user_return(new_tf);
+    /* Exec is a syscall: do not return to user mode from the middle of the
+     * syscall implementation.  Copy the replacement context into the active
+     * trap frame and let trap.c/trap_entry.S take the normal syscall return
+     * path.  trap.c will write a0=return_value and advance ERA by one syscall
+     * instruction, so return argc and pre-subtract the fixed advance. */
+    {
+        uint64_t *src = (uint64_t *)new_tf;
+        uint64_t *dst_tf = (uint64_t *)tf;
+        uint64_t *end_tf = (uint64_t *)(tf + 1);
+        while (dst_tf < end_tf)
+            *dst_tf++ = *src++;
+    }
+    tf->era = start_pc - LA_SYSCALL_INSN_SIZE;
 
-    /* Never reached */
-    return 0;
+    return (uint64_t)argc;
 
 exec_fail:
     la_uart_puts("  exec: failed\n");

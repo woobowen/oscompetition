@@ -235,10 +235,6 @@ static int is_skipped_test(const char *name)
      * started), but the first test binary hangs — likely SIGABRT signal
      * handling incomplete.  Re-enable after signal fixes. */
     if (local_strncmp(name, "ltp", 3) == 0) return 1;
-    /* libctest: temporarily skip to reach glibc tests faster.
-     * musl libctest already confirmed GROUP END (14 FAIL).  The test
-     * suite is slow (~30+ subtests each via fork/exec/wait). */
-    if (local_strncmp(name, "libctest", 8) == 0) return 1;
     return 0;
 }
 
@@ -363,6 +359,17 @@ int main(void)
 {
     syscall3(SYS_write, 1,
              (long)"initcode: started\n", 18);
+
+    {
+        char path[] = "/musl/libctest_testcode.sh";
+        char arg0[] = "libctest";
+        char *argv[2];
+        argv[0] = arg0;
+        argv[1] = 0;
+        run_one(path, argv, "libctest_testcode.sh");
+        syscall1(SYS_shutdown, 0);
+        for (;;) {}
+    }
 
     int count = 0;
 

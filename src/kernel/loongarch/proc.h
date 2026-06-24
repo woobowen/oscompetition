@@ -40,7 +40,7 @@ struct la_context {
 };
 
 /* ---- File descriptor table ---- */
-#define LA_NFD 32
+#define LA_NFD 128
 
 /* fd types */
 #define LA_FD_UNUSED  0
@@ -49,6 +49,7 @@ struct la_context {
 #define LA_FD_PIPE    3   /* pipe (read end or write end) */
 #define LA_FD_MEMFS   4   /* writable file on memfs */
 #define LA_FD_SOCKET  5   /* loopback socket (TCP / UDP) */
+#define LA_FD_DEV     6   /* simple character devices: /dev/null, /dev/zero */
 
 /* ---- Pipe ---- */
 #define LA_PIPE_SIZE   4096
@@ -68,6 +69,8 @@ struct la_fd {
     uint64_t offset;         /* current read/write offset */
     int type;                /* LA_FD_UNUSED/CONSOLE/FILE/PIPE */
     int writable;            /* 1 = write allowed */
+    int cloexec;             /* FD_CLOEXEC state */
+    int nonblock;            /* O_NONBLOCK state */
     struct la_pipe *pipe;    /* pipe object (valid when type == LA_FD_PIPE) */
     int sock_idx;            /* socket index (valid when type == LA_FD_SOCKET) */
 };
@@ -82,7 +85,7 @@ struct la_mm {
     uint64_t mmap_top;         /* mmap region (grows up, separate from heap) */
 };
 
-/* Signal action structure (matches Linux sigaction ABI — 32 bytes).
+/* Internal signal action structure.
  * When handler == 0: SIG_DFL (default action).
  * When handler == 1: SIG_IGN (ignore).
  * restorer is the user-space trampoline that calls rt_sigreturn. */
@@ -123,8 +126,12 @@ struct la_sigframe {
     /* saved registers */
     uint64_t gpr[32];
     uint64_t era;
+    uint64_t old_sig_mask;
     /* delivery metadata */
     uint64_t sig;          /* signal number */
+    uint8_t siginfo[128];  /* minimal Linux siginfo_t */
+    uint8_t ucontext[256]; /* minimal ucontext_t storage for SA_SIGINFO */
+    uint32_t tramp[2];     /* li.w a7, SYS_rt_sigreturn; syscall 0 */
 };
 
 /* ---- Process control block ---- */
@@ -153,6 +160,8 @@ struct la_proc {
     uint64_t clear_child_tid;  /* user VA of cleartid word (0 = none) */
     int    trace_sys;           /* 1 = trace syscalls for this proc */
     void  *wait_chan;          /* futex sleep channel (0 = pid-wakeup sleeper) */
+    uint64_t sleep_deadline_ticks;
+    int sleep_timed_out;
 
     /* Signal handling */
     uint64_t sig_pending;      /* bitmap of pending signals */
@@ -162,6 +171,8 @@ struct la_proc {
     /* Process relationships */
     int parent_pid;            /* parent's PID (0 for first process) */
     int exit_code;             /* exit status for wait() */
+    uint64_t rlimit_nofile_cur;
+    uint64_t rlimit_nofile_max;
 
     /* File descriptor table */
     struct la_fd fds[LA_NFD];
@@ -200,6 +211,7 @@ void la_signal_deliver(struct la_trap_frame *tf);
 /* ---- Sleep / wakeup ---- */
 void la_proc_sleep(void);
 void la_proc_sleep_chan(void *chan);    /* futex channel-keyed sleep */
+int  la_proc_sleep_chan_until(void *chan, uint64_t deadline_ticks);
 void la_proc_wakeup_pid(int pid);
 void la_proc_wakeup_chan(void *chan);   /* futex channel-keyed wake */
 

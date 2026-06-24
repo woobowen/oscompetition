@@ -12,6 +12,12 @@ static struct memfs_inode memfs_inodes[MEMFS_MAX_INODES];
 
 /* ---- Helpers ---- */
 
+static uint64_t memfs_now_sec(void)
+{
+    uint64_t now = la_timer_get_ticks() / 100;
+    return now ? now : 1;
+}
+
 /* Match two NUL-terminated strings, return 1 on match. */
 static int memfs_streq(const char *a, const char *b)
 {
@@ -29,6 +35,9 @@ void memfs_init(void)
         memfs_inodes[i].type = MEMFS_TYPE_FREE;
         memfs_inodes[i].path[0] = '\0';
         memfs_inodes[i].size = 0;
+        memfs_inodes[i].atime_sec = 0;
+        memfs_inodes[i].mtime_sec = 0;
+        memfs_inodes[i].ctime_sec = 0;
         for (int j = 0; j < MEMFS_PAGES_PER_FILE; j++)
             memfs_inodes[i].pages[j] = 0;
     }
@@ -39,6 +48,7 @@ void memfs_init(void)
     root->path[0] = '/';
     root->path[1] = '\0';
     root->size = 0;
+    root->atime_sec = root->mtime_sec = root->ctime_sec = memfs_now_sec();
 
     la_uart_puts("  memfs: initialized (");
     la_uart_put_hex(MEMFS_MAX_INODES);
@@ -79,6 +89,9 @@ int memfs_create(const char *path, int type)
 
     memfs_inodes[idx].type = type;
     memfs_inodes[idx].size = 0;
+    memfs_inodes[idx].atime_sec = memfs_now_sec();
+    memfs_inodes[idx].mtime_sec = memfs_inodes[idx].atime_sec;
+    memfs_inodes[idx].ctime_sec = memfs_inodes[idx].atime_sec;
     for (int j = 0; j < MEMFS_PAGES_PER_FILE; j++)
         memfs_inodes[idx].pages[j] = 0;
 
@@ -130,6 +143,10 @@ int memfs_write(int ino, uint32_t offset, const void *buf, uint32_t len)
     /* Update file size */
     uint32_t new_end = offset + written;
     if (new_end > inode->size) inode->size = new_end;
+    if (written > 0) {
+        inode->mtime_sec = memfs_now_sec();
+        inode->ctime_sec = inode->mtime_sec;
+    }
 
     return (int)written;
 }
@@ -160,6 +177,8 @@ int memfs_read(int ino, uint32_t offset, void *buf, uint32_t len)
             dst[done + j] = src[page_off + j];
         done += chunk;
     }
+    if (done > 0)
+        inode->atime_sec = memfs_now_sec();
     return (int)done;
 }
 
@@ -177,6 +196,8 @@ int memfs_truncate(int ino)
         }
     }
     inode->size = 0;
+    inode->mtime_sec = memfs_now_sec();
+    inode->ctime_sec = inode->mtime_sec;
     return 0;
 }
 
@@ -205,6 +226,9 @@ int memfs_reclaim_inode(int ino)
     inode->type = MEMFS_TYPE_FREE;
     inode->path[0] = '\0';
     inode->size = 0;
+    inode->atime_sec = 0;
+    inode->mtime_sec = 0;
+    inode->ctime_sec = 0;
     return 0;
 }
 
@@ -314,6 +338,35 @@ uint32_t memfs_inode_size(int ino)
 {
     if (ino < 0 || ino >= MEMFS_MAX_INODES) return 0;
     return memfs_inodes[ino].size;
+}
+
+uint64_t memfs_inode_atime(int ino)
+{
+    if (ino < 0 || ino >= MEMFS_MAX_INODES) return 0;
+    return memfs_inodes[ino].atime_sec;
+}
+
+uint64_t memfs_inode_mtime(int ino)
+{
+    if (ino < 0 || ino >= MEMFS_MAX_INODES) return 0;
+    return memfs_inodes[ino].mtime_sec;
+}
+
+uint64_t memfs_inode_ctime(int ino)
+{
+    if (ino < 0 || ino >= MEMFS_MAX_INODES) return 0;
+    return memfs_inodes[ino].ctime_sec;
+}
+
+int memfs_set_times(int ino, uint64_t atime_sec, uint64_t mtime_sec)
+{
+    if (ino < 0 || ino >= MEMFS_MAX_INODES) return -1;
+    struct memfs_inode *inode = &memfs_inodes[ino];
+    if (inode->type == MEMFS_TYPE_FREE) return -1;
+    inode->atime_sec = atime_sec;
+    inode->mtime_sec = mtime_sec;
+    inode->ctime_sec = memfs_now_sec();
+    return 0;
 }
 
 const char *memfs_get_path(int ino)

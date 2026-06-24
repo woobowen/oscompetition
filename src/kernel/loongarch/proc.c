@@ -63,6 +63,8 @@ static struct la_proc *la_proc_alloc(void)
         p->sched_priority = 0;
         p->clear_child_tid = 0;
         p->wait_chan = 0;
+        p->sleep_deadline_ticks = 0;
+        p->sleep_timed_out = 0;
         p->sig_pending = 0;
         p->sig_mask    = 0;
         for (int s = 0; s < LA_NSIG; s++) {
@@ -73,6 +75,8 @@ static struct la_proc *la_proc_alloc(void)
         }
         p->parent_pid = 0;
         p->exit_code  = 0;
+        p->rlimit_nofile_cur = LA_NFD;
+        p->rlimit_nofile_max = LA_NFD;
         p->cwd_ino    = 0;       /* caller must set to root ino */
 
         /* zero fd table */
@@ -81,6 +85,10 @@ static struct la_proc *la_proc_alloc(void)
             p->fds[j].offset = 0;
             p->fds[j].type = LA_FD_UNUSED;
             p->fds[j].writable = 0;
+            p->fds[j].cloexec = 0;
+            p->fds[j].nonblock = 0;
+            p->fds[j].pipe = 0;
+            p->fds[j].sock_idx = 0;
         }
 
         /* zero context */
@@ -458,6 +466,8 @@ void la_proc_sleep_chan(void *chan)
     struct la_proc *p = la_cpu.current;
     if (!p) return;
     p->wait_chan = chan;       /* order matters: set channel, then sleep */
+    p->sleep_deadline_ticks = 0;
+    p->sleep_timed_out = 0;
     p->state = LA_PROC_SLEEPING;
     la_swtch(&p->ctx, &la_cpu.scheduler_ctx);
 
@@ -465,6 +475,26 @@ void la_proc_sleep_chan(void *chan)
     uint64_t crmd = la_csr_read(LA_CSR_CRMD);
     la_csr_write(crmd | LA_CRMD_IE, LA_CSR_CRMD);
     la_proc_restore_user_return_state(p);
+}
+
+int la_proc_sleep_chan_until(void *chan, uint64_t deadline_ticks)
+{
+    struct la_proc *p = la_cpu.current;
+    if (!p) return 0;
+    p->wait_chan = chan;
+    p->sleep_deadline_ticks = deadline_ticks;
+    p->sleep_timed_out = 0;
+    p->state = LA_PROC_SLEEPING;
+    la_swtch(&p->ctx, &la_cpu.scheduler_ctx);
+
+    uint64_t crmd = la_csr_read(LA_CSR_CRMD);
+    la_csr_write(crmd | LA_CRMD_IE, LA_CSR_CRMD);
+    la_proc_restore_user_return_state(p);
+
+    int timed_out = p->sleep_timed_out;
+    p->sleep_deadline_ticks = 0;
+    p->sleep_timed_out = 0;
+    return timed_out;
 }
 
 /* ---- wakeup: wake all SLEEPING procs with matching pid ----
@@ -487,6 +517,8 @@ void la_proc_wakeup_chan(void *chan)
             && la_procs[i].wait_chan == chan) {
             la_procs[i].state = LA_PROC_RUNNABLE;
             la_procs[i].wait_chan = 0;   /* clear channel after wake */
+            la_procs[i].sleep_deadline_ticks = 0;
+            la_procs[i].sleep_timed_out = 0;
         }
     }
 }
@@ -516,6 +548,18 @@ void la_scheduler(void)
         /* Enable interrupts while searching / idling */
         uint64_t crmd = la_csr_read(LA_CSR_CRMD);
         la_csr_write(crmd | LA_CRMD_IE, LA_CSR_CRMD);
+
+        uint64_t now = la_timer_get_ticks();
+        for (int i = 0; i < LA_NPROC; i++) {
+            if (la_procs[i].state == LA_PROC_SLEEPING &&
+                la_procs[i].sleep_deadline_ticks &&
+                now >= la_procs[i].sleep_deadline_ticks) {
+                la_procs[i].state = LA_PROC_RUNNABLE;
+                la_procs[i].wait_chan = 0;
+                la_procs[i].sleep_deadline_ticks = 0;
+                la_procs[i].sleep_timed_out = 1;
+            }
+        }
 
         /* Priority-aware scheduling:
          * - First pass: find the RUNNABLE process with highest sched_priority.
@@ -703,6 +747,20 @@ int la_signal_pending(struct la_trap_frame *tf)
     return 1;
 }
 
+#define LA_SA_NODEFER 0x40000000UL
+#define LA_UC_SIGMASK_OFF 40
+#define LA_UC_MC_PC_OFF 176
+
+static uint64_t la_sigset_internal_to_user_local(uint64_t internal)
+{
+    uint64_t user_set = 0;
+    for (int sig = 1; sig < LA_NSIG; sig++) {
+        if (internal & (1UL << sig))
+            user_set |= (1UL << (sig - 1));
+    }
+    return user_set;
+}
+
 void la_signal_deliver(struct la_trap_frame *tf)
 {
     struct la_proc *p = la_current_proc();
@@ -750,6 +808,9 @@ void la_signal_deliver(struct la_trap_frame *tf)
 
     /* ---- Deliver the signal: build sigframe on user stack ---- */
 
+    uint64_t old_mask = p->sig_mask;
+    struct la_sigaction act = p->sig_actions[sig];
+
     /* Allocate space below the current user SP.
      * The frame must be 16-byte aligned (LoongArch ABI). */
     uint64_t old_sp = tf->gpr[LA_GPR_SP];
@@ -760,23 +821,43 @@ void la_signal_deliver(struct la_trap_frame *tf)
     struct la_sigframe sf;
     for (int i = 0; i < 32; i++) sf.gpr[i] = tf->gpr[i];
     sf.era     = tf->era;   /* save original PC */
+    sf.old_sig_mask = old_mask;
     sf.sig     = (uint64_t)sig;
+    for (int i = 0; i < 128; i++) sf.siginfo[i] = 0;
+    for (int i = 0; i < 256; i++) sf.ucontext[i] = 0;
+    ((int *)sf.siginfo)[0] = sig;  /* si_signo */
+    ((int *)sf.siginfo)[1] = 0;    /* si_errno */
+    ((int *)sf.siginfo)[2] = 0;    /* si_code = SI_USER */
+    *(uint64_t *)&sf.ucontext[LA_UC_SIGMASK_OFF] =
+        la_sigset_internal_to_user_local(old_mask);
+    *(uint64_t *)&sf.ucontext[LA_UC_MC_PC_OFF] = tf->era;
+    sf.tramp[0] = 0x03822c0bU;  /* li.w $a7, SYS_rt_sigreturn */
+    sf.tramp[1] = 0x002b0000U;  /* syscall 0 */
 
     la_copy_to_user(new_sp, &sf, sizeof(sf));
+    uint64_t usiginfo = new_sp + (uint64_t)((char *)sf.siginfo - (char *)&sf);
+    uint64_t ucontext = new_sp + (uint64_t)((char *)sf.ucontext - (char *)&sf);
+    uint64_t utramp = new_sp + (uint64_t)((char *)sf.tramp - (char *)&sf);
 
     /* Set up the child's context to run the signal handler:
      *   a0 = signal number (first argument to handler)
-     *   a1 = siginfo pointer (NULL for now — simplified)
-     *   a2 = ucontext pointer (NULL for now)
+     *   a1 = siginfo pointer
+     *   a2 = ucontext pointer
      *   ra = restorer address (user-space trampoline → rt_sigreturn)
      *   era = handler address
      *   sp = new stack pointer (bottom of sigframe) */
     tf->gpr[LA_GPR_SP] = new_sp;
     tf->gpr[LA_GPR_A0] = (uint64_t)sig;
-    tf->gpr[LA_GPR_A1] = 0;  /* no siginfo */
-    tf->gpr[LA_GPR_A2] = 0;  /* no ucontext */
-    tf->gpr[LA_GPR_RA] = p->sig_actions[sig].restorer;
-    tf->era = p->sig_actions[sig].handler;
+    tf->gpr[LA_GPR_A1] = usiginfo;
+    tf->gpr[LA_GPR_A2] = ucontext;
+    tf->gpr[LA_GPR_RA] =
+        (act.restorer && act.restorer != ~0ULL) ? act.restorer : utramp;
+    tf->era = act.handler;
+    p->sig_mask = old_mask | act.mask;
+    if ((act.flags & LA_SA_NODEFER) == 0)
+        p->sig_mask |= (1UL << sig);
+    p->sig_mask &= ~(1UL << LA_SIGKILL);
+    p->sig_mask &= ~(1UL << LA_SIGSTOP);
     /* The dispatcher will add 4 to era, so subtract 4 here so that the
      * net result is era = handler address (the dispatcher's +4 is undone
      * by entering the handler at exactly the right address).  Actually,

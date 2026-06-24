@@ -18,6 +18,8 @@
 #include "memfs_la.h"
 #include "socket_la.h"
 
+static void la_dbg_cancel_log(const char *tag, uint64_t a, uint64_t b);
+
 /* ---- Syscall numbers (LoongArch asm-generic ABI) ---- */
 #define SYS_fork         4
 #define SYS_mkdir       34
@@ -179,12 +181,124 @@
 #define LA_ECONNRESET  104
 #define LA_ECONNREFUSED 111
 #define LA_ENOTCONN    107
+#define LA_ETIMEDOUT   110
 
 #define LA_PTE_PA_MASK  0x0000FFFFFFFFF000UL
 
 /* ---- Root inode numbers (set by fs_la.c after mount) ---- */
 #define LA_ROOT_INO_SEA  0
 #define LA_ROOT_INO_E4   2
+
+#define LA_DEV_NULL 1
+#define LA_DEV_ZERO 2
+
+#define LA_O_NONBLOCK 0x800U
+#define LA_O_CLOEXEC  0x80000U
+#define LA_FD_CLOEXEC 1
+#define LA_SOCK_TYPE_MASK 0xf
+
+static int la_streq(const char *a, const char *b)
+{
+    while (*a && *b && *a == *b) {
+        a++;
+        b++;
+    }
+    return *a == 0 && *b == 0;
+}
+
+static int la_dev_lookup(const char *path)
+{
+    if (la_streq(path, "/dev/null")) return LA_DEV_NULL;
+    if (la_streq(path, "/dev/zero")) return LA_DEV_ZERO;
+    return 0;
+}
+
+static void la_fd_reset(struct la_fd *fd)
+{
+    fd->ino = 0;
+    fd->offset = 0;
+    fd->type = LA_FD_UNUSED;
+    fd->writable = 0;
+    fd->cloexec = 0;
+    fd->nonblock = 0;
+    fd->pipe = 0;
+    fd->sock_idx = 0;
+}
+
+static void la_fd_apply_flags(struct la_fd *fd, uint32_t flags)
+{
+    fd->cloexec = (flags & LA_O_CLOEXEC) ? 1 : 0;
+    fd->nonblock = (flags & LA_O_NONBLOCK) ? 1 : 0;
+}
+
+static int la_fd_limit(struct la_proc *p)
+{
+    uint64_t lim = p ? p->rlimit_nofile_cur : 0;
+    if (lim == 0 || lim > LA_NFD)
+        lim = LA_NFD;
+    return (int)lim;
+}
+
+static void la_fill_linux_stat(char *sbuf, uint64_t ino, uint32_t mode,
+                               uint64_t rdev, uint64_t size,
+                               uint64_t atime, uint64_t mtime,
+                               uint64_t ctime)
+{
+    for (int i = 0; i < 128; i++) sbuf[i] = 0;
+
+    *(uint64_t *)&sbuf[0]   = 1;      /* st_dev */
+    *(uint64_t *)&sbuf[8]   = ino;    /* st_ino */
+    *(uint32_t *)&sbuf[16]  = mode;   /* st_mode */
+    *(uint32_t *)&sbuf[20]  = 1;      /* st_nlink */
+    *(uint32_t *)&sbuf[24]  = 0;      /* st_uid */
+    *(uint32_t *)&sbuf[28]  = 0;      /* st_gid */
+    *(uint64_t *)&sbuf[32]  = rdev;   /* st_rdev */
+    *(uint64_t *)&sbuf[48]  = size;   /* st_size */
+    *(uint32_t *)&sbuf[56]  = 4096;   /* st_blksize */
+    *(uint64_t *)&sbuf[64]  = (size + 511) / 512; /* st_blocks */
+    *(uint64_t *)&sbuf[72]  = atime;  /* st_atim.tv_sec */
+    *(uint64_t *)&sbuf[80]  = 0;      /* st_atim.tv_nsec */
+    *(uint64_t *)&sbuf[88]  = mtime;  /* st_mtim.tv_sec */
+    *(uint64_t *)&sbuf[96]  = 0;      /* st_mtim.tv_nsec */
+    *(uint64_t *)&sbuf[104] = ctime;  /* st_ctim.tv_sec */
+    *(uint64_t *)&sbuf[112] = 0;      /* st_ctim.tv_nsec */
+}
+
+static int la_stat_from_fd(struct la_proc *p, int fd, char *sbuf)
+{
+    if (!p || fd < 0 || fd >= LA_NFD || p->fds[fd].type == LA_FD_UNUSED)
+        return -1;
+
+    uint64_t ino = p->fds[fd].ino;
+    uint64_t size = 0;
+    uint32_t mode = 0100644;
+    uint64_t rdev = 0;
+    uint64_t atime = 0;
+    uint64_t mtime = 0;
+    uint64_t ctime = 0;
+
+    if (p->fds[fd].type == LA_FD_DEV) {
+        mode = 0020666;
+        ino = 0x0d000000ULL | p->fds[fd].ino;
+        rdev = ino;
+    } else if (p->fds[fd].type == LA_FD_MEMFS) {
+        int mi = (int)p->fds[fd].ino;
+        ino = 0x80000000ULL | (uint32_t)mi;
+        size = memfs_inode_size(mi);
+        atime = memfs_inode_atime(mi);
+        mtime = memfs_inode_mtime(mi);
+        ctime = memfs_inode_ctime(mi);
+    } else if (p->fds[fd].type == LA_FD_FILE) {
+        int ft = la_fs_inode_type(p->fds[fd].ino);
+        mode = (ft == 1) ? 0040755 : 0100644;
+        size = la_fs_inode_size(p->fds[fd].ino);
+    } else {
+        return -1;
+    }
+
+    la_fill_linux_stat(sbuf, ino, mode, rdev, size, atime, mtime, ctime);
+    return 0;
+}
 
 /* ---- Pipe pool ---- */
 static struct la_pipe la_pipes[LA_NPIPE];
@@ -204,6 +318,35 @@ static int la_memfs_fd_refs(uint32_t ino)
         }
     }
     return refs;
+}
+
+static void la_fd_publish_group(struct la_proc *owner, int fd)
+{
+    if (!owner || fd < 0 || fd >= LA_NFD || !owner->pgtbl)
+        return;
+
+    struct la_proc *procs = la_proc_table();
+    for (int i = 0; i < LA_NPROC; i++) {
+        struct la_proc *p = &procs[i];
+        if (p == owner || p->state == LA_PROC_UNUSED ||
+            p->state == LA_PROC_ZOMBIE || p->pgtbl != owner->pgtbl)
+            continue;
+        p->fds[fd] = owner->fds[fd];
+    }
+}
+
+static void la_fd_clear_group(struct la_proc *owner, int fd)
+{
+    if (!owner || fd < 0 || fd >= LA_NFD || !owner->pgtbl)
+        return;
+
+    struct la_proc *procs = la_proc_table();
+    for (int i = 0; i < LA_NPROC; i++) {
+        struct la_proc *p = &procs[i];
+        if (p->state == LA_PROC_UNUSED || p->pgtbl != owner->pgtbl)
+            continue;
+        la_fd_reset(&p->fds[fd]);
+    }
 }
 
 /* Allocate a free pipe slot from the static pool.  Returns NULL when
@@ -335,8 +478,12 @@ static uint64_t sys_write(struct la_trap_frame *tf)
 
     if (!p) return (uint64_t)-1;
 
-    /* Console output (stdin/stdout/stderr) */
-    if (fd >= 0 && fd <= 2) {
+    if (fd >= 0 && fd < LA_NFD && p->fds[fd].type == LA_FD_DEV)
+        return len;
+
+    /* Console output (stdin/stdout/stderr), unless fd 0-2 were closed
+     * and reused by dup/open. */
+    if (fd >= 0 && fd < LA_NFD && p->fds[fd].type == LA_FD_CONSOLE) {
         /* Copy from user space to kernel temp buffer, then UART */
         uint32_t written = 0;
         while (written < len) {
@@ -488,6 +635,23 @@ static uint64_t sys_read(struct la_trap_frame *tf)
     if (p->fds[fd].type == LA_FD_CONSOLE)
         return 0;
 
+    if (p->fds[fd].type == LA_FD_DEV) {
+        if (p->fds[fd].ino == LA_DEV_NULL)
+            return 0;
+        if (p->fds[fd].ino == LA_DEV_ZERO) {
+            static __attribute__((aligned(8))) char zbuf[4096];
+            uint32_t done = 0;
+            while (done < len) {
+                uint32_t chunk = sizeof(zbuf);
+                if (chunk > len - done) chunk = len - done;
+                la_copy_to_user(buf + done, zbuf, chunk);
+                done += chunk;
+            }
+            return done;
+        }
+        return (uint64_t)(-LA_EIO);
+    }
+
     /* Pipe read */
     if (p->fds[fd].type == LA_FD_PIPE) {
         struct la_pipe *pi = p->fds[fd].pipe;
@@ -624,13 +788,32 @@ static uint64_t sys_open(struct la_trap_frame *tf)
     if (la_copy_str_from_user(path, upath, sizeof(path) - 1) < 0)
         return (uint64_t)(-LA_EFAULT);
 
-    int writable  = (flags & 1) != 0;      /* O_WRONLY=1 or O_RDWR=2 */
+    int writable  = (flags & 3) != 0;      /* O_WRONLY=1 or O_RDWR=2 */
     int may_create = (flags & 0x40) != 0;   /* O_CREAT = 0x40 */
     int truncate   = (flags & 0x200) != 0;  /* O_TRUNC = 0x200 */
 
     /* Resolve relative path → absolute for memfs operations */
     char abs_path[256];
     la_resolve_memfs_path(p, path, abs_path, sizeof(abs_path));
+
+    {
+        int dev = la_dev_lookup(abs_path);
+        if (dev) {
+            int fd = -1;
+            for (int i = 0; i < LA_NFD; i++)
+                if (p->fds[i].type == LA_FD_UNUSED) { fd = i; break; }
+            if (fd < 0) return (uint64_t)(-LA_EMFILE);
+            p->fds[fd].ino = (uint32_t)dev;
+            p->fds[fd].offset = 0;
+            p->fds[fd].type = LA_FD_DEV;
+            p->fds[fd].writable = 1;
+            p->fds[fd].pipe = 0;
+            p->fds[fd].sock_idx = 0;
+            la_fd_apply_flags(&p->fds[fd], flags);
+            la_fd_publish_group(p, fd);
+            return (uint64_t)fd;
+        }
+    }
 
     /* ---- memfs path ----
      * Route to the writable memory filesystem when:
@@ -656,6 +839,9 @@ static uint64_t sys_open(struct la_trap_frame *tf)
             p->fds[fd].type     = LA_FD_MEMFS;
             p->fds[fd].writable = 1;
             p->fds[fd].pipe     = 0;
+            p->fds[fd].sock_idx = 0;
+            la_fd_apply_flags(&p->fds[fd], flags);
+            la_fd_publish_group(p, fd);
             return (uint64_t)fd;
         }
 
@@ -674,6 +860,9 @@ static uint64_t sys_open(struct la_trap_frame *tf)
             p->fds[fd].type     = LA_FD_MEMFS;
             p->fds[fd].writable = 1;
             p->fds[fd].pipe     = 0;
+            p->fds[fd].sock_idx = 0;
+            la_fd_apply_flags(&p->fds[fd], flags);
+            la_fd_publish_group(p, fd);
             return (uint64_t)fd;
         }
 
@@ -708,7 +897,11 @@ static uint64_t sys_open(struct la_trap_frame *tf)
     p->fds[fd].ino = ino;
     p->fds[fd].offset = 0;
     p->fds[fd].type = LA_FD_FILE;
-    p->fds[fd].writable = (flags & 0x04) ? 1 : 0;
+    p->fds[fd].writable = writable;
+    p->fds[fd].pipe = 0;
+    p->fds[fd].sock_idx = 0;
+    la_fd_apply_flags(&p->fds[fd], flags);
+    la_fd_publish_group(p, fd);
     return (uint64_t)fd;
 }
 
@@ -720,9 +913,9 @@ static uint64_t sys_close(struct la_trap_frame *tf)
     int memfs_ino = -1;
 
     if (!p || fd < 0 || fd >= LA_NFD)
-        return (uint64_t)-1;
+        return (uint64_t)(-LA_EBADF);
     if (p->fds[fd].type == LA_FD_UNUSED)
-        return (uint64_t)-1;
+        return (uint64_t)(-LA_EBADF);
 
     if (p->fds[fd].type == LA_FD_MEMFS)
         memfs_ino = (int)p->fds[fd].ino;
@@ -737,12 +930,7 @@ static uint64_t sys_close(struct la_trap_frame *tf)
     if (p->fds[fd].type == LA_FD_SOCKET)
         la_sock_close(p->fds[fd].sock_idx);
 
-    p->fds[fd].ino = 0;
-    p->fds[fd].offset = 0;
-    p->fds[fd].type = LA_FD_UNUSED;
-    p->fds[fd].writable = 0;
-    p->fds[fd].pipe = 0;
-    p->fds[fd].sock_idx = 0;
+    la_fd_clear_group(p, fd);
 
     if (memfs_ino >= 0 && memfs_is_unlinked(memfs_ino) &&
         la_memfs_fd_refs((uint32_t)memfs_ino) == 0)
@@ -760,7 +948,9 @@ static uint64_t sys_lseek(struct la_trap_frame *tf)
     struct la_proc *p = la_current_proc();
 
     if (!p || fd < 0 || fd >= LA_NFD) return (uint64_t)-1;
-    if (p->fds[fd].type != LA_FD_FILE && p->fds[fd].type != LA_FD_MEMFS)
+    if (p->fds[fd].type != LA_FD_FILE &&
+        p->fds[fd].type != LA_FD_MEMFS &&
+        p->fds[fd].type != LA_FD_DEV)
         return (uint64_t)-1;
 
     uint64_t new_off;
@@ -790,15 +980,24 @@ static uint64_t sys_dup(struct la_trap_frame *tf)
     struct la_proc *p = la_current_proc();
 
     if (!p || fd < 0 || fd >= LA_NFD || p->fds[fd].type == LA_FD_UNUSED)
-        return (uint64_t)-1;
+        return (uint64_t)(-LA_EBADF);
 
     int newfd = -1;
-    for (int i = 0; i < LA_NFD; i++) {
+    int lim = la_fd_limit(p);
+    for (int i = 0; i < lim; i++) {
         if (p->fds[i].type == LA_FD_UNUSED) { newfd = i; break; }
     }
-    if (newfd < 0) return (uint64_t)-1;
+    if (newfd < 0) return (uint64_t)(-LA_EMFILE);
 
     p->fds[newfd] = p->fds[fd];
+    p->fds[newfd].cloexec = 0;
+    if (p->fds[newfd].type == LA_FD_PIPE && p->fds[newfd].pipe) {
+        if (p->fds[newfd].writable)
+            p->fds[newfd].pipe->writeopen++;
+        else
+            p->fds[newfd].pipe->readopen++;
+    }
+    la_fd_publish_group(p, newfd);
     return (uint64_t)newfd;
 }
 
@@ -809,34 +1008,10 @@ static uint64_t sys_fstat(struct la_trap_frame *tf)
     uint64_t udst = tf->gpr[LA_GPR_A1];
     struct la_proc *p = la_current_proc();
 
-    if (!p || fd < 0 || fd >= LA_NFD) return (uint64_t)-1;
-    if (p->fds[fd].type != LA_FD_FILE && p->fds[fd].type != LA_FD_MEMFS)
+    char sbuf[128];
+    if (la_stat_from_fd(p, fd, sbuf) < 0)
         return (uint64_t)-1;
-
-    /* Build file_stat_t (matching help.h layout):
-     *   uint16 type, nlink; uint32 size, inode_num, offset; */
-    struct {
-        uint16_t type;
-        uint16_t nlink;
-        uint32_t size;
-        uint32_t inode_num;
-        uint32_t offset;
-    } stat;
-
-    if (p->fds[fd].type == LA_FD_MEMFS) {
-        stat.type = 0;   /* regular file */
-        stat.nlink = 1;
-        stat.size  = memfs_inode_size((int)p->fds[fd].ino);
-    } else {
-        int ft = la_fs_inode_type(p->fds[fd].ino);
-        stat.type = (uint16_t)ft;
-        stat.nlink = 1;
-        stat.size = la_fs_inode_size(p->fds[fd].ino);
-    }
-    stat.inode_num = p->fds[fd].ino;
-    stat.offset = p->fds[fd].offset;
-
-    la_copy_to_user(udst, &stat, sizeof(stat));
+    la_copy_to_user(udst, sbuf, sizeof(sbuf));
     return 0;
 }
 
@@ -1024,6 +1199,8 @@ static uint64_t sys_fork(struct la_trap_frame *tf)
     child->stack_bottom = parent->stack_bottom;   /* so forked children keep
                                                    * the grown stack floor */
     child->cwd_ino    = parent->cwd_ino;
+    child->rlimit_nofile_cur = parent->rlimit_nofile_cur;
+    child->rlimit_nofile_max = parent->rlimit_nofile_max;
     child->shared_vm  = 0;
     child->clear_child_tid = 0;
     child->mm         = &child->__mm;
@@ -1169,8 +1346,9 @@ static uint64_t __attribute__((noreturn)) sys_exit(struct la_trap_frame *tf)
         me->clear_child_tid = 0;
     }
 
-    /* Only print for non-thread processes to reduce serial noise */
-    if (!me->shared_vm) {
+    if (me->shared_vm) {
+        la_dbg_cancel_log("thread_exit", (uint64_t)me->pid, exit_code);
+    } else {
         la_uart_puts("  exit: pid=");
         la_uart_put_hex(me->pid);
         la_uart_puts(" code=");
@@ -1379,6 +1557,13 @@ static uint64_t sys_set_robust_list(struct la_trap_frame *tf)
     return 0; /* stub: glibc needs ENOSYS ideally, but musl expects 0 */
 }
 
+static void la_dbg_cancel_log(const char *tag, uint64_t a, uint64_t b)
+{
+    (void)tag;
+    (void)a;
+    (void)b;
+}
+
 /* SYS_futex (98): fast userspace mutual exclusion.
  *
  * Minimal private-futex implementation covering the two operations
@@ -1395,30 +1580,79 @@ static uint64_t sys_futex(struct la_trap_frame *tf)
     uint64_t uaddr  = tf->gpr[LA_GPR_A0];
     int      op     = (int)tf->gpr[LA_GPR_A1] & 0x7f;   /* strip private/realtime flags */
     uint32_t val    = (uint32_t)tf->gpr[LA_GPR_A2];
-    /* timeout, uaddr2, val3 are ignored in minimal implementation */
+    uint64_t utime  = tf->gpr[LA_GPR_A3];
+    uint64_t uaddr2 = tf->gpr[LA_GPR_A4];
+    uint32_t val3   = (uint32_t)tf->gpr[LA_GPR_A5];
 
     if (uaddr == 0)
         return (uint64_t)(-LA_EFAULT);
 
-    /* FUTEX_WAKE (op == 1): wake one or more waiters on this channel */
-    if (op == 1) {
+    /* FUTEX_WAKE / FUTEX_WAKE_BITSET */
+    if (op == 1 || op == 10) {
+        la_dbg_cancel_log("futex_wake", uaddr, val);
         la_proc_wakeup_chan((void *)uaddr);
         return 1;
     }
 
-    /* FUTEX_WAIT (op == 0): sleep if *uaddr still equals val */
-    if (op == 0) {
+    /* FUTEX_REQUEUE / FUTEX_CMP_REQUEUE.
+     * The scheduler has no waiter-list migration primitive; waking both
+     * channels is conservative and avoids lost wakeups for pthread condvars. */
+    if (op == 3 || op == 4) {
+        if (op == 4) {
+            uint32_t cur = 0;
+            if (la_copy_from_user(&cur, uaddr, sizeof(cur)) != sizeof(cur))
+                return (uint64_t)(-LA_EFAULT);
+            if (cur != val3)
+                return (uint64_t)(-LA_EAGAIN);
+        }
+        la_proc_wakeup_chan((void *)uaddr);
+        if (uaddr2)
+            la_proc_wakeup_chan((void *)uaddr2);
+        return val ? val : 1;
+    }
+
+    /* FUTEX_WAIT / FUTEX_WAIT_BITSET */
+    if (op == 0 || op == 9) {
         uint32_t cur = 0;
         if (la_copy_from_user(&cur, uaddr, sizeof(cur)) != sizeof(cur))
             return (uint64_t)(-LA_EFAULT);
         if (cur != val)
             return (uint64_t)(-LA_EAGAIN);
 
-        /* check-then-sleep is atomic under cooperative single-CPU scheduling:
-         * la_proc_sleep_chan sets wait_chan THEN state=SLEEPING with no
-         * intervening swtch, and only wakeup_chan flips futex sleepers back
-         * to RUNNABLE.  The caller (musl) re-validates *uaddr after wake. */
-        la_proc_sleep_chan((void *)uaddr);
+        {
+            struct la_proc *me = la_current_proc();
+            if (me && me->sig_pending) {
+                la_dbg_cancel_log("futex_pre_eintr", uaddr, me->sig_pending);
+                return (uint64_t)(-LA_EINTR);
+            }
+        }
+
+        la_dbg_cancel_log("futex_sleep", uaddr, val);
+
+        if (utime) {
+            uint64_t ts[2];
+            uint64_t now = la_timer_get_ticks();
+            uint64_t deadline = now;
+            if (la_copy_from_user(ts, utime, sizeof(ts)) != sizeof(ts))
+                return (uint64_t)(-LA_EFAULT);
+            if (op == 9) {
+                deadline = ts[0] * 100ULL + ts[1] / 10000000ULL;
+            } else {
+                uint64_t delta = ts[0] * 100ULL + ts[1] / 10000000ULL;
+                if (delta == 0 && (ts[0] || ts[1])) delta = 1;
+                deadline = now + delta;
+            }
+            if (deadline <= now)
+                return (uint64_t)(-LA_ETIMEDOUT);
+            if (la_proc_sleep_chan_until((void *)uaddr, deadline))
+                return (uint64_t)(-LA_ETIMEDOUT);
+        } else {
+            /* check-then-sleep is atomic under cooperative single-CPU scheduling:
+             * la_proc_sleep_chan sets wait_chan THEN state=SLEEPING with no
+             * intervening swtch, and only wakeup_chan flips futex sleepers back
+             * to RUNNABLE.  The caller (musl) re-validates *uaddr after wake. */
+            la_proc_sleep_chan((void *)uaddr);
+        }
 
         /* If woken by a signal (tkill/tgkill sets sig_pending + RUNNABLE),
          * return EINTR so that musl checks its pthread cancel flag.  Without
@@ -1426,9 +1660,12 @@ static uint64_t sys_futex(struct la_trap_frame *tf)
          * doesn't know it was signalled. */
         {
             struct la_proc *me = la_current_proc();
-            if (me && me->sig_pending)
+            if (me && me->sig_pending) {
+                la_dbg_cancel_log("futex_post_eintr", uaddr, me->sig_pending);
                 return (uint64_t)(-LA_EINTR);
+            }
         }
+        la_dbg_cancel_log("futex_woke", uaddr, 0);
         return 0;
     }
 
@@ -1436,10 +1673,14 @@ static uint64_t sys_futex(struct la_trap_frame *tf)
     return 0;
 }
 
+static uint64_t la_sigset_user_to_internal(uint64_t user_set);
+static uint64_t la_sigset_internal_to_user(uint64_t internal);
+
 /* SYS_rt_sigaction(134): register a signal handler.
  *   a0 = signum, a1 = *act (or NULL to query), a2 = *oldact (or NULL),
  *   a3 = sigsetsize (must be 8)
- * The sigaction struct is { handler(8), flags(8), restorer(8), mask(8) }.
+ * musl converts its public sigaction to the Linux kernel ABI layout:
+ * { handler(8), flags(8), restorer(8), mask(8) }.
  * SIGKILL(9) and SIGSTOP(19) cannot be caught or ignored. */
 static uint64_t sys_rt_sigaction(struct la_trap_frame *tf)
 {
@@ -1457,6 +1698,7 @@ static uint64_t sys_rt_sigaction(struct la_trap_frame *tf)
     /* Read old action for query */
     if (uoldact) {
         struct la_sigaction old = p->sig_actions[signum];
+        old.mask = la_sigset_internal_to_user(old.mask);
         la_copy_to_user(uoldact, &old, sizeof(old));
     }
 
@@ -1465,6 +1707,9 @@ static uint64_t sys_rt_sigaction(struct la_trap_frame *tf)
         struct la_sigaction new;
         if (la_copy_from_user(&new, uact, sizeof(new)) != sizeof(new))
             return (uint64_t)(-LA_EFAULT);
+        new.mask = la_sigset_user_to_internal(new.mask);
+        new.mask &= ~(1UL << LA_SIGKILL);
+        new.mask &= ~(1UL << LA_SIGSTOP);
         p->sig_actions[signum] = new;
     }
     return 0;
@@ -1556,6 +1801,7 @@ static uint64_t sys_rt_sigtimedwait(struct la_trap_frame *tf)
         return (uint64_t)(-LA_EINVAL);
 
     uint64_t deadline = 0;
+    uint64_t yield_budget = 0;
     if (uts) {
         struct {
             int64_t tv_sec;
@@ -1571,6 +1817,9 @@ static uint64_t sys_rt_sigtimedwait(struct la_trap_frame *tf)
         if (add_ticks == 0 && (ts.tv_sec != 0 || ts.tv_nsec != 0))
             add_ticks = 1;
         deadline = la_timer_get_ticks() + add_ticks;
+        yield_budget = add_ticks * 200;
+        if (yield_budget < 200)
+            yield_budget = 200;
     }
 
     for (;;) {
@@ -1624,41 +1873,18 @@ static uint64_t sys_rt_sigtimedwait(struct la_trap_frame *tf)
             return (uint64_t)sig;
         }
 
-        if (uts && la_timer_get_ticks() >= deadline) {
-            if (want & (1UL << LA_SIGCHLD)) {
-                struct la_proc *procs = la_proc_table();
-                int killed_child = 0;
-                for (int i = 0; i < LA_NPROC; i++) {
-                    if (procs[i].parent_pid == p->pid &&
-                        procs[i].state != LA_PROC_UNUSED) {
-                        if (procs[i].state != LA_PROC_ZOMBIE) {
-                            procs[i].exit_code = (int)(unsigned)(-LA_SIGKILL);
-                            procs[i].wait_chan = 0;
-                            procs[i].state = LA_PROC_ZOMBIE;
-                            la_proc_wakeup_pid(p->pid);
-                            killed_child = 1;
-                        }
-                    }
-                }
-                if (killed_child) {
-                    if (uinfo) {
-                        char info[128];
-                        for (int j = 0; j < 128; j++) info[j] = 0;
-                        ((int *)info)[0] = LA_SIGCHLD;
-                        ((int *)info)[1] = 0;
-                        ((int *)info)[2] = 0;
-                        la_copy_to_user(uinfo, info, sizeof(info));
-                    }
-                    return (uint64_t)LA_SIGCHLD;
-                }
-            }
+        if (uts && la_timer_get_ticks() >= deadline)
             return (uint64_t)(-LA_EAGAIN);
-        }
 
         if (!uts && !sigchld_children)
             return (uint64_t)(-LA_EAGAIN);
 
         la_proc_yield();
+        if (uts && yield_budget > 0) {
+            yield_budget--;
+            if (yield_budget == 0)
+                return (uint64_t)(-LA_EAGAIN);
+        }
     }
 }
 
@@ -1780,6 +2006,9 @@ static uint64_t sys_tgkill(struct la_trap_frame *tf)
  * NOTE: we set tf->era = sf.era - 4 because trap.c's syscall path
  * unconditionally does tf->era += 4 after this function returns,
  * so the net effect is era = sf.era (the original interrupted PC). */
+#define LA_UC_SIGMASK_OFF 40
+#define LA_UC_MC_PC_OFF 176
+
 static uint64_t sys_rt_sigreturn(struct la_trap_frame *tf)
 {
     struct la_proc *p = la_current_proc();
@@ -1791,11 +2020,22 @@ static uint64_t sys_rt_sigreturn(struct la_trap_frame *tf)
     if (la_copy_from_user(&sf, frame_va, sizeof(sf)) != sizeof(sf))
         return (uint64_t)-1;
 
-    /* Restore all 32 GPRs and ERA from the saved sigframe.
-     * Subtract 4 from era because the dispatcher adds 4 unconditionally. */
+    uint64_t user_mask = *(uint64_t *)&sf.ucontext[LA_UC_SIGMASK_OFF];
+    uint64_t user_pc = *(uint64_t *)&sf.ucontext[LA_UC_MC_PC_OFF];
+    if (user_pc == 0)
+        user_pc = sf.era;
+
+    p->sig_mask = la_sigset_user_to_internal(user_mask);
+    p->sig_mask &= ~(1UL << LA_SIGKILL);
+    p->sig_mask &= ~(1UL << LA_SIGSTOP);
+
+    /* Restore all 32 GPRs and the PC requested by the user ucontext.
+     * musl's SIGCANCEL handler edits uc_sigmask and MC_PC before returning;
+     * ignoring those changes causes repeated SIGCANCEL delivery and stack
+     * exhaustion in pthread_cancel cancellation-point tests. */
     for (int i = 0; i < 32; i++)
         tf->gpr[i] = sf.gpr[i];
-    tf->era = sf.era - LA_SYSCALL_INSN_SIZE;
+    tf->era = user_pc - LA_SYSCALL_INSN_SIZE;
 
     /* Return the original a0 so the dispatcher writes it back */
     return sf.gpr[LA_GPR_A0];
@@ -1969,8 +2209,32 @@ static uint64_t sys_statx(struct la_trap_frame *tf)
     if (la_copy_str_from_user(path, upath, sizeof(path) - 1) < 0)
         return (uint64_t)-1;
 
-    /* Handle AT_FDCWD */
-    (void)dirfd;
+    if (path[0] == '\0') {
+        char lst[128];
+        char sxbuf[256];
+        for (int i = 0; i < 256; i++) sxbuf[i] = 0;
+        if (la_stat_from_fd(p, dirfd, lst) < 0)
+            return (uint64_t)-1;
+
+        *(uint32_t *)&sxbuf[0] = 0x07FF;       /* STATX_BASIC_STATS */
+        *(uint32_t *)&sxbuf[4] = 4096;         /* blksize */
+        *(uint32_t *)&sxbuf[16] = *(uint32_t *)&lst[20]; /* nlink */
+        *(uint32_t *)&sxbuf[20] = *(uint32_t *)&lst[24]; /* uid */
+        *(uint32_t *)&sxbuf[24] = *(uint32_t *)&lst[28]; /* gid */
+        *(uint16_t *)&sxbuf[28] = (uint16_t)*(uint32_t *)&lst[16];
+        *(uint32_t *)&sxbuf[32] = (uint32_t)*(uint64_t *)&lst[8];
+        *(uint32_t *)&sxbuf[36] = (uint32_t)(*(uint64_t *)&lst[8] >> 32);
+        *(uint64_t *)&sxbuf[40] = *(uint64_t *)&lst[48]; /* size */
+        *(uint64_t *)&sxbuf[48] = *(uint64_t *)&lst[64]; /* blocks */
+        *(uint64_t *)&sxbuf[56] = 0x07FF;                /* attributes_mask */
+        *(uint64_t *)&sxbuf[64] = *(uint64_t *)&lst[72]; /* atime sec */
+        *(uint64_t *)&sxbuf[96] = *(uint64_t *)&lst[104]; /* ctime sec */
+        *(uint64_t *)&sxbuf[112] = *(uint64_t *)&lst[88]; /* mtime sec */
+        *(uint32_t *)&sxbuf[128] = (uint32_t)*(uint64_t *)&lst[32]; /* rdev major */
+        *(uint32_t *)&sxbuf[136] = 1;                    /* dev major */
+        la_copy_to_user(ustat, sxbuf, 160);
+        return 0;
+    }
 
     /* Resolve relative path → absolute for memfs lookup */
     char abs_path[256];
@@ -1981,20 +2245,35 @@ static uint64_t sys_statx(struct la_trap_frame *tf)
     int ftype;
     uint64_t fsize;
     uint32_t ino;
+    int is_dev = 0;
+    uint64_t atime = 0;
+    uint64_t mtime = 0;
+    uint64_t ctime = 0;
 
-    if (mi >= 0) {
-        ftype = 0;  /* regular file (memfs dirs show as regular for statx simplicity) */
-        fsize = memfs_inode_size(mi);
-        ino   = (uint32_t)mi | 0x80000000U;  /* mark as memfs ino */
-    } else {
-        if (la_fs_lookup(abs_path, &ino) < 0) {
-            la_uart_puts("  statx: '");
-            la_uart_puts(path);
-            la_uart_puts("' not found\n");
-            return (uint64_t)-1;
+    {
+        int dev = la_dev_lookup(abs_path);
+        if (dev) {
+            is_dev = 1;
+            ftype = 2;
+            fsize = 0;
+            ino = 0x0d000000U | (uint32_t)dev;
+        } else if (mi >= 0) {
+            ftype = 0;  /* regular file (memfs dirs show as regular for statx simplicity) */
+            fsize = memfs_inode_size(mi);
+            ino   = (uint32_t)mi | 0x80000000U;  /* mark as memfs ino */
+            atime = memfs_inode_atime(mi);
+            mtime = memfs_inode_mtime(mi);
+            ctime = memfs_inode_ctime(mi);
+        } else {
+            if (la_fs_lookup(abs_path, &ino) < 0) {
+                la_uart_puts("  statx: '");
+                la_uart_puts(path);
+                la_uart_puts("' not found\n");
+                return (uint64_t)-1;
+            }
+            ftype = la_fs_inode_type(ino);
+            fsize = la_fs_inode_size(ino);
         }
-        ftype = la_fs_inode_type(ino);
-        fsize = la_fs_inode_size(ino);
     }
 
     /* Build a minimal statx struct matching Linux UAPI layout */
@@ -2015,20 +2294,23 @@ static uint64_t sys_statx(struct la_trap_frame *tf)
             uint32_t ino_hi;      /* 36 */
             uint64_t size;        /* 40 */
             uint64_t blocks;      /* 48 */
-            uint64_t atime_s;     /* 56 */
-            uint32_t atime_ns;    /* 64 */
-            uint32_t _spare1;     /* 68 */
-            uint64_t btime_s;     /* 72 */
-            uint32_t btime_ns;    /* 80 */
-            uint32_t _spare2;     /* 84 */
-            uint64_t ctime_s;     /* 88 */
-            uint32_t ctime_ns;    /* 96 */
-            uint32_t _spare3;     /* 100 */
-            uint64_t mtime_s;     /* 104 */
-            uint32_t mtime_ns;    /* 112 */
-            uint32_t _spare4;     /* 116 */
-            uint64_t rdev;        /* 120 */
-            uint64_t dev;         /* 128 */
+            uint64_t attributes_mask; /* 56 */
+            uint64_t atime_s;     /* 64 */
+            uint32_t atime_ns;    /* 72 */
+            uint32_t _spare1;     /* 76 */
+            uint64_t btime_s;     /* 80 */
+            uint32_t btime_ns;    /* 88 */
+            uint32_t _spare2;     /* 92 */
+            uint64_t ctime_s;     /* 96 */
+            uint32_t ctime_ns;    /* 104 */
+            uint32_t _spare3;     /* 108 */
+            uint64_t mtime_s;     /* 112 */
+            uint32_t mtime_ns;    /* 120 */
+            uint32_t _spare4;     /* 124 */
+            uint32_t rdev_major;  /* 128 */
+            uint32_t rdev_minor;  /* 132 */
+            uint32_t dev_major;   /* 136 */
+            uint32_t dev_minor;   /* 140 */
         } *psx = (struct statx_s *)sbuf;
 
         psx->mask = 0x07FF; /* STATX_BASIC_STATS */
@@ -2036,12 +2318,18 @@ static uint64_t sys_statx(struct la_trap_frame *tf)
         psx->nlink = 1;
         psx->uid = 0;
         psx->gid = 0;
-        if (ftype == 1) psx->mode = 0040755;  /* directory */
-        else psx->mode = 0100755;             /* regular file */
+        if (is_dev) psx->mode = 0020666;      /* character device */
+        else if (ftype == 1) psx->mode = 0040755;  /* directory */
+        else psx->mode = 0100644;             /* regular file */
         psx->ino_lo = ino;
         psx->size = fsize;
         psx->blocks = (psx->size + 511) / 512;
-        psx->dev = 1;
+        psx->attributes_mask = 0x07FF;
+        psx->atime_s = atime;
+        psx->mtime_s = mtime;
+        psx->ctime_s = ctime;
+        psx->rdev_major = is_dev ? ino : 0;
+        psx->dev_major = 1;
 
         la_copy_to_user(ustat, sbuf, 160);
     }
@@ -2116,7 +2404,7 @@ static uint64_t __attribute__((noreturn)) sys_exit_group(struct la_trap_frame *t
 static uint64_t sys_pipe2(struct la_trap_frame *tf)
 {
     uint64_t ufdarray = tf->gpr[LA_GPR_A0];
-    /* int flags = (int)tf->gpr[LA_GPR_A1]; */
+    uint32_t flags = (uint32_t)tf->gpr[LA_GPR_A1];
     struct la_proc *p = la_current_proc();
 
     if (!p || !ufdarray) return (uint64_t)-1;
@@ -2146,6 +2434,8 @@ static uint64_t sys_pipe2(struct la_trap_frame *tf)
     p->fds[fd0].writable = 0;
     p->fds[fd0].ino      = 0;
     p->fds[fd0].offset   = 0;
+    p->fds[fd0].sock_idx = 0;
+    la_fd_apply_flags(&p->fds[fd0], flags);
 
     /* Write end (fd1) */
     p->fds[fd1].type     = LA_FD_PIPE;
@@ -2153,6 +2443,10 @@ static uint64_t sys_pipe2(struct la_trap_frame *tf)
     p->fds[fd1].writable = 1;
     p->fds[fd1].ino      = 0;
     p->fds[fd1].offset   = 0;
+    p->fds[fd1].sock_idx = 0;
+    la_fd_apply_flags(&p->fds[fd1], flags);
+    la_fd_publish_group(p, fd0);
+    la_fd_publish_group(p, fd1);
 
     /* Copy fds to user-space int[2] */
     int fdarray[2] = { fd0, fd1 };
@@ -2166,19 +2460,36 @@ static uint64_t sys_dup3(struct la_trap_frame *tf)
 {
     int oldfd = (int)tf->gpr[LA_GPR_A0];
     int newfd = (int)tf->gpr[LA_GPR_A1];
-    /* int flags = (int)tf->gpr[LA_GPR_A2]; */
+    uint32_t flags = (uint32_t)tf->gpr[LA_GPR_A2];
     struct la_proc *p = la_current_proc();
 
     if (!p || oldfd < 0 || oldfd >= LA_NFD || newfd < 0 || newfd >= LA_NFD)
         return (uint64_t)-1;
+    if (newfd >= la_fd_limit(p))
+        return (uint64_t)(-LA_EBADF);
     if (p->fds[oldfd].type == LA_FD_UNUSED)
         return (uint64_t)-1;
 
     /* Close newfd if it was open */
-    if (p->fds[newfd].type != LA_FD_UNUSED)
-        p->fds[newfd].type = LA_FD_UNUSED;
+    if (oldfd == newfd)
+        return (uint64_t)(-LA_EINVAL);
+    if (flags & ~LA_O_CLOEXEC)
+        return (uint64_t)(-LA_EINVAL);
+    if (p->fds[newfd].type != LA_FD_UNUSED) {
+        struct la_trap_frame ctf = *tf;
+        ctf.gpr[LA_GPR_A0] = (uint64_t)newfd;
+        sys_close(&ctf);
+    }
 
     p->fds[newfd] = p->fds[oldfd];
+    p->fds[newfd].cloexec = (flags & LA_O_CLOEXEC) ? 1 : 0;
+    if (p->fds[newfd].type == LA_FD_PIPE && p->fds[newfd].pipe) {
+        if (p->fds[newfd].writable)
+            p->fds[newfd].pipe->writeopen++;
+        else
+            p->fds[newfd].pipe->readopen++;
+    }
+    la_fd_publish_group(p, newfd);
     return (uint64_t)newfd;
 }
 
@@ -2294,6 +2605,8 @@ static uint64_t sys_clone(struct la_trap_frame *tf)
     la_pipe_dup_all(child);
 
     child->cwd_ino = parent->cwd_ino;
+    child->rlimit_nofile_cur = parent->rlimit_nofile_cur;
+    child->rlimit_nofile_max = parent->rlimit_nofile_max;
 
     /* Inherit signal state */
     child->sig_pending = 0;
@@ -2303,6 +2616,7 @@ static uint64_t sys_clone(struct la_trap_frame *tf)
 
     /* tid pointers */
     child->clear_child_tid = (flags & 0x00200000UL) ? ctid : 0;
+    la_dbg_cancel_log("clone_thread", (uint64_t)child->pid, child->clear_child_tid);
     if ((flags & 0x00100000UL) && ptid != 0) {
         int cpid = child->pid;
         la_copy_to_user(ptid, &cpid, sizeof(cpid));
@@ -2339,6 +2653,14 @@ static uint64_t sys_newfstatat(struct la_trap_frame *tf)
     if (la_copy_str_from_user(path, upath, sizeof(path) - 1) < 0)
         return (uint64_t)-1;
 
+    if (path[0] == '\0') {
+        char sbuf[128];
+        if (la_stat_from_fd(p, dirfd, sbuf) < 0)
+            return (uint64_t)-1;
+        la_copy_to_user(ustat, sbuf, sizeof(sbuf));
+        return 0;
+    }
+
     /* Resolve relative path → absolute for memfs lookup */
     char abs_path[256];
     la_resolve_memfs_path(p, path, abs_path, sizeof(abs_path));
@@ -2348,61 +2670,66 @@ static uint64_t sys_newfstatat(struct la_trap_frame *tf)
     int ftype;
     uint64_t fsize;
     uint32_t ino;
+    int is_dev = 0;
+    uint64_t atime = 0;
+    uint64_t mtime = 0;
+    uint64_t ctime = 0;
 
-    if (mi >= 0) {
-        ftype = 0;  /* regular file (memfs dirs are rarer) */
-        fsize = memfs_inode_size(mi);
-        ino   = (uint32_t)mi;
-    } else {
-        if (la_fs_lookup(abs_path, &ino) < 0) {
-            /* Busybox applet fallback (stat step): busybox sh searches
-             * PATH and calls stat on "/bin/cmd", "/usr/bin/cmd", etc.
-             * before trying exec.  If the path looks like it's in a
-             * standard bin directory, fabricate a "file exists" response
-             * so the shell proceeds to exec, where the busybox fallback
-             * in sys_exec handles the actual execution. */
-            int maybe_applet = 0;
-            /* bare name (no '/') */
-            int has_slash = 0;
-            for (int i = 0; path[i]; i++)
-                if (path[i] == '/') { has_slash = 1; break; }
-            if (!has_slash) {
-                maybe_applet = 1;
-            } else {
-                /* PATH-qualified: /bin/xxx, /sbin/xxx, /usr/bin/xxx, /usr/sbin/xxx */
-                if ((path[0] == '/' && path[1] == 'b' && path[2] == 'i' && path[3] == 'n' && path[4] == '/') ||
-                    (path[0] == '/' && path[1] == 's' && path[2] == 'b' && path[3] == 'i' && path[4] == 'n' && path[5] == '/') ||
-                    (path[0] == '/' && path[1] == 'u' && path[2] == 's' && path[3] == 'r' && path[4] == '/' && path[5] == 'b' && path[6] == 'i' && path[7] == 'n' && path[8] == '/') ||
-                    (path[0] == '/' && path[1] == 'u' && path[2] == 's' && path[3] == 'r' && path[4] == '/' && path[5] == 's' && path[6] == 'b' && path[7] == 'i' && path[8] == 'n' && path[9] == '/'))
-                    maybe_applet = 1;
-            }
-            if (!maybe_applet)
-                return (uint64_t)-1;
-            /* Fabricate a minimal stat: regular file, inode 0, size 0 */
-            ino   = 0;
-            ftype = 0;
+    {
+        int dev = la_dev_lookup(abs_path);
+        if (dev) {
+            is_dev = 1;
+            ftype = 2;
             fsize = 0;
-            /* fall through to build the stat struct below */
+            ino = 0x0d000000U | (uint32_t)dev;
+        } else if (mi >= 0) {
+            ftype = 0;  /* regular file (memfs dirs are rarer) */
+            fsize = memfs_inode_size(mi);
+            ino   = (uint32_t)mi;
+            atime = memfs_inode_atime(mi);
+            mtime = memfs_inode_mtime(mi);
+            ctime = memfs_inode_ctime(mi);
+        } else {
+            if (la_fs_lookup(abs_path, &ino) < 0) {
+                /* Busybox applet fallback (stat step): busybox sh searches
+                 * PATH and calls stat on "/bin/cmd", "/usr/bin/cmd", etc.
+                 * before trying exec.  If the path looks like it's in a
+                 * standard bin directory, fabricate a "file exists" response
+                 * so the shell proceeds to exec, where the busybox fallback
+                 * in sys_exec handles the actual execution. */
+                int maybe_applet = 0;
+                /* bare name (no '/') */
+                int has_slash = 0;
+                for (int i = 0; path[i]; i++)
+                    if (path[i] == '/') { has_slash = 1; break; }
+                if (!has_slash) {
+                    maybe_applet = 1;
+                } else {
+                    /* PATH-qualified: /bin/xxx, /sbin/xxx, /usr/bin/xxx, /usr/sbin/xxx */
+                    if ((path[0] == '/' && path[1] == 'b' && path[2] == 'i' && path[3] == 'n' && path[4] == '/') ||
+                        (path[0] == '/' && path[1] == 's' && path[2] == 'b' && path[3] == 'i' && path[4] == 'n' && path[5] == '/') ||
+                        (path[0] == '/' && path[1] == 'u' && path[2] == 's' && path[3] == 'r' && path[4] == '/' && path[5] == 'b' && path[6] == 'i' && path[7] == 'n' && path[8] == '/') ||
+                        (path[0] == '/' && path[1] == 'u' && path[2] == 's' && path[3] == 'r' && path[4] == '/' && path[5] == 's' && path[6] == 'b' && path[7] == 'i' && path[8] == 'n' && path[9] == '/'))
+                        maybe_applet = 1;
+                }
+                if (!maybe_applet)
+                    return (uint64_t)-1;
+                /* Fabricate a minimal stat: regular file, inode 0, size 0 */
+                ino   = 0;
+                ftype = 0;
+                fsize = 0;
+                /* fall through to build the stat struct below */
+            } else {
+                ftype = la_fs_inode_type(ino);
+                fsize = la_fs_inode_size(ino);
+            }
         }
-        ftype = la_fs_inode_type(ino);
-        fsize = la_fs_inode_size(ino);
     }
 
-    /* Build a minimal stat struct (kernel stat, 128 bytes) */
     char sbuf[128];
-    for (int i = 0; i < 128; i++) sbuf[i] = 0;
-
-    /* Linux stat layout (simplified):
-     *   [0]  dev (8), [8] ino (8), [16] mode (4), [20] nlink (4),
-     *   [24] uid (4), [28] gid (4), [32] rdev (8), [40] size (8),
-     *   [48] blksize (8), [56] blocks (8) */
-    uint16_t mode = ftype == 1 ? 0040755 : 0100755;
-    *(uint64_t *)&sbuf[0]  = 1;      /* dev */
-    *(uint64_t *)&sbuf[8]  = ino;    /* ino */
-    *(uint32_t *)&sbuf[16] = mode;   /* mode */
-    *(uint32_t *)&sbuf[20] = 1;      /* nlink */
-    *(uint32_t *)&sbuf[48] = 4096;   /* blksize */
-    *(uint64_t *)&sbuf[40] = fsize;  /* size */
+    uint32_t mode = is_dev ? 0020666 : (ftype == 1 ? 0040755 : 0100644);
+    la_fill_linux_stat(sbuf, ino, mode, is_dev ? (uint64_t)ino : 0,
+                       fsize, atime, mtime, ctime);
 
     la_copy_to_user(ustat, sbuf, 128);
     return 0;
@@ -2431,7 +2758,7 @@ static uint64_t sys_readlinkat(struct la_trap_frame *tf)
 #define LA_F_SETFD  2
 #define LA_F_GETFL  3
 #define LA_F_SETFL  4
-#define LA_FD_CLOEXEC 1
+#define LA_F_DUPFD_CLOEXEC 1030
 
 static uint64_t sys_fcntl(struct la_trap_frame *tf)
 {
@@ -2444,17 +2771,21 @@ static uint64_t sys_fcntl(struct la_trap_frame *tf)
     if (p->fds[fd].type == LA_FD_UNUSED) return (uint64_t)(-LA_EBADF);
 
     switch (cmd) {
-    case LA_F_DUPFD: {
+    case LA_F_DUPFD:
+    case LA_F_DUPFD_CLOEXEC: {
         /* Duplicate fd to the lowest available fd >= arg */
         int start = (int)arg;
         if (start < 0) start = 0;
         int newfd = -1;
-        for (int i = start; i < LA_NFD; i++) {
+        int lim = la_fd_limit(p);
+        for (int i = start; i < lim; i++) {
             if (p->fds[i].type == LA_FD_UNUSED) { newfd = i; break; }
         }
         if (newfd < 0) return (uint64_t)(-LA_EMFILE);
 
         p->fds[newfd] = p->fds[fd];
+        p->fds[newfd].cloexec = (cmd == LA_F_DUPFD_CLOEXEC) ? 1 : 0;
+        la_fd_publish_group(p, newfd);
 
         /* Bump pipe refcount if duplicating a pipe fd */
         if (p->fds[newfd].type == LA_FD_PIPE && p->fds[newfd].pipe) {
@@ -2466,20 +2797,22 @@ static uint64_t sys_fcntl(struct la_trap_frame *tf)
         return (uint64_t)newfd;
     }
     case LA_F_GETFD:
-        /* Return close-on-exec flag (we don't track it — always 0) */
-        return 0;
+        return p->fds[fd].cloexec ? LA_FD_CLOEXEC : 0;
     case LA_F_SETFD:
-        /* Accept but ignore FD_CLOEXEC (we don't track it) */
+        p->fds[fd].cloexec = (arg & LA_FD_CLOEXEC) ? 1 : 0;
+        la_fd_publish_group(p, fd);
         return 0;
     case LA_F_GETFL: {
         /* Return file access mode flags */
         int fl = 0;
         if (p->fds[fd].writable) fl |= 2;  /* O_RDWR */
         else fl |= 0;  /* O_RDONLY */
+        if (p->fds[fd].nonblock) fl |= LA_O_NONBLOCK;
         return (uint64_t)fl;
     }
     case LA_F_SETFL:
-        /* Accept but ignore (O_NONBLOCK etc.) */
+        p->fds[fd].nonblock = (arg & LA_O_NONBLOCK) ? 1 : 0;
+        la_fd_publish_group(p, fd);
         return 0;
     default:
         /* Unknown command — silently succeed (most callers treat ENOSYS as fatal) */
@@ -2494,14 +2827,41 @@ static uint64_t sys_sched_yield(struct la_trap_frame *tf)
     return 0;
 }
 
-/* SYS_prlimit64: get/set resource limits (stub) */
+#define LA_RLIMIT_NOFILE 7
+
+/* SYS_prlimit64: get/set resource limits */
 static uint64_t sys_prlimit64(struct la_trap_frame *tf)
 {
-    uint64_t uold = tf->gpr[LA_GPR_A2];
-    /* Return empty old limit if pointer provided */
+    int pid = (int)tf->gpr[LA_GPR_A0];
+    int resource = (int)tf->gpr[LA_GPR_A1];
+    uint64_t unew = tf->gpr[LA_GPR_A2];
+    uint64_t uold = tf->gpr[LA_GPR_A3];
+    struct la_proc *p = (pid == 0) ? la_current_proc() : la_proc_by_pid(pid);
+
+    if (!p) return (uint64_t)(-LA_ESRCH);
+
+    if (resource != LA_RLIMIT_NOFILE) {
+        uint64_t inf[2] = { ~0ULL, ~0ULL };
+        if (uold) la_copy_to_user(uold, inf, sizeof(inf));
+        return 0;
+    }
+
     if (uold) {
-        uint64_t zero_pair[2] = {0, 0};
-        la_copy_to_user(uold, zero_pair, 16);
+        uint64_t old_pair[2] = {
+            p->rlimit_nofile_cur,
+            p->rlimit_nofile_max
+        };
+        la_copy_to_user(uold, old_pair, sizeof(old_pair));
+    }
+
+    if (unew) {
+        uint64_t new_pair[2];
+        if (la_copy_from_user(new_pair, unew, sizeof(new_pair)) != sizeof(new_pair))
+            return (uint64_t)(-LA_EFAULT);
+        if (new_pair[0] > new_pair[1])
+            return (uint64_t)(-LA_EINVAL);
+        p->rlimit_nofile_cur = new_pair[0];
+        p->rlimit_nofile_max = new_pair[1];
     }
     return 0;
 }
@@ -2933,7 +3293,7 @@ static uint64_t sys_socketpair(struct la_trap_frame *tf)
     if (!p || !usv) return (uint64_t)(-LA_EINVAL);
 
     /* Only AF_UNIX (1) / AF_LOCAL with SOCK_STREAM */
-    if (domain != 1 || (type & 0xf) != 1)
+    if (domain != 1 || (type & LA_SOCK_TYPE_MASK) != 1)
         return (uint64_t)(-LA_EAFNOSUPPORT);
 
     /* Allocate two loopback sockets and connect them to each other */
@@ -2963,9 +3323,19 @@ static uint64_t sys_socketpair(struct la_trap_frame *tf)
     p->fds[fd1].type     = LA_FD_SOCKET;
     p->fds[fd1].writable = 1;
     p->fds[fd1].sock_idx = s1;
+    p->fds[fd1].ino      = 0;
+    p->fds[fd1].offset   = 0;
+    p->fds[fd1].pipe     = 0;
+    la_fd_apply_flags(&p->fds[fd1], (uint32_t)type);
     p->fds[fd2].type     = LA_FD_SOCKET;
     p->fds[fd2].writable = 1;
     p->fds[fd2].sock_idx = s2;
+    p->fds[fd2].ino      = 0;
+    p->fds[fd2].offset   = 0;
+    p->fds[fd2].pipe     = 0;
+    la_fd_apply_flags(&p->fds[fd2], (uint32_t)type);
+    la_fd_publish_group(p, fd1);
+    la_fd_publish_group(p, fd2);
 
     /* Write [fd1, fd2] to user sv */
     int sv[2] = { fd1, fd2 };
@@ -2983,7 +3353,7 @@ static uint64_t sys_socket(struct la_trap_frame *tf)
 
     if (!p) return (uint64_t)(-LA_EBADF);
 
-    int idx = la_sock_socket(domain, type, 0);
+    int idx = la_sock_socket(domain, type & LA_SOCK_TYPE_MASK, 0);
     if (idx < 0) return (uint64_t)(-LA_EINVAL);
 
     /* Find a free fd */
@@ -2999,6 +3369,10 @@ static uint64_t sys_socket(struct la_trap_frame *tf)
     p->fds[fd].sock_idx = idx;
     p->fds[fd].writable = 1;
     p->fds[fd].pipe     = 0;
+    p->fds[fd].ino      = 0;
+    p->fds[fd].offset   = 0;
+    la_fd_apply_flags(&p->fds[fd], (uint32_t)type);
+    la_fd_publish_group(p, fd);
     return (uint64_t)fd;
 }
 
@@ -3069,10 +3443,55 @@ static uint64_t sys_accept(struct la_trap_frame *tf)
     p->fds[newfd].sock_idx = child_idx;
     p->fds[newfd].writable = 1;
     p->fds[newfd].pipe     = 0;
+    p->fds[newfd].ino      = 0;
+    p->fds[newfd].offset   = 0;
+    p->fds[newfd].cloexec  = 0;
+    p->fds[newfd].nonblock = 0;
+    la_fd_publish_group(p, newfd);
 
     /* Return remote address to caller */
     la_put_sockaddr_in(uaddr, uaddrlen, raddr, rport);
 
+    return (uint64_t)newfd;
+}
+
+/* SYS_accept4(242): accept with SOCK_CLOEXEC/SOCK_NONBLOCK flags. */
+static uint64_t sys_accept4(struct la_trap_frame *tf)
+{
+    int fd            = (int)tf->gpr[LA_GPR_A0];
+    uint64_t uaddr    = tf->gpr[LA_GPR_A1];
+    uint64_t uaddrlen = tf->gpr[LA_GPR_A2];
+    uint32_t flags    = (uint32_t)tf->gpr[LA_GPR_A3];
+    struct la_proc *p = la_current_proc();
+
+    if (flags & ~(LA_O_CLOEXEC | LA_O_NONBLOCK))
+        return (uint64_t)(-LA_EINVAL);
+    if (!p || fd < 0 || fd >= LA_NFD) return (uint64_t)(-LA_EBADF);
+    if (p->fds[fd].type != LA_FD_SOCKET) return (uint64_t)(-LA_EBADF);
+
+    uint32_t raddr = 0;
+    uint16_t rport = 0;
+    int child_idx = la_sock_accept(p->fds[fd].sock_idx, &raddr, &rport);
+    if (child_idx < 0) return (uint64_t)(-LA_EINVAL);
+
+    int newfd = -1;
+    for (int i = 0; i < LA_NFD; i++)
+        if (p->fds[i].type == LA_FD_UNUSED) { newfd = i; break; }
+    if (newfd < 0) {
+        la_sock_close(child_idx);
+        return (uint64_t)(-LA_EMFILE);
+    }
+
+    p->fds[newfd].type     = LA_FD_SOCKET;
+    p->fds[newfd].sock_idx = child_idx;
+    p->fds[newfd].writable = 1;
+    p->fds[newfd].pipe     = 0;
+    p->fds[newfd].ino      = 0;
+    p->fds[newfd].offset   = 0;
+    la_fd_apply_flags(&p->fds[newfd], flags);
+    la_fd_publish_group(p, newfd);
+
+    la_put_sockaddr_in(uaddr, uaddrlen, raddr, rport);
     return (uint64_t)newfd;
 }
 
@@ -3509,14 +3928,23 @@ static uint64_t sys_clock_nanosleep(struct la_trap_frame *tf)
     return 0;
 }
 
-/* SYS_getrlimit(163): get resource limit.  a0=resource, a1=rlim.
- * struct rlimit: rlim_cur(8) + rlim_max(8).  Return unlimited (all Fs). */
+/* SYS_getrlimit(163): get resource limit.  a0=resource, a1=rlim. */
 static uint64_t sys_getrlimit(struct la_trap_frame *tf)
 {
-    /* int resource = (int)tf->gpr[LA_GPR_A0]; */
+    int resource = (int)tf->gpr[LA_GPR_A0];
     uint64_t urlim = tf->gpr[LA_GPR_A1];
+    struct la_proc *p = la_current_proc();
+
+    if (!p) return (uint64_t)(-LA_EFAULT);
     if (urlim) {
-        uint64_t rlim[2] = { ~0ULL, ~0ULL };  /* RLIM_INFINITY */
+        uint64_t rlim[2];
+        if (resource == LA_RLIMIT_NOFILE) {
+            rlim[0] = p->rlimit_nofile_cur;
+            rlim[1] = p->rlimit_nofile_max;
+        } else {
+            rlim[0] = ~0ULL;
+            rlim[1] = ~0ULL;
+        }
         la_copy_to_user(urlim, rlim, 16);
     }
     return 0;
@@ -3605,12 +4033,59 @@ static uint64_t sys_fsync(struct la_trap_frame *tf)
     return 0;
 }
 
-/* SYS_utimensat(88): update file timestamps.
- * This kernel does not persist atime/mtime yet; accept the request so libc
- * tests that only require POSIX success semantics can continue. */
+#define LA_UTIME_NOW  1073741823ULL
+#define LA_UTIME_OMIT 1073741822ULL
+
+/* SYS_utimensat(88): update file timestamps. */
 static uint64_t sys_utimensat(struct la_trap_frame *tf)
 {
-    (void)tf;
+    int dirfd = (int)tf->gpr[LA_GPR_A0];
+    uint64_t upath = tf->gpr[LA_GPR_A1];
+    uint64_t utimes = tf->gpr[LA_GPR_A2];
+    struct la_proc *p = la_current_proc();
+    int ino = -1;
+
+    if (!p) return (uint64_t)(-LA_EFAULT);
+
+    if (upath == 0) {
+        if (dirfd < 0 || dirfd >= LA_NFD || p->fds[dirfd].type == LA_FD_UNUSED)
+            return (uint64_t)(-LA_EBADF);
+        if (p->fds[dirfd].type == LA_FD_MEMFS)
+            ino = (int)p->fds[dirfd].ino;
+        else
+            return 0;
+    } else {
+        char path[256];
+        if (la_copy_str_from_user(path, upath, sizeof(path) - 1) < 0)
+            return (uint64_t)(-LA_EFAULT);
+
+        char abs_path[256];
+        la_resolve_memfs_path(p, path, abs_path, sizeof(abs_path));
+        ino = memfs_lookup(abs_path);
+        if (ino < 0)
+            return 0;
+    }
+
+    uint64_t now = la_timer_get_ticks() / 100;
+    uint64_t atime = now;
+    uint64_t mtime = now;
+    if (utimes) {
+        uint64_t ts[4];
+        if (la_copy_from_user(ts, utimes, sizeof(ts)) != sizeof(ts))
+            return (uint64_t)(-LA_EFAULT);
+        atime = ts[0];
+        mtime = ts[2];
+        if (ts[1] == LA_UTIME_NOW)
+            atime = now;
+        else if (ts[1] == LA_UTIME_OMIT)
+            atime = memfs_inode_atime(ino);
+        if (ts[3] == LA_UTIME_NOW)
+            mtime = now;
+        else if (ts[3] == LA_UTIME_OMIT)
+            mtime = memfs_inode_mtime(ino);
+    }
+    if (memfs_set_times(ino, atime, mtime) < 0)
+        return (uint64_t)(-LA_EBADF);
     return 0;
 }
 
@@ -3761,8 +4236,6 @@ uint64_t la_syscall_dispatch(struct la_trap_frame *tf)
         la_fs_cwd_ino = cp ? cp->cwd_ino : 0;
     }
 
-    /* Per-process syscall trace disabled — set trace_sys=1 on a proc to enable */
-
     switch (sysno) {
     /* Process management */
     case SYS_fork:       return sys_fork(tf);
@@ -3902,7 +4375,7 @@ uint64_t la_syscall_dispatch(struct la_trap_frame *tf)
     case SYS_shutdown_sock: return sys_shutdown_sock(tf);
     case SYS_sendmsg:     return sys_stub_enosys(tf);   /* -EOPNOTSUPP would be better but ENOSYS is safe */
     case SYS_recvmsg:     return sys_stub_enosys(tf);
-    case SYS_accept4:     return sys_accept(tf);         /* accept ignoring flags */
+    case SYS_accept4:     return sys_accept4(tf);
 
     /* System */
     case SYS_shutdown:   return sys_shutdown();

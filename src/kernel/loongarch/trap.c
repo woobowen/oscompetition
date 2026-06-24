@@ -124,8 +124,9 @@ void la_trap_dispatch(struct la_trap_frame *tf)
                 struct la_proc *p = la_current_proc();
                 if (p && p->is_user) {
                     p->ticks--;
-                    if (p->ticks <= 0)
+                    if (p->ticks <= 0) {
                         la_proc_yield();
+                    }
                 }
             }
         } else {

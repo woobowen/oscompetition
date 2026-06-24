@@ -38,6 +38,9 @@ struct memfs_inode {
     int      type;                        /* MEMFS_TYPE_* */
     char     path[MEMFS_MAX_NAME];        /* full absolute path */
     uint32_t size;                        /* file size in bytes */
+    uint64_t atime_sec;
+    uint64_t mtime_sec;
+    uint64_t ctime_sec;
     void    *pages[MEMFS_PAGES_PER_FILE]; /* data pages (NULL = unallocated) */
 };
 
@@ -56,6 +59,10 @@ int      memfs_reclaim_inode(int ino);         /* free unnamed inode data */
 int      memfs_is_unlinked(int ino);           /* path removed while fd open */
 int      memfs_getdents(int dir_ino, void *buf, uint32_t len);
 uint32_t memfs_inode_size(int ino);
+uint64_t memfs_inode_atime(int ino);
+uint64_t memfs_inode_mtime(int ino);
+uint64_t memfs_inode_ctime(int ino);
+int      memfs_set_times(int ino, uint64_t atime_sec, uint64_t mtime_sec);
 
 /* Helper: does `path` start with the given prefix? */
 int      memfs_path_prefix(const char *path, const char *prefix);
