@@ -14,6 +14,7 @@
 
 /* DMW CSR addresses */
 #define LA_CSR_DMW0  0x180
+#define LA_CSR_DMW1  0x181
 
 void la_kvm_init(void)
 {
@@ -29,5 +30,12 @@ void la_kvm_init(void)
                   | (1UL << 4);   /* MAT = coherent */
     la_csr_write(dmw0, LA_CSR_DMW0);
 
-    la_uart_puts("  kvm: DMW0 identity-mapped for PLV0\n");
+    /* DMW1 maps high-RAM kernel virtual addresses (VSEG=9) to physical
+     * high memory.  Keep it PLV0-only; user mappings still go through TLB. */
+    uint64_t dmw1 = (1UL << 0)
+                  | (1UL << 4)
+                  | (9UL << 60);
+    la_csr_write(dmw1, LA_CSR_DMW1);
+
+    la_uart_puts("  kvm: DMW0 low + DMW1 high mapped for PLV0\n");
 }

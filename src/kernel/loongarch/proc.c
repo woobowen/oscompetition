@@ -8,16 +8,55 @@
 #include "proc.h"
 
 /* ---- globals ---- */
+#define LA_ASID_MASK 0x3ffUL
+
 static struct la_proc la_procs[LA_NPROC];
 static struct la_cpu la_cpu;
 static int la_next_pid;
+static uint64_t la_next_asid = 1;
+static int la_asid_ever_used[LA_ASID_MASK + 1];
 
-#define LA_ASID_MASK 0x3ffUL
-
-static uint64_t la_proc_asid_from_pid(int pid)
+static int la_proc_asid_live(uint64_t asid)
 {
-    uint64_t asid = (uint64_t)pid & LA_ASID_MASK;
-    return asid ? asid : 1;
+    for (int i = 0; i < LA_NPROC; i++) {
+        if (la_procs[i].state != LA_PROC_UNUSED &&
+            la_procs[i].asid == asid)
+            return 1;
+    }
+    return 0;
+}
+
+static uint64_t la_proc_alloc_asid(void)
+{
+    for (int tries = 0; tries < (int)LA_ASID_MASK; tries++) {
+        uint64_t asid = la_next_asid;
+        la_next_asid++;
+        if (la_next_asid > LA_ASID_MASK)
+            la_next_asid = 1;
+
+        if (la_proc_asid_live(asid))
+            continue;
+
+        if (la_asid_ever_used[asid])
+            la_tlb_inval_all();
+        la_asid_ever_used[asid] = 1;
+        return asid;
+    }
+
+    return 0;
+}
+
+int la_proc_assign_fresh_asid(struct la_proc *p)
+{
+    if (!p)
+        return -1;
+
+    uint64_t asid = la_proc_alloc_asid();
+    if (asid == 0)
+        return -1;
+
+    p->asid = asid;
+    return 0;
 }
 
 /* ---- init ---- */
@@ -27,8 +66,11 @@ void la_proc_init(void)
         la_procs[i].state = LA_PROC_UNUSED;
         la_procs[i].pid   = 0;
     }
+    for (int i = 0; i <= (int)LA_ASID_MASK; i++)
+        la_asid_ever_used[i] = 0;
     la_cpu.current  = 0;
     la_next_pid     = 1;
+    la_next_asid    = 1;
     la_uart_puts("  proc: table initialized\n");
 }
 
@@ -46,8 +88,13 @@ static struct la_proc *la_proc_alloc(void)
             continue;
 
         struct la_proc *p = &la_procs[i];
+        uint64_t asid = la_proc_alloc_asid();
+        if (asid == 0) {
+            la_uart_puts("  proc: no free ASID\n");
+            return 0;
+        }
         p->pid    = la_next_pid++;
-        p->asid   = la_proc_asid_from_pid(p->pid);
+        p->asid   = asid;
         p->kstack = 0;
         p->entry  = 0;
         p->tf     = 0;
@@ -60,13 +107,23 @@ static struct la_proc *la_proc_alloc(void)
         p->is_user  = 0;
         p->shared_vm = 0;
         p->ticks    = LA_TIME_SLICE;
+        p->sched_policy = 0;
         p->sched_priority = 0;
+        p->uid = 0;
+        p->euid = 0;
+        p->gid = 0;
+        p->egid = 0;
+        p->cap_effective = ~0ULL;
+        p->cap_permitted = ~0ULL;
+        p->cap_inheritable = 0;
         p->clear_child_tid = 0;
         p->wait_chan = 0;
         p->sleep_deadline_ticks = 0;
         p->sleep_timed_out = 0;
         p->sig_pending = 0;
         p->sig_mask    = 0;
+        p->itimer_expire = 0;
+        p->itimer_interval = 0;
         for (int s = 0; s < LA_NSIG; s++) {
             p->sig_actions[s].handler  = LA_SIG_DFL;
             p->sig_actions[s].flags    = 0;
@@ -74,7 +131,12 @@ static struct la_proc *la_proc_alloc(void)
             p->sig_actions[s].mask     = 0;
         }
         p->parent_pid = 0;
+        p->vfork_parent_pid = 0;
         p->exit_code  = 0;
+        p->term_signal = 0;
+        p->core_dumped = 0;
+        p->rlimit_core_cur = ~0ULL;
+        p->rlimit_core_max = ~0ULL;
         p->rlimit_nofile_cur = LA_NFD;
         p->rlimit_nofile_max = LA_NFD;
         p->cwd_ino    = 0;       /* caller must set to root ino */
@@ -87,6 +149,7 @@ static struct la_proc *la_proc_alloc(void)
             p->fds[j].writable = 0;
             p->fds[j].cloexec = 0;
             p->fds[j].nonblock = 0;
+            p->fds[j].path_only = 0;
             p->fds[j].pipe = 0;
             p->fds[j].sock_idx = 0;
         }
@@ -175,7 +238,38 @@ void la_proc_free(struct la_proc *p)
     p->is_user = 0;
     p->shared_vm = 0;
     p->clear_child_tid = 0;
+    p->sched_policy = 0;
+    p->sched_priority = 0;
     p->wait_chan = 0;
+    p->term_signal = 0;
+    p->core_dumped = 0;
+}
+
+static int la_signal_dumps_core(int sig)
+{
+    switch (sig) {
+    case LA_SIGQUIT:
+    case LA_SIGILL:
+    case LA_SIGTRAP:
+    case LA_SIGABRT:
+    case LA_SIGBUS:
+    case LA_SIGFPE:
+    case LA_SIGSEGV:
+    case 24:  /* SIGXCPU */
+    case 25:  /* SIGXFSZ */
+    case 31:  /* SIGSYS */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+void la_proc_note_signal_exit(struct la_proc *p, int sig)
+{
+    if (!p)
+        return;
+    p->term_signal = sig;
+    p->core_dumped = (p->rlimit_core_cur != 0 && la_signal_dumps_core(sig));
 }
 
 void la_proc_activate_user_pgtbl(struct la_proc *p)
@@ -184,7 +278,9 @@ void la_proc_activate_user_pgtbl(struct la_proc *p)
         return;
 
     if (p->asid == 0)
-        p->asid = la_proc_asid_from_pid(p->pid);
+        p->asid = la_proc_alloc_asid();
+    if (p->asid == 0)
+        return;
 
     la_csr_write(p->asid & LA_ASID_MASK, LA_CSR_ASID);
     la_tlb_active_pgtbl = (uint64_t)p->pgtbl;
@@ -326,7 +422,10 @@ struct la_proc *la_proc_create_user(const char *name)
     /*
      * Set up context so swtch jumps to la_proc_user_bootstrap on first run.
      * The trap frame (tf) and page table (pgtbl) must be set by the caller
-     * before the scheduler picks this process up.
+     * before the scheduler picks this process up.  Keep the process
+     * non-runnable until the caller publishes it after full initialization;
+     * otherwise timer preemption during fork/clone can schedule a child with
+     * tf == NULL.
      */
     p->ctx.ra = (uint64_t)la_proc_user_bootstrap;
     p->ctx.sp = (uint64_t)stack + LA_KSTACK_SIZE;
@@ -338,7 +437,7 @@ struct la_proc *la_proc_create_user(const char *name)
         p->name[i] = '\0';
     }
 
-    p->state = LA_PROC_RUNNABLE;
+    p->state = LA_PROC_SLEEPING;
 
     return p;
 }
@@ -431,6 +530,10 @@ void __attribute__((noreturn)) la_proc_exit(int code)
     }
 
     me->exit_code = (int)(unsigned)code;
+    if (me->vfork_parent_pid > 0) {
+        la_proc_wakeup_pid(me->vfork_parent_pid);
+        me->vfork_parent_pid = 0;
+    }
     me->state     = LA_PROC_ZOMBIE;
     if (me->parent_pid > 0)
         la_proc_wakeup_pid(me->parent_pid);
@@ -519,6 +622,30 @@ void la_proc_wakeup_chan(void *chan)
             la_procs[i].wait_chan = 0;   /* clear channel after wake */
             la_procs[i].sleep_deadline_ticks = 0;
             la_procs[i].sleep_timed_out = 0;
+        }
+    }
+}
+
+void la_proc_check_itimers(uint64_t now_ticks)
+{
+    for (int i = 0; i < LA_NPROC; i++) {
+        struct la_proc *p = &la_procs[i];
+        if (p->state == LA_PROC_UNUSED || p->state == LA_PROC_ZOMBIE)
+            continue;
+        if (p->itimer_expire == 0 || now_ticks < p->itimer_expire)
+            continue;
+
+        p->sig_pending |= (1UL << LA_SIGALRM);
+        if (p->itimer_interval != 0)
+            p->itimer_expire = now_ticks + p->itimer_interval;
+        else
+            p->itimer_expire = 0;
+
+        if (p->state == LA_PROC_SLEEPING) {
+            p->state = LA_PROC_RUNNABLE;
+            p->wait_chan = 0;
+            p->sleep_deadline_ticks = 0;
+            p->sleep_timed_out = 0;
         }
     }
 }
@@ -630,15 +757,15 @@ void la_scheduler(void)
                  * libc-bench worker; reaping freed its pgtbl root, and the
                  * stale PGDL then killed pid4, pid2, and initcode in turn.
                  *
-                 * Do not flush/refill the whole TLB on every resume.  Each
-                 * independent process has a nonzero ASID, and CLONE_VM
-                 * threads share their leader's ASID.  Repeated whole-address
-                 * tlbfill without first removing old entries can create
-                 * duplicate translations for the same ASID/VPPN; after mmap
-                 * and munmap churn, QEMU may hit a stale duplicate and write
-                 * through the wrong physical page.  PGDL/ASID activation is
-                 * enough here; new or missing translations are handled by
-                 * HPTW or by the single-page refill path. */
+                 * Do not flush/refill the whole TLB on every resume.
+                 * Independent live address spaces have unique ASIDs, and
+                 * CLONE_VM threads share their leader's ASID.  Repeated
+                 * whole-address tlbfill without first removing old entries
+                 * can create duplicate translations for the same ASID/VPPN;
+                 * after mmap and munmap churn, QEMU may hit a stale duplicate
+                 * and write through the wrong physical page.  PGDL/ASID
+                 * activation is enough here; new or missing translations are
+                 * handled by HPTW or by the single-page refill path. */
                 la_proc_activate_user_pgtbl(p);
             }
         }
@@ -798,6 +925,7 @@ void la_signal_deliver(struct la_trap_frame *tf)
         la_uart_puts("  signal: default kill sig=");
         la_uart_put_hex(sig);
         la_uart_puts("\n");
+        la_proc_note_signal_exit(p, sig);
         la_proc_exit(-sig);
         /* not reached */
     }

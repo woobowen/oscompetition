@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include "trap.h"
 
-#define LA_NPROC        128
+#define LA_NPROC        512
 #define LA_KSTACK_SIZE  4096   /* one page per kernel stack */
 
 /* Scheduler time slice in timer ticks (100 Hz → 10 ticks = 100 ms). */
@@ -40,7 +40,7 @@ struct la_context {
 };
 
 /* ---- File descriptor table ---- */
-#define LA_NFD 128
+#define LA_NFD 512
 
 /* fd types */
 #define LA_FD_UNUSED  0
@@ -50,13 +50,16 @@ struct la_context {
 #define LA_FD_MEMFS   4   /* writable file on memfs */
 #define LA_FD_SOCKET  5   /* loopback socket (TCP / UDP) */
 #define LA_FD_DEV     6   /* simple character devices: /dev/null, /dev/zero */
+#define LA_FD_PROC    7   /* dynamic procfs compatibility entries */
 
 /* ---- Pipe ---- */
 #define LA_PIPE_SIZE   4096
-#define LA_NPIPE       32
+/* hackbench process mode creates thousands of fdpairs.  Pipe buffers are
+ * allocated on demand, so this limit is mostly metadata, not BSS pages. */
+#define LA_NPIPE       8192
 
 struct la_pipe {
-    char data[LA_PIPE_SIZE];   /* circular buffer */
+    char *data;                /* circular buffer page, allocated on demand */
     uint32_t nread;            /* total bytes read (monotonic; mod PIPE_SIZE) */
     uint32_t nwrite;           /* total bytes written (monotonic) */
     int readopen;              /* refcount of open read-end fds */
@@ -71,6 +74,8 @@ struct la_fd {
     int writable;            /* 1 = write allowed */
     int cloexec;             /* FD_CLOEXEC state */
     int nonblock;            /* O_NONBLOCK state */
+    int append;              /* O_APPEND state */
+    int path_only;           /* O_PATH fd: no normal file object for some syscalls */
     struct la_pipe *pipe;    /* pipe object (valid when type == LA_FD_PIPE) */
     int sock_idx;            /* socket index (valid when type == LA_FD_SOCKET) */
 };
@@ -156,7 +161,15 @@ struct la_proc {
     int shared_vm;             /* 1 = CLONE_VM thread (shares pgtbl + mm; do NOT
                                 * free pgtbl on reap — owned by the leader) */
     int ticks;                 /* remaining timer ticks in this time slice */
-    int sched_priority;        /* RT priority (0 = normal, 1–99 = SCHED_FIFO) */
+    int sched_policy;          /* Linux scheduler policy (0=OTHER, 1=FIFO, 2=RR) */
+    int sched_priority;        /* RT priority (0 = normal, 1–99 = FIFO/RR) */
+    uint32_t uid;
+    uint32_t euid;
+    uint32_t gid;
+    uint32_t egid;
+    uint64_t cap_effective;
+    uint64_t cap_permitted;
+    uint64_t cap_inheritable;
     uint64_t clear_child_tid;  /* user VA of cleartid word (0 = none) */
     int    trace_sys;           /* 1 = trace syscalls for this proc */
     void  *wait_chan;          /* futex sleep channel (0 = pid-wakeup sleeper) */
@@ -167,10 +180,17 @@ struct la_proc {
     uint64_t sig_pending;      /* bitmap of pending signals */
     uint64_t sig_mask;         /* bitmap of blocked signals */
     struct la_sigaction sig_actions[LA_NSIG];
+    uint64_t itimer_expire;    /* ITIMER_REAL expiry tick, 0 = disabled */
+    uint64_t itimer_interval;  /* ITIMER_REAL repeat interval in ticks */
 
     /* Process relationships */
     int parent_pid;            /* parent's PID (0 for first process) */
+    int vfork_parent_pid;      /* sleeping parent to wake when vfork child execs */
     int exit_code;             /* exit status for wait() */
+    int term_signal;           /* terminating signal for wait(), 0 for normal exit */
+    int core_dumped;           /* wait() WCOREDUMP bit for core-dump signals */
+    uint64_t rlimit_core_cur;
+    uint64_t rlimit_core_max;
     uint64_t rlimit_nofile_cur;
     uint64_t rlimit_nofile_max;
 
@@ -195,11 +215,13 @@ void la_proc_init(void);
 void la_scheduler(void) __attribute__((noreturn));
 void la_proc_yield(void);
 void la_sched_switch(struct la_context *old_ctx);
+int la_proc_assign_fresh_asid(struct la_proc *p);
 
 /* Terminate the current user process with `code` and switch to the
  * scheduler.  Clears ISTLBR so a TLB-refill path that swtches away does
  * not leave the bit set for the next process's trap.  Never returns. */
 void la_proc_exit(int code) __attribute__((noreturn));
+void la_proc_note_signal_exit(struct la_proc *p, int sig);
 struct la_proc *la_proc_create_kthread(void (*entry)(void), const char *name);
 struct la_proc *la_proc_create_user(const char *name);
 struct la_proc *la_current_proc(void);
@@ -214,6 +236,7 @@ void la_proc_sleep_chan(void *chan);    /* futex channel-keyed sleep */
 int  la_proc_sleep_chan_until(void *chan, uint64_t deadline_ticks);
 void la_proc_wakeup_pid(int pid);
 void la_proc_wakeup_chan(void *chan);   /* futex channel-keyed wake */
+void la_proc_check_itimers(uint64_t now_ticks);
 
 /* ---- Process table accessor (for syscall.c) ---- */
 struct la_proc *la_proc_by_pid(int pid);

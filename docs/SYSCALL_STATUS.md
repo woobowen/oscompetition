@@ -7,7 +7,7 @@
 ## 已实现（共 135 个分发表入口，含 3 个 SeaOS 私有入口）
 | 号 | 名 | 备注 |
 |---|---|---|
-| 4 | fork | SeaOS |
+| 4 | fork | SeaOS；LoongArch allocation failure returns `-ENOMEM` and releases half-created child state |
 | 17 | getcwd | Linux/RISC-V ABI；写出当前工作目录 |
 | 39 | umount2 | 最小兼容卸载入口；当前镜像路径返回成功边界 |
 | 40 | mount | 最小兼容挂载入口；记录 memfs 只读 remount 边界 |
@@ -17,15 +17,15 @@
 | 29 | ioctl | 默认 `-ENOTTY`；RTC 设备支持 `RTC_RD_TIME` |
 | 34 | mkdir(at) | |
 | 35 | unlink(at) | |
-| 36 | symlinkat | memfs 符号链接；支持 access/open 跟随、readlinkat 读取和 ELOOP 环检测 |
+| 36 | symlinkat | RISC-V memfs 符号链接；LoongArch memfs 最小 symlink 已清除 LTP `UNKNOWN #0x24` setup blocker |
 | 37 | link(at) | |
 | 38 | renameat | 同文件系统重命名；支持目录重命名 |
 | 43 | statfs | 最小 Linux `struct statfs` |
 | 44 | fstatfs | 最小 Linux `struct statfs` |
 | 46 | ftruncate | 最小兼容：有效 fd 返回 0 |
-| 48 | faccessat | 路径存在性/权限检查；memfs 支持 uid/gid/mode、symlink 跟随和 EROFS/ELOOP/ENOTDIR |
+| 48 | faccessat | 路径存在性/权限检查；LoongArch 支持 memfs mode、最小 uid/gid、最终 symlink、`ENAMETOOLONG/ENOTDIR/ELOOP/EROFS` |
 | 53 | fchmodat | memfs 更新 mode；其他有效路径保持最小成功边界 |
-| 54 | fchownat | memfs 更新 uid/gid；其他有效路径保持最小成功边界 |
+| 54 | fchownat | RISC-V memfs 更新 uid/gid；LoongArch 当前对已有路径最小 no-op 成功 |
 | 49 | chdir | |
 | 56 | open(at) | 支持 Linux `O_PATH` 为 closeable path-only fd |
 | 57 | close | |
@@ -47,8 +47,8 @@
 | 81 | sync | 桩，返回 0 |
 | 82 | fsync | 最小兼容：有效 fd 返回 0 |
 | 83 | fdatasync | 最小兼容：有效 fd 返回 0 |
-| 88 | utimensat | 最小时间戳更新/存在性检查；兼容 `futimens(fd, NULL pathname)` |
-| 89 | acct | 已注册；进程 accounting 未配置，返回 `-ENOSYS` 供 LTP 正确 TCONF |
+| 88 | utimensat | 最小时间戳更新/存在性检查；兼容 `futimens(fd, NULL pathname)`；LoongArch 使用 stable counter 秒数并对设备子路径返回 `-ENOTDIR` |
+| 89 | acct | RISC-V 已注册并返回 `-ENOSYS` 供 LTP 正确 TCONF；LoongArch 当前仍是 focused LTP blocker |
 | 93 | exit | |
 | 94 | exit_group | 单进程等价 `exit`；`CLONE_THREAD`/`CLONE_VM` 组内 sibling 通过 pending self-exit 退出 |
 | 96 | set_tid_address | 返回 pid（D3 最小实现） |
@@ -58,7 +58,7 @@
 | 101 | nanosleep(兼容) | |
 | 102 | getitimer | ITIMER_REAL current/interval snapshot；暂不支持 VIRTUAL/PROF |
 | 103 | setitimer | ITIMER_REAL → proc_t.itimer_expire/interval；old_value 返回兼容 alarm 的剩余秒数 |
-| 113 | clock_gettime | |
+| 113 | clock_gettime | LoongArch 使用 `rdtime.d` stable counter 返回 100MHz 单调时间；RISC-V 保持既有实现 |
 | 114 | clock_getres | 最小兼容分辨率返回 |
 | 115 | clock_nanosleep | 支持相对睡眠与 TIMER_ABSTIME 绝对睡眠 |
 | 116 | syslog | BusyBox `dmesg` 所需最小 klogctl |
@@ -72,14 +72,14 @@
 | 129 | kill | 最小 pid/signal 校验；记录 `SI_USER`/sender pid |
 | 130 | tkill | 最小线程 signal 兼容；记录 `SI_TKILL`/sender tgid |
 | 131 | tgkill | 最小线程组 signal 兼容；记录 `SI_TKILL`/sender tgid |
-| 133 | rt_sigsuspend | 最小让出 CPU |
-| 134 | rt_sigaction | 读 musl sigaction，存 handler/restorer |
+| 133 | rt_sigsuspend | 最小兼容：校验 sigset，返回 `-EINTR` |
+| 134 | rt_sigaction | LoongArch 读 kernel ABI `{handler, flags, mask}` 并使用 sigframe trampoline；RISC-V 记录 handler/restorer/flags |
 | 135 | rt_sigprocmask | 桩，返回 0 |
 | 137 | rt_sigtimedwait | 最小 pending-signal 等待；返回已记录的 `si_code`/`si_pid` |
 | 139 | rt_sigreturn | 从用户栈恢复 signal frame |
-| 143 | setregid | 最小 real/effective GID 状态；root 可切换，非 root 仅可保留已有 id |
+| 143 | setregid | RISC-V 最小 real/effective GID 状态；LoongArch 当前未实现 |
 | 144 | setgid | 最小 real/effective GID 状态 |
-| 145 | setreuid | 最小 real/effective UID 状态；root 可切换，非 root 仅可保留已有 id |
+| 145 | setreuid | RISC-V 最小 real/effective UID 状态；LoongArch 当前未实现 |
 | 146 | setuid | 最小 real/effective UID 状态 |
 | 147 | setresuid | 最小 real/effective UID 状态；saved uid 不建模 |
 | 149 | setresgid | 最小 real/effective GID 状态；saved gid 不建模 |
@@ -89,10 +89,10 @@
 | 160 | uname | |
 | 163 | getrlimit | 支持 `RLIMIT_NOFILE` |
 | 164 | setrlimit | 支持 `RLIMIT_NOFILE`；验证用户指针但不改变静态 fd 表 |
-| 165 | getrusage | 零填充桩 |
+| 165 | getrusage | LoongArch 返回最小 rusage，并填充单调 `ru_utime`；RISC-V 仍为零填充桩 |
 | 166 | umask | 桩，返回 0 |
 | 169 | gettimeofday | |
-| 171 | adjtimex | 最小 `timex` 查询/校验：返回 `TIME_OK`，无真实调时 |
+| 171 | adjtimex | RISC-V 最小 `timex` 查询/校验；LoongArch 当前仍为 ENOSYS blocker |
 | 172 | getpid | `CLONE_THREAD` 成员返回 thread-group leader pid |
 | 173 | getppid | |
 | 174 | getuid | 返回当前最小 credential uid |
@@ -123,9 +123,9 @@
 | 214 | brk | `CLONE_VM` heap grow 同步 live sibling 页表和 `heap_top`；shrink 仍是最小当前线程语义 |
 | 215 | munmap | `addr` 必须页对齐；`len` 按 Linux 语义向上页对齐；`CLONE_VM` live siblings 同步清 PTE 并单次释放 PA |
 | 216 | mremap | 最小兼容；收缩/同尺寸返回原地址，增长返回 `-ENOMEM` |
-| 217 | add_key | 已注册；Linux key retention service 未支持，返回 `-ENOSYS` |
-| 219 | keyctl | 已注册；Linux key retention service 未支持，返回 `-ENOSYS` |
-| 220 | clone | musl fork/pthread 依赖；按 flag 区分 parent_tid、child_tid 与 clear_child_tid |
+| 217 | add_key | RISC-V 已注册；LoongArch 当前仍为 focused LTP blocker |
+| 219 | keyctl | RISC-V 已注册；LoongArch 当前仍为 focused LTP blocker |
+| 220 | clone | musl fork/pthread 依赖；LoongArch non-`CLONE_VM` child trap frame honors `new_stack`/TLS/clear_child_tid，CLONE_VM 线程仍走共享地址空间路径 |
 | 221 | execve | 支持动态链接 ELF (D4) |
 | 222 | mmap | len 自动 page 对齐；lazy fault 在 `CLONE_VM` live siblings 间复用/同步同 VA 的 PA |
 | 226 | mprotect | 最小权限更新：已有映射按 prot 调整 PTE_R/W/X |
@@ -167,6 +167,79 @@
 语义边界：只对固定 allowlist 中的 BusyBox applet 名生效；不创建文件、不创建 symlink、不修改测试镜像。未知命令仍从 `newfstatat` 返回 `-ENOENT`，避免把所有缺失路径都伪装成 BusyBox。
 
 验证：`make all` 在固定 docker 构建环境通过，随后固定 RV docker 复跑到 `sys_shutdown` 并枚举 24 组。最新严格扫描为 16 组 clean、8 组失败；`busybox-musl` 和 `busybox-glibc` 中 `which ls` 均为 success，`ltp-musl`/`ltp-glibc` 不再出现 `basename: not found`，但仍因真实 LTP 内部失败保持失败状态，详见 `rv-current.md`。
+
+## 2026-06-26 状态更新：LoongArch LTP wait/accept 前段推进
+
+本轮只推进 LoongArch，未改变共享 RISC-V syscall 表。focused
+`ltp-musl` 前段新增通过证据：
+
+| 号/模块 | 名 | LoongArch 当前语义/证据 |
+|---|---|---|
+| 4/260 | fork/wait4 | PCB 增加 signal termination 与 core-dump wait status 状态；`abort01` 现在同时报告 `abort() dumped core` 和 `abort() raised SIGIOT` |
+| 198 | socket | 最小允许 `AF_UNIX` socket 创建，供 LTP fd 枚举跳过对应 socket fd |
+| 202/242 | accept/accept4 | 非 socket fd 返回 `ENOTSOCK`，O_PATH fd 返回 `EBADF`，UDP socket accept 返回 `EOPNOTSUPP`；`accept01/03/accept4_01` 真实断言 TPASS |
+| 208 | setsockopt | 最小记录 `SOL_IP` `MCAST_JOIN_GROUP`/`MCAST_LEAVE_GROUP`；accepted TCP child 不继承 multicast membership，`accept02` 报 `EADDRNOTAVAIL` TPASS |
+| 163/261 | getrlimit/prlimit64 | 增加 `RLIMIT_CORE` 读写状态；当前只用于 wait-status 级 `WCOREDUMP` 兼容，不生成完整 ELF core 文件 |
+
+验证日志：`/tmp/seaos_la_ltp_abort_red.log` 复现旧 `abort01`
+`Child exited with 250`；`/tmp/seaos_la_ltp_abort_coredump.log` 证明
+`abort01` 两个断言 TPASS；`/tmp/seaos_la_ltp_accept03_fix.log` 证明
+`accept01`、`accept02`、`accept03`、`accept4_01` 真实断言已过。恢复完整
+`/musl` 入口后的 `/tmp/seaos_la_musl_full_after_ltp_accept.log` 在
+360 秒窗口内到达 `unixbench-musl` 的 `FS_WRITE_SMALL`，超时退出 124；
+到截点广义失败扫描为空，但未到 unixbench GROUP END，不能作为新完成大组证据。
+
+`ltp-musl` 仍不 clean。下一批真实 blocker 从 `access01` harness 子进程
+结果上报、`symlinkat(36)`/`readlinkat(78)`、`acct(89)`、`adjtimex(171)`、
+AF_ALG socket 和 fd-creation coverage 开始；除非回归，不要再从
+`abort01` 或 `accept01/02/03` 开始。
+
+## 2026-06-26 状态更新：LoongArch LTP setup/identity/access 定位
+
+本轮只推进 LoongArch，未改变共享 RISC-V syscall 表。focused
+`ltp-musl` 仍不 clean，但已从初始 setup ENOSYS 推进到真实 LTP case
+语义缺口：
+
+| 号/模块 | 名 | LoongArch 当前语义/证据 |
+|---|---|---|
+| 48 | faccessat | 对 memfs mode 做最小 root/nobody 权限判断；`access01` 多数子项 TPASS，但仍有 harness 上报缺口 |
+| 53 | fchmodat | 更新 LoongArch memfs mode；`UNKNOWN #0x35` 与 `chmod(...)=ENOSYS` 已消失 |
+| 54 | fchownat | 对 LoongArch 已有路径最小 no-op 成功；`chown(...)=ENOSYS` 已消失 |
+| 144/146 | setgid/setuid | 更新 LoongArch real/effective id |
+| 147/149 | setresuid/setresgid | 更新 LoongArch real/effective id；saved id 不建模 |
+| 154 | setpgid | 校验目标进程存在后最小成功；`setpgid(0,0)=ENOSYS` 已消失 |
+| initcode | `/etc/passwd`/`/etc/group`/`/proc/self/maps` | 运行期 stub，消除 LTP `getpwnam(nobody)` 与 proc maps ENOENT setup blocker |
+
+验证日志：`/tmp/seaos_la_ltp_focus.log`、`/tmp/seaos_la_ltp_fchmodat.log`、
+`/tmp/seaos_la_ltp_fchown_setpgid.log`、`/tmp/seaos_la_ltp_env_stubs.log`、
+`/tmp/seaos_la_ltp_identity_access.log`。当前剩余真实 blocker 包括
+`abort01`、`accept01/02/03`、`symlinkat(36)`、`acct(89)`、
+`adjtimex(171)`、AF_ALG socket 以及 LTP harness 子进程结果上报。
+
+## 2026-06-26 状态更新：LoongArch LTP access/adjtimex/AF_ALG 前段推进
+
+本轮继续推进 `ltp-musl` focused 前段，但整组仍不 clean：
+
+| 号/模块 | 名 | LoongArch 当前语义/证据 |
+|---|---|---|
+| 34 | mkdirat | LoongArch memfs 目录创建现在保留 libc 传入的 mode；旧 initcode `mkdir(path,0)` 仍保持默认目录权限 |
+| 48 | faccessat | `MAP_SHARED` result page 修复后，`access01` child TPASS 能回传父进程；目录 search 位和 mkdir mode 生效后 `access01/access02/access03/access04` 均 `: 0` |
+| 171 | adjtimex | LoongArch 注册最小 `timex` 查询/校验，合法 modes 返回 `TIME_OK`，非法 mode/tick/非 root update 按 Linux errno 返回 |
+| 198 | socket | AF_ALG(38) 显式返回 `-EAFNOSUPPORT`，LTP AF_ALG cases 转为 TCONF；`bind()` 对全零 `sockaddr_in` wildcard bind 做最小兼容；AF_INET/AF_INET6 `SOCK_RAW` 已接受 |
+| initcode | `/etc/protocols` | 增加 IPv6 protocol runtime stub；除 `hopopt` protocol-0 lookup 外，其余 asapi protocol entries TPASS |
+
+验证日志：`/tmp/seaos_la_ltp_access01_mkdir_mode.log` 显示
+`access01/access02/access03/access04` 均 `: 0`；
+`/tmp/seaos_la_ltp_adjtimex_min.log` 显示 `adjtimex01/02/03` 均 `: 0`；
+`/tmp/seaos_la_ltp_afalg_eafnosupport.log` 显示 AF_ALG cases 为 TCONF；
+`/tmp/seaos_la_ltp_rawsock1.log` 显示 asapi 早期 IPv6 RAW socket
+`socket(10,3,58/159)=EINVAL` 已清除；`/tmp/seaos_la_ltp_rawsock2.log`
+显示 `asapi_01` `IPV6_CHECKSUM` offset 错误语义已推进为 TPASS。后续
+`/tmp/seaos_la_ltp_rawdeliver2.log` 和 `/tmp/seaos_la_ltp_ancillary1.log`
+已 supersede 这里的 ICMPv6 raw packet/filter、`IPV6_RECVPKTINFO` 与
+`sendmsg` 层；当前剩余 asapi 边界是 `hopopt` protocol-0 libc lookup。
+后续不要再从 `access01`、`access04`、`adjtimex` 或 AF_ALG `EINVAL`
+开始，除非新鲜日志证明回归。
 
 ## 2026-06-24 状态更新：RISC-V robust futex owner-death
 
@@ -452,3 +525,252 @@ The retained implementation keeps the existing SeaOS RISC-V signal-frame layout.
 Boundary: only `wait4` is whitelisted for restart in this iteration. Futex, accept, sleep, and other interruptible calls still return `-EINTR` so pthread cancellation and timeout-driven networking paths keep their existing behavior.
 
 Verification: `make all` passed in the fixed docker build environment, and the fixed RV docker run reached `sys_shutdown` after all 24 groups. The latest `os_serial_out_rv.txt` has zero `waitpid(...,0) failed: EINTR` markers; the previous log had 37.
+
+## 2026-06-25 LoongArch status update: netperf-musl signal ABI and accept
+
+| No. | Name | Current semantics |
+|---|---|---|
+| 134 | rt_sigaction | LoongArch parses musl's kernel ABI as `{handler, flags, mask}`; no user restorer is copied from word 2, and signal return uses the sigframe trampoline. |
+| 202 | accept | Blocking loopback TCP accept returns `-EINTR` when an unblocked pending signal wakes the sleeper. |
+| 242 | accept4 | Same interruptible accept semantics as `accept`, plus existing flag handling. |
+
+This fixes `netperf-musl` where SIGALRM's mask bit `0x2000` was previously
+misread as a restorer address, causing a jump to `pc=0x2000`, and where
+TCP_CRR required alarm-driven netserver teardown to interrupt a blocking
+accept. Verified by `/tmp/seaos_la_netperf_sigabi_accept2.log` and the full
+integration log `/tmp/seaos_la_musl_after_netperf_fix.log`; all five netperf
+subtests print `end: success` and reach `GROUP END netperf-musl`.
+
+## 2026-06-26 LoongArch status update: minimal memfs symlink
+
+| No. | Name | Current semantics |
+|---|---|---|
+| 36 | symlinkat | Creates a LoongArch memfs symlink inode; stores raw target bytes; existing link path returns `-EEXIST`, missing capacity returns `-ENOSPC`. |
+| 48 | faccessat | Follows a final memfs symlink component; symlink loops return `-ELOOP`. |
+| 56 | openat | Follows an existing final memfs symlink before opening the target. |
+| 78 | readlinkat | Reads raw target bytes from a memfs symlink; non-symlinks return `-EINVAL`, missing paths return `-ENOENT`. |
+| 79 | newfstatat | Follows final memfs symlinks unless `AT_SYMLINK_NOFOLLOW` is set. |
+
+Verification: `/tmp/seaos_la_ltp_symlink_red.log` shows the previous
+`UNKNOWN #0x24` / `symlink(...)=ENOSYS` blocker in `access02` and `access04`.
+`/tmp/seaos_la_ltp_symlink_green.log` shows `UNKNOWN #0x24` gone and
+`access02` advancing to the next real blocker. This is not an `ltp-musl`
+pass: `access02` later traps while executing the memfs/tmpdir `file_x`
+shebang script.
+
+## 2026-06-26 LoongArch status update: minimal IPv6 RAW socket options
+
+| No. | Name | Current semantics |
+|---|---|---|
+| 198 | socket | LoongArch accepts AF_INET/AF_INET6 `SOCK_RAW` sockets and records the requested protocol. This is a minimal compatibility surface, not a full IPv6 stack. |
+| 206 | sendto | Raw sockets return the copied byte count; if `IPV6_CHECKSUM` is enabled and the checksum field is outside the payload, returns `-EINVAL`. |
+| 208 | setsockopt | For raw sockets, `IPPROTO_IPV6/IPV6_CHECKSUM` validates and stores the checksum offset (`-1` disables; non-negative offsets must be even). Other existing no-op socket options remain unchanged. |
+
+Verification: `/tmp/seaos_la_ltp_rawsock1.log` removes the old asapi
+`socket(10, 3, 58/159)=EINVAL` failure layer. `/tmp/seaos_la_ltp_rawsock2.log`
+shows `asapi_01` `IPV6_CHECKSUM` offset 19/20/66 cases become TPASS. This is
+not an `ltp-musl` pass: the focused run still times out without GROUP END and
+later raw ICMPv6/filter/sendmsg/kconfig/helper blockers remain.
+
+## 2026-06-26 LoongArch status update: clock syscall tick-timebase alignment
+
+| No. | Name | Current semantics |
+|---|---|---|
+| 113 | clock_gettime | LoongArch `CLOCK_MONOTONIC`/`CLOCK_REALTIME` return seconds/nanoseconds derived from the 100 Hz scheduler tick clock, matching `clock_nanosleep(TIMER_ABSTIME)` deadlines. |
+| 169 | gettimeofday | LoongArch returns seconds/microseconds derived from the same 100 Hz scheduler tick clock. |
+| 115 | clock_nanosleep | Still schedules absolute/relative sleeps using `la_timer_get_ticks()`; no high-resolution timer model is added. |
+
+Verification: `/tmp/seaos_la_cyclictest_ticktime_clean1.log` reaches
+`GROUP END cyclictest-musl`; `NO_STRESS_P1/P8` and `STRESS_P1/P8` all end
+success, `kill hackbench` succeeds, and broad failure scanning is empty. This
+supersedes the previous stable-counter clock read behavior for LoongArch
+because that behavior could drift away from tick-based absolute sleep
+deadlines under QEMU/hackbench pressure.
+
+## 2026-06-26 LoongArch status update: raw IPv6/sendmsg LTP progress
+
+| No. | Name | Current semantics |
+|---|---|---|
+| 89 | acct | LoongArch explicit unsupported stub returning `-ENOSYS`; no longer falls through as an unknown syscall. |
+| 211 | sendmsg | Minimal LoongArch implementation for socket fds: copies LP64 `msghdr`/iovecs and routes to existing send/sendto paths; ancillary send control data is ignored. |
+| 212 | recvmsg | Minimal LoongArch implementation for socket fds: receives into iovecs and can return observed IPv6 ancillary cmsgs such as `IPV6_PKTINFO`, `IPV6_HOPLIMIT`, `IPV6_TCLASS`, and legacy `IPV6_2292*` records. |
+| 217 | add_key | LoongArch explicit unsupported stub returning `-ENOSYS`; no longer falls through as an unknown syscall. |
+| 219 | keyctl | LoongArch explicit unsupported stub returning `-ENOSYS`; no longer falls through as an unknown syscall. |
+| 208/209 | setsockopt/getsockopt | LoongArch stores/returns observed IPv6 receive ancillary options (`IPV6_RECVPKTINFO`, hoplimit/rthdr/hopopts/dstopts/tclass, and legacy `IPV6_2292*`) and stores `ICMP6_FILTER` for raw ICMPv6 sockets. |
+| 198/206/207 | raw socket/sendto/recvfrom | Same-protocol raw sockets now have minimal in-kernel loopback delivery using the existing datagram queue and ICMPv6 filter bitmap. |
+
+Verification: `/tmp/seaos_la_ltp_rawdeliver2.log` shows `asapi_02` all 12
+assertions TPASS (`failed 0`, `broken 0`) and `asapi_03`
+`IPV6_RECVPKTINFO set-get` plus `IPV6_RECVPKTINFO receive` TPASS. The older
+`sendmsg` `ENOSYS` and ICMPv6 raw receive timeouts from
+`/tmp/seaos_la_ltp_rawsock2.log` are superseded.
+`/tmp/seaos_la_ltp_ancillary1.log` further shows `asapi_03` assertions 1
+through 18 all TPASS, including hoplimit/tclass receive and legacy 2292 option
+checks. This is still not an `ltp-musl` pass: wrapper `FAIL LTP CASE`, shell
+helper gaps, kernel config TBROK, `hopopt`, and later environment/ABI failures
+remain.
+
+## 2026-06-27 LoongArch status update: LTP helper/KCONFIG environment
+
+| No. | Name | Current semantics |
+|---|---|---|
+| 291 | statx | LoongArch busybox applet probe list includes `mktemp`, so shell scripts can proceed to exec the runtime `/bin/mktemp` wrapper instead of failing at stat lookup. |
+| 221 | execve | No ABI change; existing busybox applet fallback remains, with `mktemp` now included in the LoongArch allowlist. |
+
+Runtime initcode now passes `KCONFIG_PATH=/etc/seaos-kconfig` and creates a
+minimal config file that marks unsupported Linux features such as
+`CONFIG_BSD_PROCESS_ACCT` and `CONFIG_HAVE_ARCH_MMAP_RND_BITS` as not set.
+This uses LTP's normal config-check path; it does not set
+`KCONFIG_SKIP_CHECK`, edit tests, or suppress output.
+
+Verification: `/tmp/seaos_la_ltp_mktemp1.log` shows `ar01.sh` no longer
+fails with missing `mktemp`, advancing at that point to the next
+shell/timeout blocker. That blocker is now superseded by
+`/tmp/seaos_la_ar01_min_ar10.log`.
+`/tmp/seaos_la_ltp_kconfig1.log` shows `acct02` and `aslr01` no longer
+`TBROK` on `Cannot parse kernel .config`; they TCONF through the supplied
+runtime config. `ltp-musl` remains not clean.
+
+## 2026-06-27 LoongArch status update: socket fd dup and AF_PACKET arping
+
+| No. | Name | Current semantics |
+|---|---|---|
+| 23 | dup | When duplicating a LoongArch socket fd, increments the socket object's reference count. |
+| 24 | dup3 | Same socket reference behavior as `dup`; supports the BusyBox `xmove_fd()` pattern used by `arping`. |
+| 25 | fcntl | `F_DUPFD`/`F_DUPFD_CLOEXEC` now increment socket refs when duplicating socket fds. |
+| 198 | socket | LoongArch accepts minimal AF_PACKET/SOCK_DGRAM sockets in addition to existing loopback socket domains. |
+| 200 | bind | AF_PACKET/AF_NETLINK bind remains a minimal compatibility no-op after fd validation; AF_INET continues using sockaddr_in. |
+| 204 | getsockname | AF_PACKET sockets return a minimal `sockaddr_ll` for synthetic `eth0` with hardware address length and MAC populated. |
+| 206 | sendto | AF_PACKET sends can synthesize an ARP reply for an observed ARP request payload; other packet data is reported as copied without a real network stack. |
+| 207 | recvfrom | AF_PACKET receives can dequeue the synthetic ARP reply and return a `sockaddr_ll` source address. |
+
+Verification: `/tmp/seaos_la_arping01_clean1.log` shows focused
+`arping01.sh` TPASS with Summary `passed 1`, `failed 0`, `broken 0`, and an
+empty broad failure scan. `/tmp/seaos_la_ltp_after_arping_fix1.log` confirms
+`arping01.sh` TPASS in focused LTP order. `/tmp/seaos_la_musl_after_arping_fix_smoke.log`
+restores full `/musl` entry, reaches `libcbench-musl` and `libctest-musl`
+GROUP END, enters `unixbench-musl`, and has an empty broad failure scan before
+its 360-second timeout. `ltp-musl` remains not clean.
+
+## 2026-06-27 LoongArch status update: ar01 helper, statx mode, O_APPEND
+
+| No. | Name | Current semantics |
+|---|---|---|
+| 25 | fcntl | `F_GETFL/F_SETFL` preserve LoongArch fd `O_APPEND` in addition to existing nonblock state. |
+| 56 | openat | LoongArch records `O_APPEND` on newly opened memfs/ext4/device fds. |
+| 64 | write | Memfs writes through an `O_APPEND` fd write at current inode size before copying data. |
+| 291 | statx | Memfs paths report stored inode mode bits, so runtime chmod-created helpers are visible as executable to shell command lookup. |
+| initcode | `/bin/ar` | Runtime `/bin/ar` wrapper invokes a minimal `/tmp/ar` helper for LTP `ar01.sh`; BusyBox `ar` fallback is disabled because the image's BusyBox lacks that applet. |
+
+Verification: `/tmp/seaos_la_ar01_min_ar10.log` shows focused `ar01.sh`
+Summary `passed 20`, `failed 0`, `broken 0`, `skipped 0`, `warnings 0`.
+`/tmp/seaos_la_ltp_after_ar10.log` confirms `ar01.sh` is 20/20 TPASS in
+focused LTP order and `arping01.sh` remains TPASS. `/tmp/seaos_la_musl_after_ar_smoke.log`
+restores full `/musl` entry, reaches `libcbench-musl` and `libctest-musl`
+GROUP END, enters `unixbench-musl`, and has an empty hard failure scan before
+its 360-second timeout. At this point `ltp-musl` remained not clean due
+`asapi_01` `hopopt`, password/keyctl helper scripts, and later gaps; the
+password/keyctl helper layer is superseded by the next status update.
+
+## 2026-06-27 LoongArch status update: ttyS0/keyctl helper and brk01
+
+| No. | Name | Current semantics |
+|---|---|---|
+| 72 | pselect6 | LoongArch fd readiness treats character devices as immediately readable/writable, so bash `read -s -p` on `/dev/ttyS0` does not wait forever. |
+| 73 | ppoll | Same character-device readiness behavior as `pselect6`. |
+| 214 | brk | LoongArch skips already mapped pages when extending heap and returns current break for invalid low addresses; direct `brk01` syscall variant is TPASS. |
+| 217 | add_key | Kernel syscall remains explicit `-ENOSYS`; C keyctl LTP cases continue to TCONF as unsupported. |
+| 219 | keyctl | Kernel syscall remains explicit `-ENOSYS`; initcode separately creates a minimal runtime `/bin/keyctl instantiate` wrapper for shell password helpers. |
+| initcode | `/dev/ttyS0`, `/bin/keyctl` | Runtime password helpers can read deterministic non-interactive input from `/dev/ttyS0`; `/bin/keyctl instantiate` exits successfully. |
+
+Verification: `/tmp/seaos_la_password_helpers2.log` shows direct focused
+`ask_password.sh` and `assign_password.sh` print `Password accepted.` and
+`Password assigned.`. `/tmp/seaos_la_ltp_after_password2.log` confirms both
+helpers return 0 in focused LTP order and exposes the next `brk01` layer.
+`/tmp/seaos_la_brk01_fix1.log` shows direct focused `brk01` Summary
+`passed 1`, `failed 0`, `broken 0`, `skipped 1`, `warnings 0`.
+`ltp-musl` remains not clean due `asapi_01` `hopopt` and later gaps.
+
+## 2026-06-27 LoongArch status update: bind01-bind05
+
+| No. | Name | Current semantics |
+|---|---|---|
+| 198 | socket | `SOCK_SEQPACKET` is accepted as stream inside the existing LoongArch loopback compatibility layer. |
+| 200 | bind | Adds Linux errno compatibility for LTP bind cases: `ENOTSOCK` for non-socket fds, `EACCES` for non-root privileged ports, `EADDRNOTAVAIL` for unsupported local IPv4 addresses, `ENOTDIR` for AF_UNIX paths whose prefix is not a directory, `EINVAL` for AF_UNIX rebind, and `EADDRINUSE` for an occupied AF_UNIX pathname. Successful AF_UNIX pathname binds create a memfs placeholder so cleanup `unlink()` succeeds; abstract names are kept as internal socket keys. |
+| memfs/socket | AF_UNIX bind state | Minimal pathname/abstract bind state is tracked per LoongArch socket; this is not a full UNIX-domain socket filesystem. |
+
+Verification: `/tmp/seaos_la_bind02_fix1.log`, `/tmp/seaos_la_bind03_fix1.log`,
+`/tmp/seaos_la_bind04_fix3.log`, and `/tmp/seaos_la_bind05_fix1.log` show
+direct focused `bind02`-`bind05` with zero failed/broken cases and empty hard
+failure scans. `/tmp/seaos_la_ltp_after_bind05_fix1.log` confirms
+`bind01`-`bind05` are real TPASS/ret 0 in focused LTP order. The same run
+keeps `ltp-musl` not clean due the known `asapi_01` `hopopt` TFAIL,
+`bind06` namespace-config TCONF, and later proc/cgroup environment TBROK.
+`/tmp/seaos_la_musl_after_bind_smoke1.log` restores full `/musl` entry and
+has an empty hard failure scan before its 360-second timeout.
+
+## 2026-06-27 LoongArch status update: capability ABI and proc/cgroup helpers
+
+| No. | Name | Current semantics |
+|---|---|---|
+| 90 | capget | LoongArch supports Linux capability header versions 1/2/3, pid 0/current and live-pid lookup, per-process effective/permitted/inheritable masks, and `EFAULT/EINVAL/ESRCH` error returns needed by LTP. |
+| 91 | capset | LoongArch stores per-process capability masks and enforces the basic Linux subset checks used by LTP, including `EFAULT` for bad guarded buffers, `EINVAL` for bad versions/pids, and `EPERM` for invalid capability changes or modifying another process. |
+| 222 | mmap | LoongArch now maps user pages according to `PROT_NONE/READ/WRITE/EXEC` instead of always RWX; this is required for LTP guarded-buffer `EFAULT` checks. |
+| 226 | mprotect | Uses the same LoongArch PTE permission builder as `mmap`, preserving software shm/fork-share bits. |
+| initcode | proc/cgroup helpers | Runtime stubs now create `/proc/sys/kernel/pid_max`, `/proc/self/mounts`, and BusyBox wrappers/fallbacks for `rmdir` and `killall`. |
+
+Verification: `/tmp/seaos_la_capability_fix4.log` shows direct focused
+`capget01`, `capget02`, and `capset01`-`capset04` all have zero failed/broken
+cases with an empty broad failure scan. `/tmp/seaos_la_ltp_after_killall_fix1.log`
+confirms these cases TPASS/ret 0 in focused LTP order and shows the missing
+`rmdir`/`killall` layers have advanced. `/tmp/seaos_la_musl_after_capability_smoke1.log`
+restores full `/musl` entry, reaches `libcbench-musl` and `libctest-musl`
+GROUP END, enters `unixbench-musl`, and has an empty hard failure scan before
+its 360-second timeout. `ltp-musl` remains not clean due `hopopt`, bind06
+namespace-config TCONF, and cgroup controller/helper blockers.
+
+## 2026-06-27 LoongArch status update: optional syscall probes as ENOSYS
+
+These entries are LoongArch-only explicit unsupported-feature stubs. They
+return `(uint64)(-ENOSYS)` and do not implement the underlying subsystem.
+
+| No. | Name | Current semantics |
+|---|---|---|
+| 19 | eventfd2 | Explicit `-ENOSYS` for LTP fd-creation probes. |
+| 20 | epoll_create1 | Explicit `-ENOSYS` for LTP fd-creation probes. |
+| 26 | inotify_init1 | Explicit `-ENOSYS` for LTP fd-creation probes. |
+| 74 | signalfd4 | Explicit `-ENOSYS` for LTP fd-creation probes. |
+| 85 | timerfd_create | Explicit `-ENOSYS` for LTP fd-creation probes. |
+| 241 | perf_event_open | Explicit `-ENOSYS` for LTP optional perf-event probes. |
+| 262 | fanotify_init | Explicit `-ENOSYS` for LTP fd-creation probes. |
+| 279 | memfd_create | Explicit `-ENOSYS` for LTP fd-creation probes. |
+| 280 | bpf | Explicit `-ENOSYS` for LTP optional BPF probes. |
+| 282 | userfaultfd | Explicit `-ENOSYS` for LTP fd-creation probes. |
+| 425 | io_uring_setup | Explicit `-ENOSYS` for LTP optional io_uring probes. |
+| 428 | open_tree | Explicit `-ENOSYS` for LTP mount-api probes. |
+| 430 | fsopen | Explicit `-ENOSYS` for LTP mount-api probes. |
+| 433 | fspick | Explicit `-ENOSYS` for LTP mount-api probes. |
+| 434 | pidfd_open | Explicit `-ENOSYS` for LTP pidfd probes. |
+| 447 | memfd_secret | Explicit `-ENOSYS` for LTP fd-creation probes. |
+
+Verification: `/tmp/seaos_la_ltp_enosys_only1.log` shows the old optional
+fd-creation `UNKNOWN #...` lines are gone, `ar01.sh` remains 20/20 TPASS,
+`arping01.sh` remains TPASS, and `broken_ip-*` advances to TPASS/TCONF.
+`/tmp/seaos_la_musl_after_enosys_stub_smoke1.log` restores full `/musl` entry,
+reaches libcbench/libctest GROUP END, enters unixbench, and has an empty hard
+failure scan before its 360-second timeout. `ltp-musl` remains not clean.
+
+## 2026-06-29 LoongArch status update: wait4 restart boundary
+
+| No. | Name | Current semantics |
+|---|---|---|
+| 260 | wait4 | If a pending signal has a handler without `SA_RESTART`, LoongArch returns user-visible `-EINTR`. If the pending signal is default, ignored, or handled with `SA_RESTART`, LoongArch returns internal `-ERESTARTSYS`; trap handling preserves the original syscall PC/arguments, delivers the signal, and restarts `wait4` if the handler returns. |
+| trap | syscall restart | LoongArch syscall dispatch recognizes internal `-ERESTARTSYS` and does not advance `era` or overwrite `a0`; this is not exposed to userland as an errno. |
+
+Verification: `/tmp/seaos_la_musl_full_clean1.log` reached `ltp-musl` after
+passing the previous `lmbench-musl` `lat_fs 0k` blocker and showed 43
+`waitpid.*EINTR` occurrences before the fix. Focused official-QEMU
+`/tmp/seaos_la_ltp_restart1.log` shows `waitpid.*EINTR` count 0 and confirms
+the old waitpid TBROK layer is gone through `capget/capset`. `ltp-musl`
+remains not clean because of the known `asapi_01` `hopopt` libc-table boundary
+and cgroup helper/direct-enumeration blockers.

@@ -42,6 +42,22 @@
  */
 #define LA_LOWMEM_END   0x10000000ULL
 #define LA_HIGHMEM_BASE 0x90000000ULL
+#define LA_HIGHMEM_END  0xC0000000ULL
+#define LA_DMW_HIGH_BASE 0x9000000000000000ULL
+
+static inline uint64_t la_pa_to_kva(uint64_t pa)
+{
+    if (pa >= LA_HIGHMEM_BASE && pa < LA_HIGHMEM_END)
+        return LA_DMW_HIGH_BASE | pa;
+    return pa;
+}
+
+static inline uint64_t la_kva_to_pa(uint64_t kva)
+{
+    if ((kva >> 60) == 0x9)
+        return kva & 0x0FFFFFFFFFFFFFFFULL;
+    return kva;
+}
 
 /* ---- Stable Timer (cpucfg[4] reports 100 MHz in QEMU virt) ---- */
 #define LA_TIMER_FREQ     100000000ULL    /* 100 MHz */
@@ -71,9 +87,12 @@ void la_timer_init(void);
 /* ---- Timer interrupt handler (called from trap_dispatch) ---- */
 void la_timer_interrupt(void);
 uint64_t la_timer_get_ticks(void);     /* monotonic tick counter (100 Hz) */
+uint64_t la_timer_get_counter(void);   /* stable hardware counter (100 MHz) */
 
 /* ---- Physical memory allocator ---- */
 void *la_pmem_alloc(void);
+void *la_pmem_alloc_user_page(void);
+void  la_pmem_ref_inc(void *page);
 void  la_pmem_free(void *page);
 
 /* ---- Block buffer cache ---- */
@@ -108,7 +127,9 @@ int      memfs_create(const char *path, int type);
 int      memfs_write(int ino, uint32_t offset, const void *buf, uint32_t len);
 int      memfs_read(int ino, uint32_t offset, void *buf, uint32_t len);
 int      memfs_delete(const char *path);
+int      memfs_rename(const char *old_path, const char *new_path);
 int      memfs_getdents(int dir_ino, void *buf, uint32_t len);
+int      memfs_inode_type(int ino);
 uint32_t memfs_inode_size(int ino);
 int      memfs_path_prefix(const char *path, const char *prefix);
 const char *memfs_get_path(int ino);

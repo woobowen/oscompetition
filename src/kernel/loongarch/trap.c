@@ -22,6 +22,71 @@ extern int la_tlb_refill_count;  /* diagnostic counter */
 
 uint64_t la_syscall_dispatch(struct la_trap_frame *tf);
 
+#define LA_TRAP_PTE_V   (1UL << 0)
+#define LA_TRAP_PTE_P   (1UL << 7)
+#define LA_TRAP_PTE_W   (1UL << 8)
+#define LA_TRAP_PTE_NR  (1UL << 61)
+#define LA_TRAP_PTE_NX  (1UL << 62)
+#define LA_ERESTARTSYS 512
+
+#define LA_ECODE_PIL 0x1
+#define LA_ECODE_PIS 0x2
+#define LA_ECODE_PIF 0x3
+#define LA_ECODE_PME 0x4
+
+static uint64_t la_trap_lookup_user_pte(uint64_t *root, uint64_t va)
+{
+    if (!root || va >= (1ULL << 39))
+        return 0;
+
+    uint64_t e0 = root[(va >> 30) & 0x1FF];
+    if (!e0)
+        return 0;
+    uint64_t *mid = (uint64_t *)e0;
+
+    uint64_t e1 = mid[(va >> 21) & 0x1FF];
+    if (!e1)
+        return 0;
+    uint64_t *leaf = (uint64_t *)e1;
+
+    return leaf[(va >> 12) & 0x1FF];
+}
+
+static int la_trap_pte_present(uint64_t pte)
+{
+    return (pte & (LA_TRAP_PTE_V | LA_TRAP_PTE_P)) ==
+           (LA_TRAP_PTE_V | LA_TRAP_PTE_P);
+}
+
+static int la_trap_fault_access_allowed(uint64_t pte, uint64_t ecode)
+{
+    switch (ecode) {
+    case LA_ECODE_PIL:
+        return (pte & LA_TRAP_PTE_NR) == 0;
+    case LA_ECODE_PIS:
+    case LA_ECODE_PME:
+        return (pte & LA_TRAP_PTE_W) != 0;
+    case LA_ECODE_PIF:
+        return (pte & LA_TRAP_PTE_NX) == 0;
+    default:
+        return 0;
+    }
+}
+
+static int la_trap_queue_sigsegv_if_catchable(struct la_proc *p)
+{
+    if (!p || !p->is_user)
+        return 0;
+    if (p->sig_actions[LA_SIGSEGV].handler == LA_SIG_DFL ||
+        p->sig_actions[LA_SIGSEGV].handler == LA_SIG_IGN)
+        return 0;
+    if (p->sig_mask & (1UL << LA_SIGSEGV))
+        return 0;
+
+    p->sig_pending |= (1UL << LA_SIGSEGV);
+    return 1;
+}
+
 void la_trap_dispatch(struct la_trap_frame *tf)
 {
     /* ---- TLB refill check (ISTLBR in TLBRERA) ---- */
@@ -83,11 +148,11 @@ void la_trap_dispatch(struct la_trap_frame *tf)
                 if (p && p->is_user) {
                     /* Dump key registers: $ra ($r1), $tp ($r2), $sp ($r3) */
                     la_uart_puts("  regs: ra=");
-                    la_uart_put_hex(p->tf->gpr[1]);
+                    la_uart_put_hex(tf->gpr[1]);
                     la_uart_puts(" tp=");
-                    la_uart_put_hex(p->tf->gpr[2]);
+                    la_uart_put_hex(tf->gpr[2]);
                     la_uart_puts(" sp=");
-                    la_uart_put_hex(p->tf->gpr[3]);
+                    la_uart_put_hex(tf->gpr[3]);
                     la_uart_puts("\n");
                     la_uart_puts("trap: kill user proc (segv) badv=");
                     la_uart_put_hex(badv);
@@ -96,6 +161,7 @@ void la_trap_dispatch(struct la_trap_frame *tf)
                     la_uart_puts(" parent=");
                     la_uart_put_hex(p->parent_pid);
                     la_uart_puts("\n");
+                    la_proc_note_signal_exit(p, LA_SIGSEGV);
                     la_proc_exit(-11);   /* noreturn */
                 }
                 la_uart_puts("trap: TLB refill FAIL in kernel — HALT\n");
@@ -112,6 +178,7 @@ void la_trap_dispatch(struct la_trap_frame *tf)
     if (ecode == LA_ECODE_INT) {
         if (tf->estat & LA_ESTAT_IS_TIMER) {
             la_timer_interrupt();
+            la_proc_check_itimers(la_timer_get_ticks());
 
             /* ---- timer preemption ----
              * Decrement the current user process's time-slice counter.
@@ -140,6 +207,8 @@ void la_trap_dispatch(struct la_trap_frame *tf)
     /* ---- syscall (ecode == 0x0B) ---- */
     if (ecode == LA_ECODE_SYS) {
         uint64_t ret = la_syscall_dispatch(tf);
+        if (ret == (uint64_t)(-LA_ERESTARTSYS))
+            goto check_signal;
         tf->gpr[LA_GPR_A0] = ret;
         tf->era += LA_SYSCALL_INSN_SIZE;
         goto check_signal;
@@ -155,22 +224,31 @@ void la_trap_dispatch(struct la_trap_frame *tf)
     }
 
     /* HPTW may report a normal page-invalid exception for freshly mapped
-     * pages in our software page table (notably mmap/brk pages).  If the
-     * current page table says the address is present, fill the TLB through
-     * the normal CSR path and retry the faulting instruction. */
-    if (ecode >= 0x1 && ecode <= 0x3) {
+     * pages in our software page table (notably mmap/brk pages).  Refill
+     * only when the leaf PTE grants the faulting access.  A present but
+     * permission-denied page (PROT_NONE, no-write, NX) is a real user fault;
+     * refilling it just spins forever on the same instruction. */
+    if (ecode >= 0x1 && ecode <= 0x4) {
         struct la_proc *p = la_current_proc();
         if (p && p->is_user && p->pgtbl) {
-            if (la_uva_to_pa(p->pgtbl, tf->badv) != 0 &&
-                la_tlb_refill_one(tf->badv) == 0) {
+            uint64_t pte = la_trap_lookup_user_pte(p->pgtbl, tf->badv);
+            if (la_trap_pte_present(pte)) {
+                if (la_trap_fault_access_allowed(pte, ecode) &&
+                    la_tlb_refill_one(tf->badv) == 0) {
+                    la_tlb_refill_count++;
+                    return;
+                }
+                if (!la_trap_fault_access_allowed(pte, ecode) &&
+                    from_user &&
+                    la_trap_queue_sigsegv_if_catchable(p))
+                    goto check_signal;
+            } else if (la_uvm_grow_stack(p->pgtbl, tf->badv) == 0 &&
+                       la_tlb_refill_one(tf->badv) == 0) {
                 la_tlb_refill_count++;
                 return;
             }
-            if (la_uvm_grow_stack(p->pgtbl, tf->badv) == 0 &&
-                la_tlb_refill_one(tf->badv) == 0) {
-                la_tlb_refill_count++;
-                return;
-            }
+            if (from_user && la_trap_queue_sigsegv_if_catchable(p))
+                goto check_signal;
         }
     }
 
@@ -219,11 +297,14 @@ void la_trap_dispatch(struct la_trap_frame *tf)
      * mapped in the current user page table.  This keeps the failure visible
      * while giving enough state to distinguish stale-TLB bugs from real user
      * faults. */
-    if ((ecode >= 0x1 && ecode <= 0x4) || ecode == 0x8 || ecode == 0x9) {
+    if ((ecode >= 0x1 && ecode <= 0x4) || ecode == 0x8 ||
+        ecode == 0x9 || ecode == LA_ECODE_INE) {
         struct la_proc *cur = fault_proc;
         if (cur && cur->pgtbl) {
             uint64_t era_pa = la_uva_to_pa(cur->pgtbl, tf->era);
             uint64_t badv_pa = la_uva_to_pa(cur->pgtbl, tf->badv);
+            uint32_t era_insn = era_pa ?
+                *(uint32_t *)la_pa_to_kva(era_pa) : 0;
             uint64_t badv_pte = 0;
             if (tf->badv < (1ULL << 39)) {
                 uint64_t idx0 = (tf->badv >> 30) & 0x1FF;
@@ -243,6 +324,8 @@ void la_trap_dispatch(struct la_trap_frame *tf)
             la_uart_put_hex(era_pa);
             la_uart_puts(" BADV_PA=");
             la_uart_put_hex(badv_pa);
+            la_uart_puts(" ERA_INSN=");
+            la_uart_put_hex(era_insn);
             la_uart_puts(" BADV_PTE=");
             la_uart_put_hex(badv_pte);
             la_uart_puts(" PGDL=");
@@ -262,6 +345,7 @@ void la_trap_dispatch(struct la_trap_frame *tf)
         la_uart_puts(" parent=");
         la_uart_put_hex(p->parent_pid);
         la_uart_puts("\n");
+        la_proc_note_signal_exit(p, LA_SIGSEGV);
         la_proc_exit(-11);   /* noreturn */
     }
     for (;;) {}              /* kernel-mode unhandled exception → halt */
@@ -275,7 +359,7 @@ check_signal:
      * the original context is restored. */
     {
         struct la_proc *cur = la_current_proc();
-        if (cur && cur->is_user) {
+        if (cur && cur->is_user && from_user) {
             if (la_signal_pending(tf))
                 la_signal_deliver(tf);
 
@@ -287,11 +371,9 @@ check_signal:
              * close the tiny window for another nested kernel interrupt before
              * assembly executes ertn.  ertn will re-enable user interrupts
              * from PRMD.PIE. */
-            if (from_user) {
-                la_csr_write(LA_USER_PLV | LA_PRMD_PIE, LA_CSR_PRMD);
-                la_csr_write(la_csr_read(LA_CSR_CRMD) & ~LA_CRMD_IE,
-                             LA_CSR_CRMD);
-            }
+            la_csr_write(LA_USER_PLV | LA_PRMD_PIE, LA_CSR_PRMD);
+            la_csr_write(la_csr_read(LA_CSR_CRMD) & ~LA_CRMD_IE,
+                         LA_CSR_CRMD);
         }
     }
 }

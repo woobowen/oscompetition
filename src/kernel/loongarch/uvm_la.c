@@ -42,6 +42,8 @@
 #define LA_PTE_NX       (1UL << 62)  /* No Execute */
 #define LA_PTE_NR       (1UL << 61)  /* No Read */
 #define LA_PTE_PA_MASK  0x0000FFFFFFFFF000UL
+#define LA_PTE_SW_SHM   (1UL << 9)   /* software: SysV shm leaf, not owned */
+#define LA_PTE_SW_FORK_SHARE (1UL << 10) /* software: share PA across fork */
 
 /* Permission shorthand.
  * When HPTW is enabled, QEMU's pte_write() checks bit W (bit 8),
@@ -173,7 +175,8 @@ int la_uvm_unmap_page(uint64_t *root, uint64_t va, int free_page)
     la_tlb_inval_page(va);
     if (free_page) {
         uint64_t pa = LA_PTE_PPN(pte);
-        la_pmem_free((void *)pa);
+        if (!(pte & LA_PTE_SW_SHM))
+            la_pmem_free((void *)pa);
     }
     return 0;
 }
@@ -181,13 +184,14 @@ int la_uvm_unmap_page(uint64_t *root, uint64_t va, int free_page)
 /* ---- Allocate a new page and map it ---- */
 uint64_t la_uvm_alloc_page(uint64_t *root, uint64_t va, uint64_t perm)
 {
-    void *pa = la_pmem_alloc();
+    void *pa = la_pmem_alloc_user_page();
     if (!pa) return 0;
-    if (la_uvm_map_page(root, va, (uint64_t)pa, perm) < 0) {
+    uint64_t phys = la_kva_to_pa((uint64_t)pa);
+    if (la_uvm_map_page(root, va, phys, perm) < 0) {
         la_pmem_free(pa);
         return 0;
     }
-    return (uint64_t)pa;
+    return phys;
 }
 
 /* ---- Grow the current proc's user stack down to cover fault_addr ----
@@ -252,9 +256,8 @@ void la_uvm_copy_in(uint64_t *root, uint64_t va, const void *src, uint32_t len)
             la_uart_puts("\n");
             return;
         }
-
         uint64_t pa = LA_PTE_PPN(*pte) + page_off;
-        char *dst = (char *)pa;
+        char *dst = (char *)la_pa_to_kva(pa);
         for (uint32_t i = 0; i < chunk; i++)
             dst[i] = s[off + i];
 
@@ -346,7 +349,7 @@ uint32_t la_copy_from_user(void *kdst, uint64_t usrc, uint32_t len)
         uint64_t pa = la_uva_to_pa(p->pgtbl, va);
         if (!pa) break;
 
-        const uint8_t *s = (const uint8_t *)pa;
+        const uint8_t *s = (const uint8_t *)la_pa_to_kva(pa);
         for (uint32_t i = 0; i < chunk; i++)
             d[done + i] = s[i];
         done += chunk;
@@ -372,7 +375,7 @@ uint32_t la_copy_to_user(uint64_t udst, const void *ksrc, uint32_t len)
         uint64_t pa = la_uva_to_pa(p->pgtbl, va);
         if (!pa) break;
 
-        uint8_t *d = (uint8_t *)pa;
+        uint8_t *d = (uint8_t *)la_pa_to_kva(pa);
         for (uint32_t i = 0; i < chunk; i++)
             d[i] = s[done + i];
         done += chunk;
@@ -391,7 +394,7 @@ int la_copy_str_from_user(char *kdst, uint64_t usrc, uint32_t max)
     while (i < max) {
         uint64_t pa = la_uva_to_pa(p->pgtbl, usrc + i);
         if (!pa) { kdst[i] = 0; return -1; }
-        char c = *(const char *)pa;
+        char c = *(const char *)la_pa_to_kva(pa);
         kdst[i] = c;
         if (c == 0) return (int)i;
         i++;
@@ -429,20 +432,31 @@ int la_uvm_copy_pgtbl(uint64_t *src, uint64_t *dst)
             for (int k = 0; k < LA_PT_ENTRIES; k++) {
                 if (!(src_leaf[k] & LA_PTE_V)) continue;
 
-                /* Allocate new data page and copy */
-                void *new_page = la_pmem_alloc();
+                uint64_t pte = src_leaf[k];
+                uint64_t old_pa = LA_PTE_PPN(src_leaf[k]);
+                uint64_t perm   = pte & ~LA_PTE_PA_MASK;
+
+                if (src_leaf[k] & LA_PTE_SW_SHM) {
+                    dst_leaf[k] = LA_MK_PTE(old_pa, perm);
+                    continue;
+                }
+
+                if (src_leaf[k] & LA_PTE_SW_FORK_SHARE) {
+                    la_pmem_ref_inc((void *)old_pa);
+                    dst_leaf[k] = LA_MK_PTE(old_pa, perm);
+                    continue;
+                }
+
+                void *new_page = la_pmem_alloc_user_page();
                 if (!new_page) return -1;
 
-                uint64_t old_pa = LA_PTE_PPN(src_leaf[k]);
-                uint64_t perm   = src_leaf[k] & 0xFFFUL;
-
-                /* Copy page data */
-                const uint8_t *s = (const uint8_t *)old_pa;
-                uint8_t *d = (uint8_t *)new_page;
+                uint64_t new_pa = la_kva_to_pa((uint64_t)new_page);
+                const uint8_t *s = (const uint8_t *)la_pa_to_kva(old_pa);
+                uint8_t *d = (uint8_t *)la_pa_to_kva(new_pa);
                 for (int b = 0; b < (int)LA_PGSIZE; b++)
                     d[b] = s[b];
 
-                dst_leaf[k] = LA_MK_PTE((uint64_t)new_page, perm);
+                dst_leaf[k] = LA_MK_PTE(new_pa, perm);
             }
         }
     }
@@ -456,12 +470,10 @@ int la_uvm_copy_pgtbl(uint64_t *src, uint64_t *dst)
  * page whose PPN is the data page PA.  We free every mapped data page, then
  * each leaf table, each mid table, and finally the root.
  *
- * SAFE because this kernel's fork DEEP-COPIES the page table (no shared/COW
- * pages) — every page under `root` is privately owned by exactly one process.
- * The caller must guarantee `root` is not the active page table of any running
- * context and that stale TLB entries are dropped before the freed pages are
- * reused (the scheduler invalidates the whole TLB before entering the next
- * user process; exec invalidates before installing the new image). */
+ * fork deep-copies ordinary pages, so they are privately owned by each process.
+ * SysV shm leaves are marked non-owned and are not freed here.  The caller
+ * must guarantee `root` is not the active page table of any running context
+ * and that stale TLB entries are dropped before page-table pages can be reused. */
 void la_uvm_free_pgtbl(uint64_t *root)
 {
     if (!root) return;
@@ -488,7 +500,8 @@ void la_uvm_free_pgtbl(uint64_t *root)
                 uint64_t e2 = leaf[k];
                 if (!(e2 & LA_PTE_V)) continue;
 
-                la_pmem_free((void *)LA_PTE_PPN(e2));   /* data page */
+                if (!(e2 & LA_PTE_SW_SHM))
+                    la_pmem_free((void *)LA_PTE_PPN(e2));   /* data page */
             }
             la_pmem_free(leaf);   /* leaf table page */
         }

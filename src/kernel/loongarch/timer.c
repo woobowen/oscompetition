@@ -56,3 +56,12 @@ uint64_t la_timer_get_ticks(void)
 {
     return la_ticks;
 }
+
+uint64_t la_timer_get_counter(void)
+{
+    uint64_t counter;
+    uint64_t counter_id;
+    asm volatile("rdtime.d %0, %1" : "=r"(counter), "=r"(counter_id));
+    (void)counter_id;
+    return counter;
+}
